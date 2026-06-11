@@ -1,2 +1,1 @@
-add_subdirectory(dxilconv)
-add_subdirectory(dxbc2dxil)
+add_subdirectory(scorpi-dxbc-probe)

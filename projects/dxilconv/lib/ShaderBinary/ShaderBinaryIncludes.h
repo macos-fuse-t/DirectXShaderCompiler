@@ -13,6 +13,7 @@
 #include "windows.h"
 
 #include <assert.h>
+#include <algorithm>
 #include <float.h>
 #include <strsafe.h>
 #include <intsafe.h>
@@ -22,6 +23,8 @@
 #include "dxc/Support/d3dx12.h"
 #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
 #include "ShaderBinary/ShaderBinary.h"
+using std::max;
+using std::min;
 // clang-format on
 
 #define ASSUME(_exp)                                                           \

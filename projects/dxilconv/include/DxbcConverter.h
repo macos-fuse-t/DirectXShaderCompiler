@@ -12,6 +12,7 @@
 #ifndef __DXBC_CONVERTER__H__
 #define __DXBC_CONVERTER__H__
 
+#include <windows.h>
 #include "dxc/dxcapi.h"
 
 #ifndef _MSC_VER
@@ -50,6 +51,7 @@ struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) IDxbcConverter
       _In_opt_z_ LPCWSTR pExtraOptions, _Out_ IDxcBlob **ppDxilModule,
       _Outptr_result_maybenull_z_ LPWSTR *ppDiag) = 0;
 };
+CROSS_PLATFORM_UUIDOF(IDxbcConverter, "5F956ED5-78D1-4B15-8247-F7187614A041")
 
 __declspec(selectany) extern const CLSID
     CLSID_DxbcConverter = {/* 4900391E-B752-4EDD-A885-6FB76E25ADDB */

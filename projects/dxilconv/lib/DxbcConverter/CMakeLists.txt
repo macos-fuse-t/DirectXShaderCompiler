@@ -5,14 +5,14 @@ find_package(D3D12 REQUIRED)
 add_dxilconv_project_library(DxbcConverter
   DxbcConverter.cpp
   DxbcUtil.cpp
+  ../ShaderBinary/ShaderBinary.cpp
 )
 
 target_link_libraries(DxbcConverter PUBLIC
   DxilConvPasses
-  ShaderBinary
 )
 
-add_dependencies(DxbcConverter intrinsics_gen DxcRuntimeEtw DxilConvPasses)
+add_dependencies(DxbcConverter intrinsics_gen DxilConvPasses)
 
 target_include_directories(DxbcConverter
 PUBLIC
@@ -21,4 +21,5 @@ PUBLIC
   $<INSTALL_INTERFACE:include>
 PRIVATE
   ${D3D12_INCLUDE_DIRS}
+  ${DXILCONV_PROJECT_SOURCE_DIR}/lib/ShaderBinary
 )

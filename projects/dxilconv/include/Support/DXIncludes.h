@@ -27,6 +27,7 @@
 #include <d3dcommon.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#define D3DX12_NO_STATE_OBJECT_HELPERS
 #include "dxc/Support/d3dx12.h"
 #include "DxbcSignatures.h"
 #include <d3dcompiler.h>
