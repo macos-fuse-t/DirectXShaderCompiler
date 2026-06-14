@@ -21,6 +21,9 @@
 
 namespace hlsl {
 
+static void AddMissingSignatureRecordsFromDeclarations(
+    SignatureHelper &SigHelper, const ShaderModel *SM);
+
 __override HRESULT STDMETHODCALLTYPE
 DxbcConverter::Convert(LPCVOID pDxbc, UINT32 DxbcSize, LPCWSTR pExtraOptions,
                        LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag) {
@@ -368,11 +371,14 @@ void DxbcConverter::ConvertInDriverImpl(
   // 2. Parse input signature(s).
   ExtractSignatureFromDDI(pInputSignature, NumInputSignatureElements,
                           *m_pInputSignature);
+  AddMissingSignatureRecordsFromDeclarations(*m_pInputSignature, m_pSM);
   ConvertSignature(*m_pInputSignature, m_pPR->GetInputSignature());
   if (m_pSM->IsDS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
                             NumPatchConstantSignatureElements,
                             *m_pPatchConstantSignature);
+    AddMissingSignatureRecordsFromDeclarations(*m_pPatchConstantSignature,
+                                               m_pSM);
     ConvertSignature(*m_pPatchConstantSignature,
                      m_pPR->GetPatchConstOrPrimSignature());
   }
@@ -380,11 +386,14 @@ void DxbcConverter::ConvertInDriverImpl(
   // 3. Parse output signature(s).
   ExtractSignatureFromDDI(pOutputSignature, NumOutputSignatureElements,
                           *m_pOutputSignature);
+  AddMissingSignatureRecordsFromDeclarations(*m_pOutputSignature, m_pSM);
   ConvertSignature(*m_pOutputSignature, m_pPR->GetOutputSignature());
   if (m_pSM->IsHS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
                             NumPatchConstantSignatureElements,
                             *m_pPatchConstantSignature);
+    AddMissingSignatureRecordsFromDeclarations(*m_pPatchConstantSignature,
+                                               m_pSM);
     ConvertSignature(*m_pPatchConstantSignature,
                      m_pPR->GetPatchConstOrPrimSignature());
   }
@@ -736,6 +745,13 @@ void DxbcConverter::ExtractSignatureFromDDI(
   unsigned iArbitrarySemantic = 0;
   for (unsigned iElement = 0; iElement < NumElements; iElement++) {
     const D3D12DDIARG_SIGNATURE_ENTRY_0012 &P = pElements[iElement];
+    if (P.Mask == 0) {
+      continue;
+    }
+    if (P.SystemValue == D3D10_SB_NAME_UNDEFINED &&
+        P.RegisterComponentType == D3D10_SB_REGISTER_COMPONENT_UNKNOWN) {
+      continue;
+    }
 
     // Extract data from DDI signature element record.
     SignatureHelper::ElementRecord E;
@@ -815,6 +831,66 @@ void DxbcConverter::ExtractSignatureFromDDI(
     IFTBOOL(!E.ComponentType.IsInvalid(), DXC_E_INCORRECT_DDI_SIGNATURE);
 
     SigHelper.m_ElementRecords.emplace_back(E);
+  }
+}
+
+static bool SignatureRecordCoversUsedElement(
+    const SignatureHelper::ElementRecord &record,
+    const SignatureHelper::UsedElement &used) {
+  if (record.Stream != used.OutputStream)
+    return false;
+  if (record.StartRow > used.Row || used.Row >= record.StartRow + record.Rows)
+    return false;
+
+  const unsigned recordEndCol = record.StartCol + record.Cols;
+  const unsigned usedEndCol = used.StartCol + used.Cols;
+  return record.StartCol <= used.StartCol && usedEndCol <= recordEndCol;
+}
+
+static void AddMissingSignatureRecordsFromDeclarations(
+    SignatureHelper &SigHelper, const ShaderModel *SM) {
+  string NamePrefix;
+  if (SigHelper.IsInput())
+    NamePrefix = "_in";
+  else if (SigHelper.IsOutput())
+    NamePrefix = "_out";
+  else
+    NamePrefix = "_pc";
+
+  unsigned nextSemanticIndex =
+      static_cast<unsigned>(SigHelper.m_ElementRecords.size());
+  for (const SignatureHelper::UsedElement &used : SigHelper.m_UsedElements) {
+    if (used.Cols == 0)
+      continue;
+
+    bool covered = false;
+    for (const SignatureHelper::ElementRecord &record :
+         SigHelper.m_ElementRecords) {
+      if (SignatureRecordCoversUsedElement(record, used)) {
+        covered = true;
+        break;
+      }
+    }
+    if (covered)
+      continue;
+
+    SignatureHelper::ElementRecord record;
+    if (SM != nullptr && SM->IsPS() && SigHelper.IsOutput()) {
+      record.SemanticName = "SV_Target";
+      record.SemanticIndex = used.Row;
+    } else {
+      record.SemanticName = NamePrefix + std::to_string(nextSemanticIndex);
+      record.SemanticIndex = nextSemanticIndex;
+    }
+    record.StartRow = used.Row;
+    record.StartCol = used.StartCol;
+    record.Rows = 1;
+    record.Cols = used.Cols;
+    record.Stream = used.OutputStream;
+    record.ComponentType = DXBC::GetCompTypeWithMinPrec(
+        D3D_REGISTER_COMPONENT_FLOAT32, used.MinPrecision);
+    SigHelper.m_ElementRecords.emplace_back(record);
+    nextSemanticIndex++;
   }
 }
 
