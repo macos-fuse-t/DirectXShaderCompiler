@@ -850,15 +850,11 @@ static bool SignatureRecordCoversUsedElement(
 static void AddMissingSignatureRecordsFromDeclarations(
     SignatureHelper &SigHelper, const ShaderModel *SM) {
   string NamePrefix;
-  if (SigHelper.IsInput())
+  if (SigHelper.IsInput() || SigHelper.IsOutput())
     NamePrefix = "_in";
-  else if (SigHelper.IsOutput())
-    NamePrefix = "_out";
   else
     NamePrefix = "_pc";
 
-  unsigned nextSemanticIndex =
-      static_cast<unsigned>(SigHelper.m_ElementRecords.size());
   for (const SignatureHelper::UsedElement &used : SigHelper.m_UsedElements) {
     if (used.Cols == 0)
       continue;
@@ -879,8 +875,8 @@ static void AddMissingSignatureRecordsFromDeclarations(
       record.SemanticName = "SV_Target";
       record.SemanticIndex = used.Row;
     } else {
-      record.SemanticName = NamePrefix + std::to_string(nextSemanticIndex);
-      record.SemanticIndex = nextSemanticIndex;
+      record.SemanticName = NamePrefix + std::to_string(used.Row);
+      record.SemanticIndex = used.Row;
     }
     record.StartRow = used.Row;
     record.StartCol = used.StartCol;
@@ -890,7 +886,6 @@ static void AddMissingSignatureRecordsFromDeclarations(
     record.ComponentType = DXBC::GetCompTypeWithMinPrec(
         D3D_REGISTER_COMPONENT_FLOAT32, used.MinPrecision);
     SigHelper.m_ElementRecords.emplace_back(record);
-    nextSemanticIndex++;
   }
 }
 

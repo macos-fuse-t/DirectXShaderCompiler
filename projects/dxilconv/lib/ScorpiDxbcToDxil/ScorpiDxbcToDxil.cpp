@@ -95,6 +95,23 @@ struct SignatureView {
   uint32_t patch_count = 0;
 };
 
+struct SignatureStorage {
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> input;
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> output;
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> patch;
+
+  SignatureView View() const {
+    SignatureView view = {};
+    view.input = input.empty() ? nullptr : input.data();
+    view.output = output.empty() ? nullptr : output.data();
+    view.patch = patch.empty() ? nullptr : patch.data();
+    view.input_count = static_cast<uint32_t>(input.size());
+    view.output_count = static_cast<uint32_t>(output.size());
+    view.patch_count = static_cast<uint32_t>(patch.size());
+    return view;
+  }
+};
+
 void SetError(char *error_message, size_t error_message_size,
               const std::string &message) {
   if (error_message == nullptr || error_message_size == 0) {
@@ -173,6 +190,74 @@ const uint32_t *ValidateShaderTokenStream(const void *shader_code,
     throw std::runtime_error("shader token count does not match file size");
   }
   return token_stream;
+}
+
+D3D10_SB_TOKENIZED_PROGRAM_TYPE ShaderTypeFromTokenStream(
+    const uint32_t *token_stream) {
+  return DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(token_stream[0]);
+}
+
+const D3D12DDIARG_SIGNATURE_ENTRY_0012 *SignatureEntries(
+    const void *entries) {
+  return static_cast<const D3D12DDIARG_SIGNATURE_ENTRY_0012 *>(entries);
+}
+
+bool IsEmptySignatureRecord(const D3D12DDIARG_SIGNATURE_ENTRY_0012 &entry) {
+  return entry.Mask == 0 ||
+         (entry.SystemValue == D3D10_SB_NAME_UNDEFINED &&
+          entry.RegisterComponentType == D3D10_SB_REGISTER_COMPONENT_UNKNOWN);
+}
+
+bool IsOrdinaryLinkageRecord(const D3D12DDIARG_SIGNATURE_ENTRY_0012 &entry) {
+  return entry.SystemValue == D3D10_SB_NAME_UNDEFINED &&
+         entry.RegisterComponentType != D3D10_SB_REGISTER_COMPONENT_UNKNOWN;
+}
+
+bool ShouldKeepDdiSignatureRecord(
+    D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, bool output_signature,
+    const D3D12DDIARG_SIGNATURE_ENTRY_0012 &entry) {
+  if (IsEmptySignatureRecord(entry)) {
+    return false;
+  }
+  if (!IsOrdinaryLinkageRecord(entry)) {
+    return true;
+  }
+
+  // Ordinary DDI entries do not carry semantic names. If they are fed directly
+  // to ConvertInDriver, input and output signatures synthesize different
+  // arbitrary names, breaking VS/PS linkage. Let the converter rebuild ordinary
+  // linkage records from DXBC declarations instead. PS outputs are special:
+  // ConvertInDriver can infer SV_Target/depth/coverage from the output register
+  // and declaration state, so those records are preserved.
+  return output_signature && shader_type == D3D10_SB_PIXEL_SHADER;
+}
+
+std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> FilterSignatureRecords(
+    D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, bool output_signature,
+    const void *records, uint32_t count) {
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> filtered;
+  const auto *entries = SignatureEntries(records);
+  for (uint32_t index = 0; index < count; ++index) {
+    if (ShouldKeepDdiSignatureRecord(shader_type, output_signature,
+                                     entries[index])) {
+      filtered.emplace_back(entries[index]);
+    }
+  }
+  return filtered;
+}
+
+SignatureView NormalizeSignaturesForRawTokenConversion(
+    const uint32_t *token_stream, const SignatureView &signatures,
+    SignatureStorage *storage) {
+  const D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type =
+      ShaderTypeFromTokenStream(token_stream);
+  storage->input = FilterSignatureRecords(shader_type, false, signatures.input,
+                                          signatures.input_count);
+  storage->output = FilterSignatureRecords(shader_type, true, signatures.output,
+                                           signatures.output_count);
+  storage->patch = FilterSignatureRecords(shader_type, false, signatures.patch,
+                                          signatures.patch_count);
+  return storage->View();
 }
 
 bool IsDxilContainer(const void *shader_code, size_t shader_code_size) {
@@ -309,8 +394,11 @@ int ConvertToDxilFile(const void *shader_code, size_t shader_code_size,
 
   const uint32_t *token_stream =
       ValidateShaderTokenStream(shader_code, shader_code_size);
-  const SignatureView signatures =
+  const SignatureView parsed_signatures =
       ParseSignatures(signature_dump, signature_dump_size);
+  SignatureStorage normalized_signatures;
+  const SignatureView signatures = NormalizeSignaturesForRawTokenConversion(
+      token_stream, parsed_signatures, &normalized_signatures);
 
   DxcMallocScope dxc_malloc;
 
