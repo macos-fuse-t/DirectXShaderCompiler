@@ -31,6 +31,19 @@ ScorpiCreateDxilBinaryFile(const void *shader_code,
                            char *error_message,
                            size_t error_message_size);
 
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateDxilBinary(const void *shader_code,
+                       size_t shader_code_size,
+                       const void *signature_dump,
+                       size_t signature_dump_size,
+                       void **dxil_binary,
+                       size_t *dxil_binary_size,
+                       char *error_message,
+                       size_t error_message_size);
+
+SCORPI_DXBC_TO_DXIL_EXPORT void
+ScorpiFreeDxilBinary(void *dxil_binary);
+
 #ifdef __cplusplus
 }
 #endif

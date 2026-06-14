@@ -6,6 +6,7 @@
 #include "dxc/DxilContainer/DxilContainer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -49,30 +50,6 @@ public:
 
 private:
   IDxcBlob *blob_ = nullptr;
-};
-
-class ScorpiDxbcConverter : public hlsl::DxbcConverter {
-public:
-  HRESULT ConvertRawInDriver(const UINT32 *bytecode, const void *input,
-                             uint32_t input_count, const void *output,
-                             uint32_t output_count, const void *patch,
-                             uint32_t patch_count, IDxcBlob **dxil,
-                             LPWSTR *diagnostics) {
-    DxcThreadMalloc thread_malloc(nullptr);
-    HRESULT hr = S_OK;
-    try {
-      ConvertInDriverImpl(
-          bytecode,
-          static_cast<const D3D12DDIARG_SIGNATURE_ENTRY_0012 *>(input),
-          input_count,
-          static_cast<const D3D12DDIARG_SIGNATURE_ENTRY_0012 *>(output),
-          output_count,
-          static_cast<const D3D12DDIARG_SIGNATURE_ENTRY_0012 *>(patch),
-          patch_count, nullptr, dxil, diagnostics);
-    }
-    CATCH_CPP_ASSIGN_HRESULT();
-    return hr;
-  }
 };
 
 struct ScorpiShaderMetadata {
@@ -177,6 +154,19 @@ const uint32_t *ValidateShaderTokenStream(const void *shader_code,
   return token_stream;
 }
 
+bool IsDxbcContainer(const void *shader_code, size_t shader_code_size) {
+  if (shader_code == nullptr ||
+      shader_code_size < sizeof(hlsl::DxilContainerHeader) ||
+      shader_code_size > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const auto *container =
+      reinterpret_cast<const hlsl::DxilContainerHeader *>(shader_code);
+  return container->HeaderFourCC == hlsl::DFCC_Container &&
+         container->ContainerSizeInBytes == shader_code_size;
+}
+
 bool IsDxilContainer(const void *shader_code, size_t shader_code_size) {
   const auto *container =
       hlsl::IsDxilContainerLike(shader_code, shader_code_size);
@@ -200,6 +190,15 @@ bool IsDxilProgram(const void *shader_code, size_t shader_code_size) {
 
 std::vector<uint8_t> WrapDxilProgram(const void *dxil, size_t dxil_size,
                                      uint32_t source_version_token) {
+  if (IsDxilProgram(dxil, dxil_size)) {
+    const auto *program = static_cast<const hlsl::DxilProgramHeader *>(dxil);
+    const size_t program_size =
+        static_cast<size_t>(program->SizeInUint32) * sizeof(uint32_t);
+    return std::vector<uint8_t>(static_cast<const uint8_t *>(dxil),
+                                static_cast<const uint8_t *>(dxil) +
+                                    program_size);
+  }
+
   if (dxil_size > std::numeric_limits<uint32_t>::max()) {
     throw std::runtime_error("DXIL bitcode exceeds 32-bit size");
   }
@@ -270,11 +269,12 @@ void WriteFile(const char *path, const void *data, size_t size) {
   }
 }
 
-int WriteExistingDxilFile(const void *shader_code, size_t shader_code_size,
-                          const char *output_path) {
+std::vector<uint8_t> NormalizeExistingDxil(const void *shader_code,
+                                           size_t shader_code_size) {
   if (IsDxilContainer(shader_code, shader_code_size)) {
-    WriteFile(output_path, shader_code, shader_code_size);
-    return SCORPI_DXBC_TO_DXIL_OK;
+    return std::vector<uint8_t>(
+        static_cast<const uint8_t *>(shader_code),
+        static_cast<const uint8_t *>(shader_code) + shader_code_size);
   }
 
   if (IsDxilProgram(shader_code, shader_code_size)) {
@@ -282,15 +282,53 @@ int WriteExistingDxilFile(const void *shader_code, size_t shader_code_size,
         static_cast<const hlsl::DxilProgramHeader *>(shader_code);
     const size_t program_size =
         static_cast<size_t>(program->SizeInUint32) * sizeof(uint32_t);
-    const std::vector<uint8_t> dxil_container =
-        WrapDxilContainer(std::vector<uint8_t>(
-            static_cast<const uint8_t *>(shader_code),
-            static_cast<const uint8_t *>(shader_code) + program_size));
-    WriteFile(output_path, dxil_container.data(), dxil_container.size());
-    return SCORPI_DXBC_TO_DXIL_OK;
+    return WrapDxilContainer(std::vector<uint8_t>(
+        static_cast<const uint8_t *>(shader_code),
+        static_cast<const uint8_t *>(shader_code) + program_size));
   }
 
-  return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+  return {};
+}
+
+std::vector<uint8_t> ConvertToDxilBinary(const void *shader_code,
+                                         size_t shader_code_size,
+                                         const void *signature_dump,
+                                         size_t signature_dump_size) {
+  if (shader_code == nullptr || shader_code_size == 0) {
+    throw std::invalid_argument("shader code is empty");
+  }
+
+  std::vector<uint8_t> existing =
+      NormalizeExistingDxil(shader_code, shader_code_size);
+  if (!existing.empty()) {
+    return existing;
+  }
+
+  if (!IsDxbcContainer(shader_code, shader_code_size)) {
+    ValidateShaderTokenStream(shader_code, shader_code_size);
+    throw std::runtime_error("shader code is not a DXBC container");
+  }
+
+  DxcMallocScope dxc_malloc;
+
+  hlsl::DxbcConverter converter;
+  void *dxil_binary = nullptr;
+  uint32_t dxil_size = 0;
+  LPWSTR diagnostics = nullptr;
+  const HRESULT status = converter.Convert(
+      shader_code, static_cast<uint32_t>(shader_code_size), nullptr,
+      &dxil_binary, &dxil_size, &diagnostics);
+  if (FAILED(status)) {
+    throw std::runtime_error("shader conversion failed");
+  }
+  if (dxil_binary == nullptr || dxil_size == 0) {
+    throw std::runtime_error("conversion succeeded without DXIL blob");
+  }
+
+  CComHeapPtr<void> dxil_holder(dxil_binary);
+  return std::vector<uint8_t>(static_cast<const uint8_t *>(dxil_binary),
+                              static_cast<const uint8_t *>(dxil_binary) +
+                                  dxil_size);
 }
 
 int ConvertToDxilFile(const void *shader_code, size_t shader_code_size,
@@ -299,44 +337,10 @@ int ConvertToDxilFile(const void *shader_code, size_t shader_code_size,
   if (output_path == nullptr || output_path[0] == '\0') {
     throw std::invalid_argument("output path is empty");
   }
-  if (shader_code == nullptr || shader_code_size == 0) {
-    throw std::invalid_argument("shader code is empty");
-  }
 
-  const int existing_status =
-      WriteExistingDxilFile(shader_code, shader_code_size, output_path);
-  if (existing_status == SCORPI_DXBC_TO_DXIL_OK) {
-    return existing_status;
-  }
-
-  const uint32_t *token_stream =
-      ValidateShaderTokenStream(shader_code, shader_code_size);
-  const SignatureView signatures =
-      ParseSignatures(signature_dump, signature_dump_size);
-
-  DxcMallocScope dxc_malloc;
-
-  ScorpiDxbcConverter converter;
-  DxcBlobScope dxil;
-  LPWSTR diagnostics = nullptr;
-  const HRESULT status = converter.ConvertRawInDriver(
-      token_stream, signatures.input, signatures.input_count,
-      signatures.output, signatures.output_count, signatures.patch,
-      signatures.patch_count, dxil.Out(), &diagnostics);
-
-  if (FAILED(status)) {
-    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
-  }
-  if (dxil.Get() == nullptr) {
-    throw std::runtime_error("conversion succeeded without DXIL blob");
-  }
-
-  const std::vector<uint8_t> dxil_program =
-      WrapDxilProgram(dxil.Get()->GetBufferPointer(), dxil.Get()->GetBufferSize(),
-                      token_stream[0]);
   const std::vector<uint8_t> dxil_container =
-      WrapDxilContainer(dxil_program);
-
+      ConvertToDxilBinary(shader_code, shader_code_size, signature_dump,
+                          signature_dump_size);
   WriteFile(output_path, dxil_container.data(), dxil_container.size());
   return SCORPI_DXBC_TO_DXIL_OK;
 }
@@ -365,6 +369,9 @@ extern "C" int ScorpiCreateDxilBinaryFile(
         message.find("DXIL") != std::string::npos) {
       return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
     }
+    if (message.find("conversion") != std::string::npos) {
+      return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+    }
     if (message.find("output") != std::string::npos ||
         message.find("file") != std::string::npos) {
       return SCORPI_DXBC_TO_DXIL_IO_FAILED;
@@ -374,4 +381,61 @@ extern "C" int ScorpiCreateDxilBinaryFile(
     SetError(error_message, error_message_size, "unexpected exception");
     return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
   }
+}
+
+extern "C" int ScorpiCreateDxilBinary(
+    const void *shader_code, size_t shader_code_size,
+    const void *signature_dump, size_t signature_dump_size, void **dxil_binary,
+    size_t *dxil_binary_size, char *error_message, size_t error_message_size) {
+  SetError(error_message, error_message_size, "");
+  if (dxil_binary == nullptr || dxil_binary_size == nullptr) {
+    SetError(error_message, error_message_size, "output pointer is null");
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  }
+  *dxil_binary = nullptr;
+  *dxil_binary_size = 0;
+
+  try {
+    const std::vector<uint8_t> dxil_container =
+        ConvertToDxilBinary(shader_code, shader_code_size, signature_dump,
+                            signature_dump_size);
+    if (dxil_container.empty()) {
+      SetError(error_message, error_message_size, "DXIL container is empty");
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    }
+
+    void *buffer = std::malloc(dxil_container.size());
+    if (buffer == nullptr) {
+      SetError(error_message, error_message_size, "failed to allocate output");
+      return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+    }
+    std::memcpy(buffer, dxil_container.data(), dxil_container.size());
+    *dxil_binary = buffer;
+    *dxil_binary_size = dxil_container.size();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::invalid_argument &error) {
+    SetError(error_message, error_message_size, error.what());
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  } catch (const std::runtime_error &error) {
+    const std::string message = error.what();
+    SetError(error_message, error_message_size, message);
+    if (message.find("signature") != std::string::npos) {
+      return SCORPI_DXBC_TO_DXIL_INVALID_SIGNATURES;
+    }
+    if (message.find("shader") != std::string::npos ||
+        message.find("DXIL") != std::string::npos) {
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    }
+    if (message.find("conversion") != std::string::npos) {
+      return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+    }
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  } catch (...) {
+    SetError(error_message, error_message_size, "unexpected exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
+extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
+  std::free(dxil_binary);
 }
