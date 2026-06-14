@@ -20,6 +20,7 @@ foreach(target ScorpiDxbcToDxil ScorpiDxbcToDxilStatic)
     DxbcConverter
     LLVMDxcSupport
     LLVMDxilContainer
+    LLVMDxilRootSignature
     LLVMMSSupport
     LLVMScalarOpts
     LLVMSupport

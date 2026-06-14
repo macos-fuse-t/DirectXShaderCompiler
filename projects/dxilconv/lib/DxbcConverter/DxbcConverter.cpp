@@ -13,11 +13,21 @@
 
 #include "DxbcConverterImpl.h"
 #include "DxilConvPasses/DxilCleanup.h"
+#include "Tracing/DxcRuntimeEtw.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilContainer/DxilContainerAssembler.h"
 #include "dxc/DxilContainer/DxilContainerReader.h"
 
 #define DXBCCONV_DBG 0
+#ifndef DxcRuntimeEtw_DxcTranslate_Start
+#define DxcRuntimeEtw_DxcTranslate_Start()
+#endif
+#ifndef DxcRuntimeEtw_DxcTranslate_Stop
+#define DxcRuntimeEtw_DxcTranslate_Stop(hr)
+#endif
+#ifndef DxcRuntimeEtw_DxcTranslate_TranslateStats
+#define DxcRuntimeEtw_DxcTranslate_TranslateStats(...)
+#endif
 
 namespace hlsl {
 

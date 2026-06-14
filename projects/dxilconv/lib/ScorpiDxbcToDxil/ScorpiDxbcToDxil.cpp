@@ -1,3 +1,5 @@
+#include "llvm/Support/Debug.h" // Must be included first.
+
 #include "ScorpiDxbcToDxil.h"
 
 #include "DxbcConverterImpl.h"

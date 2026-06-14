@@ -1,5 +1,11 @@
 #pragma once
 
+#ifdef _MSC_VER
+#include <../um/windows.h>
+#elif defined(_WIN32)
+#include "dxc/Support/WinIncludes.h"
+#else
+
 #include "dxc/Support/WinIncludes.h"
 
 #ifndef interface
@@ -167,3 +173,5 @@ inline HRESULT StringCchCopyA(char *dst, size_t dst_count, const char *src) {
   dst[dst_count - 1] = '\0';
   return S_OK;
 }
+
+#endif
