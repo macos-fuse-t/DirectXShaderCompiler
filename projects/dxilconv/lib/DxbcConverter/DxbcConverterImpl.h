@@ -178,13 +178,15 @@ public:
     unsigned Cols;
     D3D_INTERPOLATION_MODE InterpolationMode;
     D3D11_SB_OPERAND_MIN_PRECISION MinPrecision;
+    D3D10_SB_OPERAND_TYPE SpecialRegType;
     unsigned NumUnits;
     BYTE OutputStream;
 
     UsedElement()
         : Row(UINT_MAX), StartCol(UINT_MAX), Cols(0),
           InterpolationMode(D3D_INTERPOLATION_UNDEFINED),
-          MinPrecision(D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT), NumUnits(0),
+          MinPrecision(D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT),
+          SpecialRegType(D3D10_SB_OPERAND_TYPE_NULL), NumUnits(0),
           OutputStream(0) {}
 
     struct LTByStreamAndStartRowAndStartCol {

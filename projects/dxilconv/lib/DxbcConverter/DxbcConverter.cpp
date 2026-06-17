@@ -953,6 +953,14 @@ void DxbcConverter::ExtractSignatureFromDDI(
         P.RegisterComponentType == D3D10_SB_REGISTER_COMPONENT_UNKNOWN) {
       continue;
     }
+    if (m_pSM->IsPS() && SigHelper.IsOutput() &&
+        P.SystemValue == D3D10_SB_NAME_UNDEFINED &&
+        P.Register == UINT_MAX) {
+      // DDI only gives structural records here. The exact special PS output
+      // semantic is derivable from the DXBC declaration opcode, so do not
+      // materialize a lossy DDI record that can duplicate the derived one.
+      continue;
+    }
 
     // Extract data from DDI signature element record.
     SignatureHelper::ElementRecord E;
@@ -1042,8 +1050,14 @@ static bool SignatureRecordCoversUsedElement(
     const SignatureHelper::UsedElement &used) {
   if (record.Stream != used.OutputStream)
     return false;
-  if (record.StartRow > used.Row || used.Row >= record.StartRow + record.Rows)
+  if (record.StartRow == Semantic::kUndefinedRow ||
+      used.Row == Semantic::kUndefinedRow) {
+    if (record.StartRow != used.Row)
+      return false;
+  } else if (record.StartRow > used.Row ||
+             used.Row >= record.StartRow + record.Rows) {
     return false;
+  }
 
   const unsigned recordEndCol = record.StartCol + record.Cols;
   const unsigned usedEndCol = used.StartCol + used.Cols;
@@ -1051,9 +1065,9 @@ static bool SignatureRecordCoversUsedElement(
 }
 
 static void FillPixelOutputSystemValueRecord(
-    SignatureHelper::ElementRecord &record, D3D10_SB_OPERAND_TYPE DepthRegType,
-    bool HasStencilRef, bool HasCoverageOut) {
-  if (HasStencilRef) {
+    SignatureHelper::ElementRecord &record,
+    D3D10_SB_OPERAND_TYPE SpecialRegType) {
+  if (SpecialRegType == D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF) {
     record.SemanticName = "SV_StencilRef";
     record.SemanticIndex = Semantic::kUndefinedRow;
     record.ComponentType =
@@ -1061,7 +1075,7 @@ static void FillPixelOutputSystemValueRecord(
                                      D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT);
     return;
   }
-  if (HasCoverageOut) {
+  if (SpecialRegType == D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
     record.SemanticName = "SV_Coverage";
     record.SemanticIndex = Semantic::kUndefinedRow;
     record.ComponentType =
@@ -1070,7 +1084,7 @@ static void FillPixelOutputSystemValueRecord(
     return;
   }
 
-  switch (DepthRegType) {
+  switch (SpecialRegType) {
   case D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH:
     record.SemanticName = "SV_Depth";
     break;
@@ -1121,8 +1135,16 @@ static void AddMissingSignatureRecordsFromDeclarations(
 
     if (SM != nullptr && SM->IsPS() && SigHelper.IsOutput() &&
         used.Row == Semantic::kUndefinedRow) {
-      FillPixelOutputSystemValueRecord(record, DepthRegType, HasStencilRef,
-                                       HasCoverageOut);
+      D3D10_SB_OPERAND_TYPE SpecialRegType = used.SpecialRegType;
+      if (SpecialRegType == D3D10_SB_OPERAND_TYPE_NULL) {
+        if (HasStencilRef)
+          SpecialRegType = D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF;
+        else if (HasCoverageOut)
+          SpecialRegType = D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK;
+        else
+          SpecialRegType = DepthRegType;
+      }
+      FillPixelOutputSystemValueRecord(record, SpecialRegType);
       SigHelper.m_ElementRecords.emplace_back(record);
       continue;
     }
@@ -2121,6 +2143,7 @@ void DxbcConverter::AnalyzeShader(
         E.Cols = 1;
         E.InterpolationMode = D3D_INTERPOLATION_UNDEFINED;
         E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
+        E.SpecialRegType = RegType;
 
         m_pOutputSignature->m_UsedElements.emplace_back(E);
         break;
