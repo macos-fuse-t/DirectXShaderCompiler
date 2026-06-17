@@ -5,7 +5,7 @@
 
 #if defined(SCORPI_DXBC_TO_DXIL_STATIC)
 #define SCORPI_DXBC_TO_DXIL_EXPORT
-#elif defined(SCORPI_DXBC_TO_DXIL_BUILD_DLL)
+#elif defined(_WIN32) && defined(SCORPI_DXBC_TO_DXIL_BUILD_DLL)
 #define SCORPI_DXBC_TO_DXIL_EXPORT __declspec(dllexport)
 #elif defined(_WIN32)
 #define SCORPI_DXBC_TO_DXIL_EXPORT __declspec(dllimport)
