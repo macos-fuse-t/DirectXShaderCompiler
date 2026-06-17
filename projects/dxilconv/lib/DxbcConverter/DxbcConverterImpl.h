@@ -11,6 +11,7 @@
 #pragma once
 
 #include "dxc/DXIL/DXIL.h"
+#include "dxc/DXIL/DxilSigPoint.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilContainer/DxilContainerReader.h"
 #include "dxc/Support/Global.h"
@@ -179,6 +180,8 @@ public:
     D3D_INTERPOLATION_MODE InterpolationMode;
     D3D11_SB_OPERAND_MIN_PRECISION MinPrecision;
     D3D10_SB_OPERAND_TYPE SpecialRegType;
+    D3D10_SB_NAME SystemValue;
+    CompType ComponentType;
     unsigned NumUnits;
     BYTE OutputStream;
 
@@ -186,8 +189,9 @@ public:
         : Row(UINT_MAX), StartCol(UINT_MAX), Cols(0),
           InterpolationMode(D3D_INTERPOLATION_UNDEFINED),
           MinPrecision(D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT),
-          SpecialRegType(D3D10_SB_OPERAND_TYPE_NULL), NumUnits(0),
-          OutputStream(0) {}
+          SpecialRegType(D3D10_SB_OPERAND_TYPE_NULL),
+          SystemValue(D3D10_SB_NAME_UNDEFINED),
+          ComponentType(CompType::getInvalid()), NumUnits(0), OutputStream(0) {}
 
     struct LTByStreamAndStartRowAndStartCol {
       bool operator()(const UsedElement &e1, const UsedElement &e2) const {
@@ -273,6 +277,10 @@ public:
 
   bool IsInput() const { return m_Signature.IsInput(); }
   bool IsOutput() const { return m_Signature.IsOutput(); }
+  bool IsPatchConstOrPrim() const {
+    return SigPoint::GetSigPoint(m_Signature.GetSigPointKind())
+        ->IsPatchConstOrPrim();
+  }
 
   // Special case SGVs that are not in the signature.
   bool m_bHasInputCoverage;
@@ -572,6 +580,8 @@ protected:
   void ParseExtraOptions(const wchar_t *pStr);
 
   void AnalyzeShader(D3D10ShaderBinary::CShaderCodeParser &Parser);
+  void InferMissingOutputElementTypes(
+      D3D10ShaderBinary::CShaderCodeParser &Parser);
 
   void ExtractInputSignatureFromDXBC(DxilContainerReader &dxbcReader,
                                      const void *pMaxPtr);

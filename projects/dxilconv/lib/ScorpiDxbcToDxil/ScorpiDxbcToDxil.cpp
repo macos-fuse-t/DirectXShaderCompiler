@@ -358,7 +358,11 @@ ConvertTokenStreamToDxilContainer(const void *shader_code,
       signatures.output_count, signatures.patch, signatures.patch_count, nullptr,
       &dxil_binary, &dxil_size, &diagnostics);
   if (FAILED(status)) {
-    throw std::runtime_error("shader token stream conversion failed");
+    char message[128] = {};
+    std::snprintf(message, sizeof(message),
+                  "shader token stream conversion failed hr=0x%08x",
+                  static_cast<unsigned>(status));
+    throw std::runtime_error(message);
   }
   if (dxil_binary == nullptr || dxil_size == 0) {
     throw std::runtime_error(

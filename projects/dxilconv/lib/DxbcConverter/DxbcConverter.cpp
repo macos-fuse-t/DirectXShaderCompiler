@@ -42,6 +42,12 @@ static void AddMissingSignatureRecordsFromDeclarations(
     D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
     bool HasCoverageOut);
 
+static bool SameBaseCompType(CompType A, CompType B) {
+  if (A.IsInvalid() || B.IsInvalid())
+    return false;
+  return A.GetBaseCompType().GetKind() == B.GetBaseCompType().GetKind();
+}
+
 __override HRESULT STDMETHODCALLTYPE
 DxbcConverter::Convert(LPCVOID pDxbc, UINT32 DxbcSize, LPCWSTR pExtraOptions,
                        LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag) {
@@ -471,6 +477,9 @@ void DxbcConverter::ConvertInDriverImpl(
                      m_pPR->GetPatchConstOrPrimSignature());
   }
 
+  Parser.SetShader(pByteCode);
+  InferMissingOutputElementTypes(Parser);
+
   // 3. Parse output signature(s).
   ExtractSignatureFromDDI(pOutputSignature, NumOutputSignatureElements,
                           *m_pOutputSignature);
@@ -578,6 +587,9 @@ void DxbcConverter::ConvertInDriverToContainerImpl(
     ConvertSignature(*m_pPatchConstantSignature,
                      m_pPR->GetPatchConstOrPrimSignature());
   }
+
+  Parser.SetShader(pByteCode);
+  InferMissingOutputElementTypes(Parser);
 
   // 3. Parse output signature(s).
   ExtractSignatureFromDDI(pOutputSignature, NumOutputSignatureElements,
@@ -1145,6 +1157,31 @@ static void AddMissingSignatureRecordsFromDeclarations(
           SpecialRegType = DepthRegType;
       }
       FillPixelOutputSystemValueRecord(record, SpecialRegType);
+      SigHelper.m_ElementRecords.emplace_back(record);
+      continue;
+    }
+
+    const bool isOutputLike =
+        SigHelper.IsOutput() || SigHelper.IsPatchConstOrPrim();
+
+    if (isOutputLike &&
+        used.SystemValue != D3D10_SB_NAME_UNDEFINED) {
+      record.SemanticName = string(DXBC::GetD3D10SBName(used.SystemValue));
+      record.SemanticIndex = DXBC::GetD3D10SBSemanticIndex(used.SystemValue);
+      record.ComponentType = used.ComponentType;
+      if (record.ComponentType.IsInvalid()) {
+        record.ComponentType = DXBC::GetCompTypeWithMinPrec(
+            DXBC::GetD3DRegCompType(used.SystemValue), used.MinPrecision);
+      }
+      SigHelper.m_ElementRecords.emplace_back(record);
+      continue;
+    }
+
+    if (isOutputLike && !used.ComponentType.IsInvalid()) {
+      record.SemanticName =
+          SigHelper.IsPatchConstOrPrim() ? "SCORPIPC" : "SCORPI";
+      record.SemanticIndex = used.Row;
+      record.ComponentType = used.ComponentType;
       SigHelper.m_ElementRecords.emplace_back(record);
       continue;
     }
@@ -2144,6 +2181,13 @@ void DxbcConverter::AnalyzeShader(
         E.InterpolationMode = D3D_INTERPOLATION_UNDEFINED;
         E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
         E.SpecialRegType = RegType;
+        E.ComponentType = DXBC::GetCompTypeWithMinPrec(
+            RegType == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH ||
+                    RegType == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL ||
+                    RegType == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL
+                ? D3D_REGISTER_COMPONENT_FLOAT32
+                : D3D_REGISTER_COMPONENT_UINT32,
+            E.MinPrecision);
 
         m_pOutputSignature->m_UsedElements.emplace_back(E);
         break;
@@ -2186,6 +2230,11 @@ void DxbcConverter::AnalyzeShader(
       E.InterpolationMode = D3D_INTERPOLATION_UNDEFINED;
       E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
       E.OutputStream = CurrentOutputStream;
+      E.SystemValue = Inst.OpCode() == D3D10_SB_OPCODE_DCL_OUTPUT_SIV
+                          ? Inst.m_OutputDeclSIV.Name
+                          : Inst.m_OutputDeclSGV.Name;
+      E.ComponentType = DXBC::GetCompTypeWithMinPrec(
+          DXBC::GetD3DRegCompType(E.SystemValue), E.MinPrecision);
 
       if (!m_pSM->IsHS() || m_bControlPointPhase) {
         m_pOutputSignature->m_UsedElements.emplace_back(E);
@@ -2402,6 +2451,197 @@ void DxbcConverter::AnalyzeShader(
     default:
       break;
     }
+  }
+}
+
+void DxbcConverter::InferMissingOutputElementTypes(
+    D3D10ShaderBinary::CShaderCodeParser &Parser) {
+  auto getSelectedComponent =
+      [](const D3D10ShaderBinary::COperandBase &O, BYTE c) -> unsigned {
+    switch (O.m_ComponentSelection) {
+    case D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE:
+      return O.m_Swizzle[c];
+    case D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE:
+      return O.m_ComponentName;
+    default:
+      return c;
+    }
+  };
+
+  auto inferSignatureSourceType =
+      [&](const D3D10ShaderBinary::COperandBase &O, BYTE c) -> CompType {
+    if (O.m_Type != D3D10_SB_OPERAND_TYPE_INPUT)
+      return CompType::getInvalid();
+
+    unsigned reg = O.m_Index[(m_pSM->IsGS() || m_pSM->IsHS()) ? 1 : 0]
+                       .m_RegIndex;
+    unsigned comp = getSelectedComponent(O, c);
+    const DxilSignatureElement *E = m_pInputSignature->GetElement(reg, comp);
+    if (E == nullptr)
+      return CompType::getInvalid();
+    return E->GetCompType();
+  };
+
+  auto inferOutputWriteType =
+      [&](const D3D10ShaderBinary::CInstruction &Inst, BYTE c) -> CompType {
+    switch (Inst.OpCode()) {
+    case D3D10_SB_OPCODE_MOV: {
+      if (Inst.m_Operands[1].Modifier() !=
+              D3D10_SB_OPERAND_MODIFIER_NONE ||
+          Inst.m_bSaturate)
+        return CompType::getF32();
+      return inferSignatureSourceType(Inst.m_Operands[1], c);
+    }
+
+    case D3D10_SB_OPCODE_MOVC: {
+      CompType src2 = inferSignatureSourceType(Inst.m_Operands[2], c);
+      CompType src3 = inferSignatureSourceType(Inst.m_Operands[3], c);
+      if (Inst.m_Operands[2].Modifier() !=
+              D3D10_SB_OPERAND_MODIFIER_NONE ||
+          Inst.m_Operands[3].Modifier() !=
+              D3D10_SB_OPERAND_MODIFIER_NONE ||
+          Inst.m_bSaturate)
+        return CompType::getF32();
+      if (SameBaseCompType(src2, src3))
+        return src2;
+      if (!src2.IsInvalid() && src3.IsInvalid())
+        return src2;
+      if (src2.IsInvalid() && !src3.IsInvalid())
+        return src3;
+      return CompType::getInvalid();
+    }
+
+    case D3D10_SB_OPCODE_ADD:
+    case D3D10_SB_OPCODE_MUL:
+    case D3D10_SB_OPCODE_DIV:
+    case D3D10_SB_OPCODE_MAX:
+    case D3D10_SB_OPCODE_MIN:
+    case D3D10_SB_OPCODE_MAD:
+    case D3D10_SB_OPCODE_DP2:
+    case D3D10_SB_OPCODE_DP3:
+    case D3D10_SB_OPCODE_DP4:
+    case D3D10_SB_OPCODE_ITOF:
+    case D3D10_SB_OPCODE_UTOF:
+      return CompType::getF32();
+
+    case D3D10_SB_OPCODE_IADD:
+    case D3D10_SB_OPCODE_IMAX:
+    case D3D10_SB_OPCODE_IMIN:
+    case D3D10_SB_OPCODE_AND:
+    case D3D10_SB_OPCODE_OR:
+    case D3D10_SB_OPCODE_XOR:
+    case D3D10_SB_OPCODE_ISHL:
+    case D3D10_SB_OPCODE_ISHR:
+    case D3D10_SB_OPCODE_USHR:
+    case D3D10_SB_OPCODE_IMAD:
+    case D3D11_1_SB_OPCODE_MSAD:
+    case D3D11_SB_OPCODE_IBFE:
+    case D3D11_SB_OPCODE_UBFE:
+    case D3D11_SB_OPCODE_BFI:
+    case D3D10_SB_OPCODE_FTOI:
+      return CompType::getI32();
+
+    case D3D10_SB_OPCODE_UMAX:
+    case D3D10_SB_OPCODE_UMIN:
+    case D3D10_SB_OPCODE_UMAD:
+    case D3D10_SB_OPCODE_FTOU:
+      return CompType::getU32();
+
+    default:
+      return CompType::getInvalid();
+    }
+  };
+
+  auto applyOutputWriteType = [&](SignatureHelper &signature, unsigned row,
+                                  BYTE stream, const CMask &mask,
+                                  CompType type) {
+    if (type.IsInvalid())
+      return;
+
+    for (SignatureHelper::UsedElement &used : signature.m_UsedElements) {
+      if (used.Row != row || used.OutputStream != stream ||
+          used.SystemValue != D3D10_SB_NAME_UNDEFINED)
+        continue;
+
+      bool overlaps = false;
+      for (BYTE c = 0; c < DXBC::kWidth; ++c) {
+        if (mask.IsSet(c) && c >= used.StartCol &&
+            c < used.StartCol + used.Cols) {
+          overlaps = true;
+          break;
+        }
+      }
+      if (!overlaps)
+        continue;
+
+      type = DXBC::GetCompTypeWithMinPrec(type.GetBaseCompType(),
+                                          used.MinPrecision);
+      if (used.ComponentType.IsInvalid()) {
+        used.ComponentType = type;
+      } else if (!SameBaseCompType(used.ComponentType, type)) {
+        used.ComponentType = CompType::getInvalid();
+      }
+    }
+  };
+
+  BYTE currentOutputStream = 0;
+  bool patchConstantPhase = false;
+  D3D10ShaderBinary::CInstruction Inst;
+  while (!Parser.EndOfShader()) {
+    Parser.ParseInstruction(&Inst);
+
+    switch (Inst.OpCode()) {
+    case D3D11_SB_OPCODE_HS_CONTROL_POINT_PHASE:
+      patchConstantPhase = false;
+      continue;
+    case D3D11_SB_OPCODE_HS_FORK_PHASE:
+    case D3D11_SB_OPCODE_HS_JOIN_PHASE:
+      patchConstantPhase = true;
+      continue;
+    case D3D10_SB_OPCODE_LABEL:
+      patchConstantPhase = false;
+      break;
+    default:
+      break;
+    }
+
+    if (Inst.OpCode() == D3D11_SB_OPCODE_DCL_STREAM) {
+      currentOutputStream = (BYTE)Inst.m_Operands[0].m_Index[0].m_RegIndex;
+      continue;
+    }
+
+    if (Inst.m_NumOperands == 0 ||
+        Inst.m_Operands[0].m_Type != D3D10_SB_OPERAND_TYPE_OUTPUT)
+      continue;
+
+    CMask writeMask = CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask);
+    if (writeMask.IsZero())
+      continue;
+
+    unsigned row = Inst.m_Operands[0].m_Index[0].m_RegIndex;
+    CompType type = CompType::getInvalid();
+    for (BYTE c = 0; c < DXBC::kWidth; ++c) {
+      if (!writeMask.IsSet(c))
+        continue;
+
+      CompType componentType = inferOutputWriteType(Inst, c);
+      if (componentType.IsInvalid()) {
+        type = CompType::getInvalid();
+        break;
+      }
+      if (type.IsInvalid())
+        type = componentType;
+      else if (!SameBaseCompType(type, componentType)) {
+        type = CompType::getInvalid();
+        break;
+      }
+    }
+
+    SignatureHelper &targetSignature =
+        (m_pSM->IsHS() && patchConstantPhase) ? *m_pPatchConstantSignature
+                                              : *m_pOutputSignature;
+    applyOutputWriteType(targetSignature, row, currentOutputStream, writeMask,
+                         type);
   }
 }
 
