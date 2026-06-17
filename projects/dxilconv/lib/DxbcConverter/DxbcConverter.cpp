@@ -13,16 +13,34 @@
 
 #include "DxbcConverterImpl.h"
 #include "DxilConvPasses/DxilCleanup.h"
+#include "Tracing/DxcRuntimeEtw.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilContainer/DxilContainerAssembler.h"
 #include "dxc/DxilContainer/DxilContainerReader.h"
+#include "dxc/DxilHash/DxilHash.h"
+#include "dxc/Support/dxcapi.impl.h"
 
 #define DXBCCONV_DBG 0
+#ifndef DxcRuntimeEtw_DxcTranslate_Start
+#define DxcRuntimeEtw_DxcTranslate_Start()
+#endif
+#ifndef DxcRuntimeEtw_DxcTranslate_Stop
+#define DxcRuntimeEtw_DxcTranslate_Stop(hr)
+#endif
+#ifndef DxcRuntimeEtw_DxcTranslate_TranslateStats
+#define DxcRuntimeEtw_DxcTranslate_TranslateStats(...)
+#endif
 
 namespace hlsl {
 
+static void SetDxilTargetTriple(llvm::Module *pModule) {
+  pModule->setTargetTriple("dxil-ms-dx");
+}
+
 static void AddMissingSignatureRecordsFromDeclarations(
-    SignatureHelper &SigHelper, const ShaderModel *SM);
+    SignatureHelper &SigHelper, const ShaderModel *SM,
+    D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
+    bool HasCoverageOut);
 
 __override HRESULT STDMETHODCALLTYPE
 DxbcConverter::Convert(LPCVOID pDxbc, UINT32 DxbcSize, LPCWSTR pExtraOptions,
@@ -105,6 +123,52 @@ __override HRESULT STDMETHODCALLTYPE DxbcConverter::ConvertInDriver(
   return hr;
 }
 
+HRESULT STDMETHODCALLTYPE DxbcConverter::ConvertInDriverToContainer(
+    const UINT32 *pBytecode, LPCVOID pInputSignature,
+    UINT32 NumInputSignatureElements, LPCVOID pOutputSignature,
+    UINT32 NumOutputSignatureElements, LPCVOID pPatchConstantSignature,
+    UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
+    LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag) {
+  DxcThreadMalloc TM(m_pMalloc);
+  LARGE_INTEGER start, end;
+  QueryPerformanceCounter(&start);
+  DxcRuntimeEtw_DxcTranslate_Start();
+  HRESULT hr = S_OK;
+  UINT32 bcSize = pBytecode[1] * sizeof(UINT32);
+  try {
+    sys::fs::MSFileSystem *pFSPtr;
+    IFT(CreateMSFileSystemForDisk(&pFSPtr));
+    unique_ptr<sys::fs::MSFileSystem> pFS(pFSPtr);
+    sys::fs::AutoPerThreadSystem pTS(pFS.get());
+    IFTLLVM(pTS.error_code());
+
+    struct StdErrFlusher {
+      ~StdErrFlusher() { dbgs().flush(); }
+    } S;
+
+    ConvertInDriverToContainerImpl(
+        pBytecode, (const D3D12DDIARG_SIGNATURE_ENTRY_0012 *)pInputSignature,
+        NumInputSignatureElements,
+        (const D3D12DDIARG_SIGNATURE_ENTRY_0012 *)pOutputSignature,
+        NumOutputSignatureElements,
+        (const D3D12DDIARG_SIGNATURE_ENTRY_0012 *)pPatchConstantSignature,
+        NumPatchConstantSignatureElements, pExtraOptions, ppDxil, pDxilSize,
+        ppDiag);
+
+    DxcRuntimeEtw_DxcTranslate_TranslateStats(
+        bcSize, bcSize, (const BYTE *)pBytecode, *pDxilSize);
+
+    hr = S_OK;
+  }
+  CATCH_CPP_ASSIGN_HRESULT();
+  DxcRuntimeEtw_DxcTranslate_Stop(hr);
+  QueryPerformanceCounter(&end);
+  LogConvertResult(true, &start, &end, pBytecode, bcSize, pExtraOptions,
+                   ppDxil != nullptr ? *ppDxil : nullptr,
+                   pDxilSize != nullptr ? *pDxilSize : 0, hr);
+  return hr;
+}
+
 DxbcConverter::DxbcConverter()
     : m_dwRef(0), m_pPR(nullptr), m_pOP(nullptr), m_pSM(nullptr),
       m_DxbcMajor(0), m_DxbcMinor(0), m_bDisableHashCheck(false),
@@ -144,6 +208,19 @@ void WritePart(AbstractMemoryStream *pStream,
   WritePart(pStream, Data.data(), Data.size());
 }
 
+static void HashDxilContainer(void *pData, UINT32 Size) {
+  DxilContainerHeader *pHeader =
+      (DxilContainerHeader *)IsDxilContainerLike(pData, Size);
+  if (!pHeader)
+    return;
+
+  static const UINT32 DXBCHashStartOffset =
+      offsetof(DxilContainerHeader, Version);
+  const BYTE *pDataToHash = (const BYTE *)pHeader + DXBCHashStartOffset;
+  UINT32 AmountToHash = pHeader->ContainerSizeInBytes - DXBCHashStartOffset;
+  ComputeHashRetail(pDataToHash, AmountToHash, pHeader->Hash.Digest);
+}
+
 void DxbcConverter::ConvertImpl(LPCVOID pDxbc, UINT32 DxbcSize,
                                 LPCWSTR pExtraOptions, LPVOID *ppDxil,
                                 UINT32 *pDxilSize, LPWSTR *ppDiag) {
@@ -160,6 +237,7 @@ void DxbcConverter::ConvertImpl(LPCVOID pDxbc, UINT32 DxbcSize,
 
   // Create the module.
   m_pModule = std::make_unique<llvm::Module>("main", m_Ctx);
+  SetDxilTargetTriple(m_pModule.get());
 
   // Setup DxilModule.
   m_pPR = &(m_pModule->GetOrCreateDxilModule(/*skipInit*/ true));
@@ -320,6 +398,7 @@ void DxbcConverter::ConvertImpl(LPCVOID pDxbc, UINT32 DxbcSize,
   IFT(CreateFixedSizeMemoryStream((LPBYTE)pOutput.m_pData, OutputSize,
                                   &pOutputStream));
   pContainerWriter->write(pOutputStream);
+  HashDxilContainer(pOutput.m_pData, OutputSize);
   // pOutputStream does not own the buffer; allow CComPtr to clean up the stream
   // object.
 
@@ -356,6 +435,7 @@ void DxbcConverter::ConvertInDriverImpl(
 
   // Create the module.
   m_pModule = std::make_unique<llvm::Module>("main", m_Ctx);
+  SetDxilTargetTriple(m_pModule.get());
 
   // Setup DxilModule.
   m_pPR = &(m_pModule->GetOrCreateDxilModule(/*skipInit*/ true));
@@ -368,17 +448,25 @@ void DxbcConverter::ConvertInDriverImpl(
   Parser.SetShader(pByteCode);
   AnalyzeShader(Parser);
 
+  // 1.5. Callback before conversion. DDI shader bytecode may not come with a
+  // complete input signature, so collect declaration use before signatures are
+  // materialized.
+  PreConvertHook(pByteCode);
+
   // 2. Parse input signature(s).
   ExtractSignatureFromDDI(pInputSignature, NumInputSignatureElements,
                           *m_pInputSignature);
-  AddMissingSignatureRecordsFromDeclarations(*m_pInputSignature, m_pSM);
+  AddMissingSignatureRecordsFromDeclarations(
+      *m_pInputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+      m_bHasCoverageOut);
   ConvertSignature(*m_pInputSignature, m_pPR->GetInputSignature());
   if (m_pSM->IsDS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
                             NumPatchConstantSignatureElements,
                             *m_pPatchConstantSignature);
-    AddMissingSignatureRecordsFromDeclarations(*m_pPatchConstantSignature,
-                                               m_pSM);
+    AddMissingSignatureRecordsFromDeclarations(
+        *m_pPatchConstantSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+        m_bHasCoverageOut);
     ConvertSignature(*m_pPatchConstantSignature,
                      m_pPR->GetPatchConstOrPrimSignature());
   }
@@ -386,20 +474,20 @@ void DxbcConverter::ConvertInDriverImpl(
   // 3. Parse output signature(s).
   ExtractSignatureFromDDI(pOutputSignature, NumOutputSignatureElements,
                           *m_pOutputSignature);
-  AddMissingSignatureRecordsFromDeclarations(*m_pOutputSignature, m_pSM);
+  AddMissingSignatureRecordsFromDeclarations(
+      *m_pOutputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+      m_bHasCoverageOut);
   ConvertSignature(*m_pOutputSignature, m_pPR->GetOutputSignature());
   if (m_pSM->IsHS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
                             NumPatchConstantSignatureElements,
                             *m_pPatchConstantSignature);
-    AddMissingSignatureRecordsFromDeclarations(*m_pPatchConstantSignature,
-                                               m_pSM);
+    AddMissingSignatureRecordsFromDeclarations(
+        *m_pPatchConstantSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+        m_bHasCoverageOut);
     ConvertSignature(*m_pPatchConstantSignature,
                      m_pPR->GetPatchConstOrPrimSignature());
   }
-
-  // 3.5. Callback before conversion
-  PreConvertHook(pByteCode);
 
   // 4. Transform DXBC to DXIL.
   Parser.SetShader(pByteCode);
@@ -422,6 +510,128 @@ void DxbcConverter::ConvertInDriverImpl(
 
   IFT(DxcCreateBlobOnHeapCopy(DxilBuffer.data(), DxilBuffer.size_in_bytes(),
                               ppDxcBlob));
+
+  m_pBuilder.reset();
+  m_pModule.reset();
+
+  // Diagnostics.
+  if (ppDiag)
+    *ppDiag = nullptr;
+}
+
+void DxbcConverter::ConvertInDriverToContainerImpl(
+    const UINT32 *pByteCode,
+    const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pInputSignature,
+    UINT32 NumInputSignatureElements,
+    const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pOutputSignature,
+    UINT32 NumOutputSignatureElements,
+    const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pPatchConstantSignature,
+    UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
+    LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag) {
+  IFTARG(pByteCode);
+  IFTARG(ppDxil);
+  IFTARG(pDxilSize);
+  UINT SizeInUINTs = pByteCode[1];
+  IFTBOOL(SizeInUINTs >= 2, DXC_E_ERROR_PARSING_DXBC_BYTECODE);
+  *ppDxil = nullptr;
+  *pDxilSize = 0;
+  if (ppDiag)
+    *ppDiag = nullptr;
+
+  // Parse pExtraOptions.
+  ParseExtraOptions(pExtraOptions);
+
+  // Create the module.
+  m_pModule = std::make_unique<llvm::Module>("main", m_Ctx);
+  SetDxilTargetTriple(m_pModule.get());
+
+  // Setup DxilModule.
+  m_pPR = &(m_pModule->GetOrCreateDxilModule(/*skipInit*/ true));
+  m_pOP = m_pPR->GetOP();
+
+  // Parse DXBC bytecode.
+  D3D10ShaderBinary::CShaderCodeParser Parser;
+
+  // 1. Collect information about the shader.
+  Parser.SetShader(pByteCode);
+  AnalyzeShader(Parser);
+
+  // 1.5. Callback before conversion. DDI shader bytecode may not come with a
+  // complete input signature, so collect declaration use before signatures are
+  // materialized.
+  PreConvertHook(pByteCode);
+
+  // 2. Parse input signature(s).
+  ExtractSignatureFromDDI(pInputSignature, NumInputSignatureElements,
+                          *m_pInputSignature);
+  AddMissingSignatureRecordsFromDeclarations(
+      *m_pInputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+      m_bHasCoverageOut);
+  ConvertSignature(*m_pInputSignature, m_pPR->GetInputSignature());
+  if (m_pSM->IsDS()) {
+    ExtractSignatureFromDDI(pPatchConstantSignature,
+                            NumPatchConstantSignatureElements,
+                            *m_pPatchConstantSignature);
+    AddMissingSignatureRecordsFromDeclarations(
+        *m_pPatchConstantSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+        m_bHasCoverageOut);
+    ConvertSignature(*m_pPatchConstantSignature,
+                     m_pPR->GetPatchConstOrPrimSignature());
+  }
+
+  // 3. Parse output signature(s).
+  ExtractSignatureFromDDI(pOutputSignature, NumOutputSignatureElements,
+                          *m_pOutputSignature);
+  AddMissingSignatureRecordsFromDeclarations(
+      *m_pOutputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+      m_bHasCoverageOut);
+  ConvertSignature(*m_pOutputSignature, m_pPR->GetOutputSignature());
+  if (m_pSM->IsHS()) {
+    ExtractSignatureFromDDI(pPatchConstantSignature,
+                            NumPatchConstantSignatureElements,
+                            *m_pPatchConstantSignature);
+    AddMissingSignatureRecordsFromDeclarations(
+        *m_pPatchConstantSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
+        m_bHasCoverageOut);
+    ConvertSignature(*m_pPatchConstantSignature,
+                     m_pPR->GetPatchConstOrPrimSignature());
+  }
+
+  // 4. Transform DXBC to DXIL.
+  Parser.SetShader(pByteCode);
+  ConvertInstructions(Parser);
+
+  // 5. Emit metadata.
+  m_pPR->EmitDxilMetadata();
+  EmitIdentMetadata(m_pModule.get(), "dxbc2dxil 1.2");
+
+  // 6. Cleanup/Optimize DXIL.
+  Optimize();
+
+  // 7. Callback after conversion.
+  PostConvertHook(pByteCode);
+
+  CComPtr<AbstractMemoryStream> pModuleBitcodeStream;
+  IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pModuleBitcodeStream));
+  {
+    raw_stream_ostream DxilStream(pModuleBitcodeStream.p);
+    WriteBitcodeToFile(m_pModule.get(), DxilStream);
+  }
+
+  CComPtr<AbstractMemoryStream> pContainerStream;
+  IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pContainerStream));
+  SerializeDxilContainerForModule(m_pPR, pModuleBitcodeStream, nullptr,
+                                  pContainerStream, llvm::StringRef(),
+                                  SerializeDxilFlags::None);
+
+  UINT32 OutputSize = pContainerStream->GetPtrSize();
+  CComHeapPtr<void> pOutput;
+  IFTBOOL(pOutput.AllocateBytes(OutputSize), E_OUTOFMEMORY);
+  memcpy(pOutput.m_pData, pContainerStream->GetPtr(), OutputSize);
+  HashDxilContainer(pOutput.m_pData, OutputSize);
+
+  *ppDxil = pOutput.Detach();
+  *pDxilSize = OutputSize;
 
   m_pBuilder.reset();
   m_pModule.reset();
@@ -734,15 +944,6 @@ void DxbcConverter::ExtractSignatureFromDXBC(
 void DxbcConverter::ExtractSignatureFromDDI(
     const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pElements, unsigned NumElements,
     SignatureHelper &SigHelper) {
-  string NamePrefix;
-  if (SigHelper.IsInput())
-    NamePrefix = "_in";
-  else if (SigHelper.IsOutput())
-    NamePrefix = "_out";
-  else
-    NamePrefix = "_pc";
-
-  unsigned iArbitrarySemantic = 0;
   for (unsigned iElement = 0; iElement < NumElements; iElement++) {
     const D3D12DDIARG_SIGNATURE_ENTRY_0012 &P = pElements[iElement];
     if (P.Mask == 0) {
@@ -812,8 +1013,10 @@ void DxbcConverter::ExtractSignatureFromDDI(
         }
       } else {
         // Arbitrary semantic.
-        E.SemanticName = NamePrefix + std::to_string(iArbitrarySemantic++);
-        E.SemanticIndex = iElement;
+        E.SemanticName =
+            (SigHelper.IsInput() || SigHelper.IsOutput()) ? "SCORPI"
+                                                          : "SCORPIPC";
+        E.SemanticIndex = P.Register;
       }
     } else {
       E.SemanticName = string(DXBC::GetD3D10SBName(P.SystemValue));
@@ -847,13 +1050,52 @@ static bool SignatureRecordCoversUsedElement(
   return record.StartCol <= used.StartCol && usedEndCol <= recordEndCol;
 }
 
+static void FillPixelOutputSystemValueRecord(
+    SignatureHelper::ElementRecord &record, D3D10_SB_OPERAND_TYPE DepthRegType,
+    bool HasStencilRef, bool HasCoverageOut) {
+  if (HasStencilRef) {
+    record.SemanticName = "SV_StencilRef";
+    record.SemanticIndex = Semantic::kUndefinedRow;
+    record.ComponentType =
+        DXBC::GetCompTypeWithMinPrec(D3D_REGISTER_COMPONENT_UINT32,
+                                     D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT);
+    return;
+  }
+  if (HasCoverageOut) {
+    record.SemanticName = "SV_Coverage";
+    record.SemanticIndex = Semantic::kUndefinedRow;
+    record.ComponentType =
+        DXBC::GetCompTypeWithMinPrec(D3D_REGISTER_COMPONENT_UINT32,
+                                     D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT);
+    return;
+  }
+
+  switch (DepthRegType) {
+  case D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH:
+    record.SemanticName = "SV_Depth";
+    break;
+  case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL:
+    record.SemanticName = "SV_DepthGreaterEqual";
+    break;
+  case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL:
+    record.SemanticName = "SV_DepthLessEqual";
+    break;
+  case D3D10_SB_OPERAND_TYPE_NULL:
+  default:
+    IFT(DXC_E_INCORRECT_DDI_SIGNATURE);
+  }
+  record.SemanticIndex = Semantic::kUndefinedRow;
+  record.ComponentType =
+      DXBC::GetCompTypeWithMinPrec(D3D_REGISTER_COMPONENT_FLOAT32,
+                                   D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT);
+}
+
 static void AddMissingSignatureRecordsFromDeclarations(
-    SignatureHelper &SigHelper, const ShaderModel *SM) {
-  string NamePrefix;
-  if (SigHelper.IsInput() || SigHelper.IsOutput())
-    NamePrefix = "_in";
-  else
-    NamePrefix = "_pc";
+    SignatureHelper &SigHelper, const ShaderModel *SM,
+    D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
+    bool HasCoverageOut) {
+  if (SigHelper.m_UsedElements.empty())
+    return;
 
   for (const SignatureHelper::UsedElement &used : SigHelper.m_UsedElements) {
     if (used.Cols == 0)
@@ -871,21 +1113,24 @@ static void AddMissingSignatureRecordsFromDeclarations(
       continue;
 
     SignatureHelper::ElementRecord record;
-    if (SM != nullptr && SM->IsPS() && SigHelper.IsOutput()) {
-      record.SemanticName = "SV_Target";
-      record.SemanticIndex = used.Row;
-    } else {
-      record.SemanticName = NamePrefix + std::to_string(used.Row);
-      record.SemanticIndex = used.Row;
-    }
     record.StartRow = used.Row;
     record.StartCol = used.StartCol;
     record.Rows = 1;
     record.Cols = used.Cols;
     record.Stream = used.OutputStream;
-    record.ComponentType = DXBC::GetCompTypeWithMinPrec(
-        D3D_REGISTER_COMPONENT_FLOAT32, used.MinPrecision);
-    SigHelper.m_ElementRecords.emplace_back(record);
+
+    if (SM != nullptr && SM->IsPS() && SigHelper.IsOutput() &&
+        used.Row == Semantic::kUndefinedRow) {
+      FillPixelOutputSystemValueRecord(record, DepthRegType, HasStencilRef,
+                                       HasCoverageOut);
+      SigHelper.m_ElementRecords.emplace_back(record);
+      continue;
+    }
+
+    // DDI arbitrary records do not carry semantic names, but they do carry the
+    // component type. If a used arbitrary declaration is not covered by a DDI
+    // structural record, do not guess a fake float signature.
+    IFT(DXC_E_INCORRECT_DDI_SIGNATURE);
   }
 }
 

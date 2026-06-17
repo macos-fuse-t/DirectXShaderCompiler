@@ -1,9 +1,14 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
-#if defined(_WIN32)
+#if defined(SCORPI_DXBC_TO_DXIL_STATIC)
+#define SCORPI_DXBC_TO_DXIL_EXPORT
+#elif defined(SCORPI_DXBC_TO_DXIL_BUILD_DLL)
 #define SCORPI_DXBC_TO_DXIL_EXPORT __declspec(dllexport)
+#elif defined(_WIN32)
+#define SCORPI_DXBC_TO_DXIL_EXPORT __declspec(dllimport)
 #else
 #define SCORPI_DXBC_TO_DXIL_EXPORT __attribute__((visibility("default")))
 #endif
@@ -22,6 +27,32 @@ enum ScorpiDxbcToDxilStatus {
   SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR = 6,
 };
 
+enum {
+  SCORPI_SHADER_SIGNATURE_METADATA_VERSION = 2,
+};
+
+typedef struct ScorpiShaderSignatureMetadata {
+  uint32_t version;
+  uint32_t flags;
+  uint32_t signature_entry_size;
+  uint32_t input_count;
+  uint32_t output_count;
+  uint32_t patch_count;
+  uint32_t input_offset;
+  uint32_t output_offset;
+  uint32_t patch_offset;
+  uint32_t reserved;
+} ScorpiShaderSignatureMetadata;
+
+typedef struct ScorpiShaderSignatureEntry {
+  uint32_t system_value;
+  uint32_t register_index;
+  uint32_t mask;
+  uint32_t stream;
+  uint32_t component_type;
+  uint32_t min_precision;
+} ScorpiShaderSignatureEntry;
+
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateDxilBinaryFile(const void *shader_code,
                            size_t shader_code_size,
@@ -30,6 +61,19 @@ ScorpiCreateDxilBinaryFile(const void *shader_code,
                            const char *output_path,
                            char *error_message,
                            size_t error_message_size);
+
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateDxilBinary(const void *shader_code,
+                       size_t shader_code_size,
+                       const void *signature_dump,
+                       size_t signature_dump_size,
+                       void **dxil_binary,
+                       size_t *dxil_binary_size,
+                       char *error_message,
+                       size_t error_message_size);
+
+SCORPI_DXBC_TO_DXIL_EXPORT void
+ScorpiFreeDxilBinary(void *dxil_binary);
 
 #ifdef __cplusplus
 }
