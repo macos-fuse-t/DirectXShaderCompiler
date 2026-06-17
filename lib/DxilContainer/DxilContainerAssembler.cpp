@@ -304,7 +304,7 @@ private:
       // Only mark exist channel write for output.
       // All channel not used for input.
       if (!m_isInput)
-        sig.NeverWrites_Mask = ~sig.Mask;
+        sig.NeverWrites_Mask = NegMask(sig.Mask);
       else
         sig.AlwaysReads_Mask = 0;
     } else {

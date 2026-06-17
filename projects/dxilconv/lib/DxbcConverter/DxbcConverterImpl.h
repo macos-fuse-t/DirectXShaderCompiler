@@ -311,6 +311,13 @@ public:
       UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
       IDxcBlob **ppDxilModule, LPWSTR *ppDiag) override;
 
+  HRESULT STDMETHODCALLTYPE ConvertInDriverToContainer(
+      const UINT32 *pBytecode, LPCVOID pInputSignature,
+      UINT32 NumInputSignatureElements, LPCVOID pOutputSignature,
+      UINT32 NumOutputSignatureElements, LPCVOID pPatchConstantSignature,
+      UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
+      LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag);
+
 protected:
   LLVMContext m_Ctx;
   DxilModule *m_pPR;
@@ -535,6 +542,16 @@ protected:
       const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pPatchConstantSignature,
       UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
       IDxcBlob **ppDxcBlob, LPWSTR *ppDiag);
+
+  virtual void ConvertInDriverToContainerImpl(
+      const UINT32 *pByteCode,
+      const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pInputSignature,
+      UINT32 NumInputSignatureElements,
+      const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pOutputSignature,
+      UINT32 NumOutputSignatureElements,
+      const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pPatchConstantSignature,
+      UINT32 NumPatchConstantSignatureElements, LPCWSTR pExtraOptions,
+      LPVOID *ppDxil, UINT32 *pDxilSize, LPWSTR *ppDiag);
 
   virtual void LogConvertResult(bool InDriver,
                                 const LARGE_INTEGER *pQPCConvertStart,

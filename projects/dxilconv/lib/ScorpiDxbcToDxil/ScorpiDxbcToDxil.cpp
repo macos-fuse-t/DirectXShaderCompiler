@@ -1,9 +1,11 @@
 #include "llvm/Support/Debug.h" // Must be included first.
 
+#define SCORPI_DXBC_TO_DXIL_BUILD_DLL
 #include "ScorpiDxbcToDxil.h"
 
 #include "DxbcConverterImpl.h"
 #include "dxc/DxilContainer/DxilContainer.h"
+#include "llvm/Support/FileSystem.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +35,17 @@ public:
   DxcMallocScope &operator=(const DxcMallocScope &) = delete;
 };
 
+void EnsureDxcStaticRuntimeInitialized() {
+  static std::once_flag once;
+  static std::error_code init_error;
+  std::call_once(once, []() {
+    init_error = llvm::sys::fs::SetupPerThreadFileSystem();
+  });
+  if (init_error) {
+    throw std::runtime_error("failed to initialize DXC filesystem TLS");
+  }
+}
+
 class DxcBlobScope {
 public:
   DxcBlobScope() = default;
@@ -52,26 +66,30 @@ private:
   IDxcBlob *blob_ = nullptr;
 };
 
-struct ScorpiShaderMetadata {
-  uint32_t version;
-  uint32_t flags;
-  uint32_t signature_entry_size;
-  uint32_t input_count;
-  uint32_t output_count;
-  uint32_t patch_count;
-  uint32_t input_offset;
-  uint32_t output_offset;
-  uint32_t patch_offset;
-  uint32_t reserved;
-};
-
 struct SignatureView {
-  const void *input = nullptr;
-  const void *output = nullptr;
-  const void *patch = nullptr;
+  const D3D12DDIARG_SIGNATURE_ENTRY_0012 *input = nullptr;
+  const D3D12DDIARG_SIGNATURE_ENTRY_0012 *output = nullptr;
+  const D3D12DDIARG_SIGNATURE_ENTRY_0012 *patch = nullptr;
   uint32_t input_count = 0;
   uint32_t output_count = 0;
   uint32_t patch_count = 0;
+};
+
+struct SignatureStorage {
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> input;
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> output;
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> patch;
+
+  SignatureView View() const {
+    SignatureView view = {};
+    view.input = input.empty() ? nullptr : input.data();
+    view.output = output.empty() ? nullptr : output.data();
+    view.patch = patch.empty() ? nullptr : patch.data();
+    view.input_count = static_cast<uint32_t>(input.size());
+    view.output_count = static_cast<uint32_t>(output.size());
+    view.patch_count = static_cast<uint32_t>(patch.size());
+    return view;
+  }
 };
 
 void SetError(char *error_message, size_t error_message_size,
@@ -86,9 +104,9 @@ void SetError(char *error_message, size_t error_message_size,
   error_message[copy_size] = '\0';
 }
 
-const void *SignaturePointer(const uint8_t *data, size_t data_size,
-                             uint32_t offset, uint32_t count,
-                             uint32_t entry_size) {
+const ScorpiShaderSignatureEntry *SignaturePointer(
+    const uint8_t *data, size_t data_size, uint32_t offset, uint32_t count,
+    uint32_t entry_size) {
   if (count == 0) {
     return nullptr;
   }
@@ -97,46 +115,73 @@ const void *SignaturePointer(const uint8_t *data, size_t data_size,
   if (offset > data_size || bytes > data_size - offset) {
     throw std::runtime_error("signature range exceeds signature dump");
   }
-  return data + offset;
+  return reinterpret_cast<const ScorpiShaderSignatureEntry *>(data + offset);
+}
+
+std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> ConvertWireSignatureEntries(
+    const ScorpiShaderSignatureEntry *entries, uint32_t count) {
+  std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> converted;
+  converted.reserve(count);
+  for (uint32_t index = 0; index < count; ++index) {
+    D3D12DDIARG_SIGNATURE_ENTRY_0012 entry = {};
+    entry.SystemValue =
+        static_cast<D3D10_SB_NAME>(entries[index].system_value);
+    entry.Register = entries[index].register_index;
+    entry.Mask = static_cast<BYTE>(entries[index].mask);
+    entry.Stream = static_cast<BYTE>(entries[index].stream);
+    entry.RegisterComponentType =
+        static_cast<D3D10_SB_REGISTER_COMPONENT_TYPE>(
+            entries[index].component_type);
+    entry.MinPrecision =
+        static_cast<D3D11_SB_OPERAND_MIN_PRECISION>(
+            entries[index].min_precision);
+    converted.emplace_back(entry);
+  }
+  return converted;
 }
 
 SignatureView ParseSignatures(const void *signature_dump,
-                              size_t signature_dump_size) {
-  SignatureView view = {};
+                              size_t signature_dump_size,
+                              SignatureStorage *storage) {
+  if (storage == nullptr) {
+    throw std::invalid_argument("signature storage is null");
+  }
+  *storage = {};
 
   if (signature_dump == nullptr || signature_dump_size == 0) {
-    return view;
+    return storage->View();
   }
-  if (signature_dump_size < sizeof(ScorpiShaderMetadata)) {
+  if (signature_dump_size < sizeof(ScorpiShaderSignatureMetadata)) {
     throw std::runtime_error("signature dump is missing metadata");
   }
 
   const auto *data = static_cast<const uint8_t *>(signature_dump);
-  const auto *metadata = reinterpret_cast<const ScorpiShaderMetadata *>(data);
-  if (metadata->version != 1) {
+  const auto *metadata =
+      reinterpret_cast<const ScorpiShaderSignatureMetadata *>(data);
+  if (metadata->version != SCORPI_SHADER_SIGNATURE_METADATA_VERSION) {
     throw std::runtime_error("unsupported signature metadata version");
   }
   if (metadata->signature_entry_size !=
-      sizeof(D3D12DDIARG_SIGNATURE_ENTRY_0012)) {
+      sizeof(ScorpiShaderSignatureEntry)) {
     throw std::runtime_error("signature entry size does not match DXC");
   }
 
-  view.input_count = metadata->input_count;
-  view.output_count = metadata->output_count;
-  view.patch_count = metadata->patch_count;
-  view.input = SignaturePointer(data, signature_dump_size,
-                                metadata->input_offset,
-                                metadata->input_count,
-                                metadata->signature_entry_size);
-  view.output = SignaturePointer(data, signature_dump_size,
-                                 metadata->output_offset,
-                                 metadata->output_count,
-                                 metadata->signature_entry_size);
-  view.patch = SignaturePointer(data, signature_dump_size,
-                                metadata->patch_offset,
-                                metadata->patch_count,
-                                metadata->signature_entry_size);
-  return view;
+  storage->input = ConvertWireSignatureEntries(
+      SignaturePointer(data, signature_dump_size, metadata->input_offset,
+                       metadata->input_count,
+                       metadata->signature_entry_size),
+      metadata->input_count);
+  storage->output = ConvertWireSignatureEntries(
+      SignaturePointer(data, signature_dump_size, metadata->output_offset,
+                       metadata->output_count,
+                       metadata->signature_entry_size),
+      metadata->output_count);
+  storage->patch = ConvertWireSignatureEntries(
+      SignaturePointer(data, signature_dump_size, metadata->patch_offset,
+                       metadata->patch_count,
+                       metadata->signature_entry_size),
+      metadata->patch_count);
+  return storage->View();
 }
 
 const uint32_t *ValidateShaderTokenStream(const void *shader_code,
@@ -290,6 +335,42 @@ std::vector<uint8_t> NormalizeExistingDxil(const void *shader_code,
   return {};
 }
 
+std::vector<uint8_t>
+ConvertTokenStreamToDxilContainer(const void *shader_code,
+                                  size_t shader_code_size,
+                                  const void *signature_dump,
+                                  size_t signature_dump_size) {
+  const uint32_t *token_stream =
+      ValidateShaderTokenStream(shader_code, shader_code_size);
+  SignatureStorage signature_storage;
+  const SignatureView signatures =
+      ParseSignatures(signature_dump, signature_dump_size, &signature_storage);
+
+  EnsureDxcStaticRuntimeInitialized();
+  DxcMallocScope dxc_malloc;
+
+  hlsl::DxbcConverter converter;
+  void *dxil_binary = nullptr;
+  uint32_t dxil_size = 0;
+  LPWSTR diagnostics = nullptr;
+  const HRESULT status = converter.ConvertInDriverToContainer(
+      token_stream, signatures.input, signatures.input_count, signatures.output,
+      signatures.output_count, signatures.patch, signatures.patch_count, nullptr,
+      &dxil_binary, &dxil_size, &diagnostics);
+  if (FAILED(status)) {
+    throw std::runtime_error("shader token stream conversion failed");
+  }
+  if (dxil_binary == nullptr || dxil_size == 0) {
+    throw std::runtime_error(
+        "shader token stream conversion succeeded without DXIL container");
+  }
+
+  CComHeapPtr<void> dxil_holder(dxil_binary);
+  return std::vector<uint8_t>(static_cast<const uint8_t *>(dxil_binary),
+                              static_cast<const uint8_t *>(dxil_binary) +
+                                  dxil_size);
+}
+
 std::vector<uint8_t> ConvertToDxilBinary(const void *shader_code,
                                          size_t shader_code_size,
                                          const void *signature_dump,
@@ -305,10 +386,11 @@ std::vector<uint8_t> ConvertToDxilBinary(const void *shader_code,
   }
 
   if (!IsDxbcContainer(shader_code, shader_code_size)) {
-    ValidateShaderTokenStream(shader_code, shader_code_size);
-    throw std::runtime_error("shader code is not a DXBC container");
+    return ConvertTokenStreamToDxilContainer(
+        shader_code, shader_code_size, signature_dump, signature_dump_size);
   }
 
+  EnsureDxcStaticRuntimeInitialized();
   DxcMallocScope dxc_malloc;
 
   hlsl::DxbcConverter converter;
@@ -326,9 +408,10 @@ std::vector<uint8_t> ConvertToDxilBinary(const void *shader_code,
   }
 
   CComHeapPtr<void> dxil_holder(dxil_binary);
-  return std::vector<uint8_t>(static_cast<const uint8_t *>(dxil_binary),
-                              static_cast<const uint8_t *>(dxil_binary) +
-                                  dxil_size);
+  std::vector<uint8_t> converted(
+      static_cast<const uint8_t *>(dxil_binary),
+      static_cast<const uint8_t *>(dxil_binary) + dxil_size);
+  return converted;
 }
 
 int ConvertToDxilFile(const void *shader_code, size_t shader_code_size,

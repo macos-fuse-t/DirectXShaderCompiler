@@ -10,6 +10,7 @@ add_dxilconv_project_library(DxbcConverter
 
 target_link_libraries(DxbcConverter PUBLIC
   DxilConvPasses
+  LLVMDxilHash
 )
 
 add_dependencies(DxbcConverter intrinsics_gen DxilConvPasses)
