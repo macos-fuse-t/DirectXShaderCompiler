@@ -953,6 +953,41 @@ void DxbcConverter::ExtractSignatureFromDXBC(
 #endif
 }
 
+static bool CanCoalesceDDISignatureRecord(
+    const SignatureHelper::ElementRecord &Existing,
+    const SignatureHelper::ElementRecord &Record) {
+  return Existing.SemanticName == Record.SemanticName &&
+         Existing.SemanticIndex == Record.SemanticIndex &&
+         Existing.StartRow == Record.StartRow &&
+         Existing.Stream == Record.Stream && Existing.Rows == 1 &&
+         Record.Rows == 1 && Existing.ComponentType == Record.ComponentType;
+}
+
+static void CoalesceSignatureColumns(SignatureHelper::ElementRecord &Existing,
+                                     const SignatureHelper::ElementRecord &Record) {
+  const unsigned ExistingEnd = Existing.StartCol + Existing.Cols;
+  const unsigned RecordEnd = Record.StartCol + Record.Cols;
+  const unsigned StartCol =
+      Existing.StartCol < Record.StartCol ? Existing.StartCol : Record.StartCol;
+  const unsigned EndCol = ExistingEnd > RecordEnd ? ExistingEnd : RecordEnd;
+
+  Existing.StartCol = StartCol;
+  Existing.Cols = EndCol - StartCol;
+}
+
+static void AppendOrCoalesceDDISignatureRecord(
+    SignatureHelper &SigHelper, const SignatureHelper::ElementRecord &Record) {
+  for (SignatureHelper::ElementRecord &Existing : SigHelper.m_ElementRecords) {
+    if (!CanCoalesceDDISignatureRecord(Existing, Record))
+      continue;
+
+    CoalesceSignatureColumns(Existing, Record);
+    return;
+  }
+
+  SigHelper.m_ElementRecords.emplace_back(Record);
+}
+
 void DxbcConverter::ExtractSignatureFromDDI(
     const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pElements, unsigned NumElements,
     SignatureHelper &SigHelper) {
@@ -1053,7 +1088,10 @@ void DxbcConverter::ExtractSignatureFromDDI(
     // This would happen is component type is not supplied by the runtime.
     IFTBOOL(!E.ComponentType.IsInvalid(), DXC_E_INCORRECT_DDI_SIGNATURE);
 
-    SigHelper.m_ElementRecords.emplace_back(E);
+    // DDI signatures can split one register across multiple component-mask
+    // records. Keep that as one DXIL signature element so synthetic semantics
+    // such as SCORPI2 do not become duplicate Metal user attributes.
+    AppendOrCoalesceDDISignatureRecord(SigHelper, E);
   }
 }
 
