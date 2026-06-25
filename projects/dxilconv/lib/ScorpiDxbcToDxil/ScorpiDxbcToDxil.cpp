@@ -20,21 +20,6 @@
 
 namespace {
 
-class DxcMallocScope {
-public:
-  DxcMallocScope() {
-    if (FAILED(DxcInitThreadMalloc())) {
-      throw std::runtime_error("failed to initialize DXC allocator");
-    }
-    DxcSetThreadMallocToDefault();
-  }
-
-  ~DxcMallocScope() { DxcCleanupThreadMalloc(); }
-
-  DxcMallocScope(const DxcMallocScope &) = delete;
-  DxcMallocScope &operator=(const DxcMallocScope &) = delete;
-};
-
 void EnsureDxcStaticRuntimeInitialized() {
   static std::once_flag once;
   static std::error_code init_error;
@@ -43,6 +28,16 @@ void EnsureDxcStaticRuntimeInitialized() {
   });
   if (init_error) {
     throw std::runtime_error("failed to initialize DXC filesystem TLS");
+  }
+}
+
+void EnsureDxcMallocInitialized() {
+  static std::once_flag once;
+  static HRESULT init_status = S_OK;
+  // DXC malloc TLS is process-global; DxbcConverter owns per-call thread scopes.
+  std::call_once(once, []() { init_status = DxcInitThreadMalloc(); });
+  if (FAILED(init_status)) {
+    throw std::runtime_error("failed to initialize DXC allocator");
   }
 }
 
@@ -347,7 +342,7 @@ ConvertTokenStreamToDxilContainer(const void *shader_code,
       ParseSignatures(signature_dump, signature_dump_size, &signature_storage);
 
   EnsureDxcStaticRuntimeInitialized();
-  DxcMallocScope dxc_malloc;
+  EnsureDxcMallocInitialized();
 
   hlsl::DxbcConverter converter;
   void *dxil_binary = nullptr;
@@ -395,7 +390,7 @@ std::vector<uint8_t> ConvertToDxilBinary(const void *shader_code,
   }
 
   EnsureDxcStaticRuntimeInitialized();
-  DxcMallocScope dxc_malloc;
+  EnsureDxcMallocInitialized();
 
   hlsl::DxbcConverter converter;
   void *dxil_binary = nullptr;
