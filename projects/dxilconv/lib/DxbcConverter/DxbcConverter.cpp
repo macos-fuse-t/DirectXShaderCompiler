@@ -953,6 +953,36 @@ void DxbcConverter::ExtractSignatureFromDXBC(
 #endif
 }
 
+static bool CanMergeDDISignatureRecord(
+    const SignatureHelper::ElementRecord &existing,
+    const SignatureHelper::ElementRecord &record) {
+  return existing.SemanticName == record.SemanticName &&
+         existing.SemanticIndex == record.SemanticIndex &&
+         existing.StartRow == record.StartRow &&
+         existing.Stream == record.Stream && existing.Rows == 1 &&
+         record.Rows == 1 && existing.ComponentType == record.ComponentType;
+}
+
+static void AppendOrMergeDDISignatureRecord(
+    SignatureHelper &SigHelper,
+    const SignatureHelper::ElementRecord &record) {
+  for (SignatureHelper::ElementRecord &existing :
+       SigHelper.m_ElementRecords) {
+    if (!CanMergeDDISignatureRecord(existing, record))
+      continue;
+
+    const unsigned existingEnd = existing.StartCol + existing.Cols;
+    const unsigned recordEnd = record.StartCol + record.Cols;
+    const unsigned startCol = std::min(existing.StartCol, record.StartCol);
+    const unsigned endCol = std::max(existingEnd, recordEnd);
+    existing.StartCol = startCol;
+    existing.Cols = endCol - startCol;
+    return;
+  }
+
+  SigHelper.m_ElementRecords.emplace_back(record);
+}
+
 void DxbcConverter::ExtractSignatureFromDDI(
     const D3D12DDIARG_SIGNATURE_ENTRY_0012 *pElements, unsigned NumElements,
     SignatureHelper &SigHelper) {
@@ -1053,7 +1083,11 @@ void DxbcConverter::ExtractSignatureFromDDI(
     // This would happen is component type is not supplied by the runtime.
     IFTBOOL(!E.ComponentType.IsInvalid(), DXC_E_INCORRECT_DDI_SIGNATURE);
 
-    SigHelper.m_ElementRecords.emplace_back(E);
+    // DDI may describe one system-value register with multiple component
+    // records. DXIL and Metal require that semantic to remain one signature
+    // element. Arbitrary split records keep distinct synthesized semantic
+    // indices and therefore do not merge here.
+    AppendOrMergeDDISignatureRecord(SigHelper, E);
   }
 }
 
