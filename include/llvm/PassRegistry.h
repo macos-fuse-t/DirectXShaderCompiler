@@ -39,10 +39,7 @@ struct PassRegistrationListener;
 /// threads simultaneously, you will need to use a separate PassRegistry on
 /// each thread.
 class PassRegistry {
-  #ifndef LLVM_ON_WIN32
-  // HLSL Change - no lock needed for Windows, as it will use its own mechanism defined in PassRegistry.cpp.
   mutable sys::SmartRWMutex<true> Lock;
-  #endif
 
   /// PassInfoMap - Keep track of the PassInfo object for each registered pass.
   typedef DenseMap<const void *, const PassInfo *> MapType;
