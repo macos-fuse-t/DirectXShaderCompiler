@@ -6,6 +6,14 @@
 #include "DxbcConverterImpl.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilShaderModel.h"
+#include "dxc/DXIL/DxilSignature.h"
+#include "dxc/DXIL/DxilSignatureElement.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -542,4 +550,64 @@ extern "C" int ScorpiCreateDxilBinary(
 
 extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
   std::free(dxil_binary);
+}
+
+// This deliberately recognizes a narrow, side-effect-free mask producer rather
+// than inferring shader behavior from a hash or from the output signature alone.
+extern "C" uint32_t ScorpiInspectCoverageShader(
+    const void *code, size_t size, const void *metadata, size_t metadata_size) {
+  try {
+    DxcMallocScope malloc_scope;
+    auto binary = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(binary.data());
+    if (!hlsl::IsValidDxilContainer(container, binary.size())) return 0;
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) return 0;
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(
+        llvm::StringRef(hlsl::GetDxilBitcodeData(program),
+                        hlsl::GetDxilBitcodeSize(program)), "coverage", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) return 0;
+    auto &module = *parsed.get();
+    auto *dxil = hlsl::DxilModule::TryGetDxilModule(&module);
+    if (!dxil || !dxil->GetUAVs().empty() ||
+        dxil->m_ShaderFlags.GetResourceDescriptorHeapIndexing()) return 0;
+    if (dxil->GetShaderModel()->IsVS()) return SCORPI_COVERAGE_REPLAY_SAFE_VERTEX;
+    if (!dxil->GetShaderModel()->IsPS()) return 0;
+    const auto &outputs = dxil->GetOutputSignature().GetElements();
+    if (outputs.size() != 1 || outputs[0]->GetKind() != hlsl::DXIL::SemanticKind::Target ||
+        outputs[0]->GetSemanticStartIndex() != 0 || outputs[0]->GetRows() != 1 ||
+        outputs[0]->GetCompType().GetKind() != hlsl::DXIL::ComponentType::U32) return 0;
+    auto *entry = dxil->GetEntryFunction();
+    if (!entry || entry->size() != 1) return 0;
+    llvm::CallInst *coverage = nullptr;
+    unsigned components = 0;
+    auto constant = [](llvm::Value *v, uint64_t expected) {
+      auto *c = llvm::dyn_cast<llvm::ConstantInt>(v);
+      return c && c->getZExtValue() == expected;
+    };
+    for (auto &inst : entry->front()) {
+      if (llvm::isa<llvm::ReturnInst>(inst)) continue;
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (!call || !call->getCalledFunction()) return 0;
+      auto name = call->getCalledFunction()->getName();
+      if (name == "dx.op.coverage.i32" && call->getNumArgOperands() == 1 &&
+          constant(call->getArgOperand(0), 91) && !coverage) {
+        coverage = call;
+      } else if (name == "dx.op.storeOutput.i32" &&
+                 call->getNumArgOperands() == 5 && coverage &&
+                 constant(call->getArgOperand(0), 5) &&
+                 constant(call->getArgOperand(1), 0) &&
+                 constant(call->getArgOperand(2), 0) &&
+                 call->getArgOperand(4) == coverage) {
+        auto *column = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(3));
+        if (!column || column->getZExtValue() > 3) return 0;
+        unsigned bit = 1u << column->getZExtValue();
+        if (components & bit) return 0;
+        components |= bit;
+      } else return 0;
+    }
+    return coverage && (components & 1) ? SCORPI_COVERAGE_MASK_PIXEL : 0;
+  } catch (...) { return 0; }
 }
