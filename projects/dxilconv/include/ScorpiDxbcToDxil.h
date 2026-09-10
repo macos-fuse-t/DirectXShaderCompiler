@@ -75,6 +75,8 @@ ScorpiCreateDxilBinary(const void *shader_code,
 enum {
   SCORPI_COVERAGE_MASK_PIXEL = 1,
   SCORPI_COVERAGE_REPLAY_SAFE_VERTEX = 2,
+  SCORPI_COVERAGE_REPLAY_SAFE_HULL = 4,
+  SCORPI_COVERAGE_REPLAY_SAFE_DOMAIN = 8,
 };
 // Returns zero for unsupported or invalid shaders. Accepts DXBC or DXIL.
 SCORPI_DXBC_TO_DXIL_EXPORT uint32_t

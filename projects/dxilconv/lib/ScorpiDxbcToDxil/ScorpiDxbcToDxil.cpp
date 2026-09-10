@@ -574,6 +574,8 @@ extern "C" uint32_t ScorpiInspectCoverageShader(
     if (!dxil || !dxil->GetUAVs().empty() ||
         dxil->m_ShaderFlags.GetResourceDescriptorHeapIndexing()) return 0;
     if (dxil->GetShaderModel()->IsVS()) return SCORPI_COVERAGE_REPLAY_SAFE_VERTEX;
+    if (dxil->GetShaderModel()->IsHS()) return SCORPI_COVERAGE_REPLAY_SAFE_HULL;
+    if (dxil->GetShaderModel()->IsDS()) return SCORPI_COVERAGE_REPLAY_SAFE_DOMAIN;
     if (!dxil->GetShaderModel()->IsPS()) return 0;
     const auto &outputs = dxil->GetOutputSignature().GetElements();
     if (outputs.size() != 1 || outputs[0]->GetKind() != hlsl::DXIL::SemanticKind::Target ||
