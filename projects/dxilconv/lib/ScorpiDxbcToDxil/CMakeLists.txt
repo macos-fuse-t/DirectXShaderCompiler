@@ -1,5 +1,7 @@
 set(SCORPI_DXBC_TO_DXIL_SOURCES
   ScorpiDxbcToDxil.cpp
+  ScorpiRasterReplay.cpp
+  ScorpiGeometryCapture.cpp
 )
 
 add_dxilconv_project_library(ScorpiDxbcToDxil

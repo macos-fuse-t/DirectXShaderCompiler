@@ -83,6 +83,94 @@ SCORPI_DXBC_TO_DXIL_EXPORT uint32_t
 ScorpiInspectCoverageShader(const void *code, size_t size,
                            const void *metadata, size_t metadata_size);
 
+typedef struct ScorpiRasterReplayParameters {
+  uint32_t width, height, coverage_base_element, sample_base;
+  int32_t origin_x, origin_y;
+  uint32_t primitive_id, reserved;
+  // Offsets within the original draw when capture/replay splits its work.
+  uint32_t vertex_bias, instance_bias, reserved_draw[2];
+} ScorpiRasterReplayParameters;
+
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateRasterReplayVertexShader(const void *code, size_t size,
+                                   uint32_t register_space, void **binary,
+                                   size_t *binary_size, char *error_message,
+                                   size_t error_message_size);
+
+// Internal renderer ABI. Produces an attachment-free PS variant with private
+// b0=ScorpiRasterReplayParameters and raw coverage SRV t0 in
+// register_space. Coverage belongs to one generated primitive, after all sample
+// groups have been accumulated. Inactive replay lanes retain derivative work
+// but cannot write application UAVs. The caller owns the returned binary.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateRasterReplayPixelShader(const void *code, size_t size,
+                                  uint32_t register_space, uint32_t sample_count,
+                                  uint32_t sample_mask, void **binary,
+                                  size_t *binary_size, char *error_message,
+                                  size_t error_message_size);
+
+// Internal geometry capture ABI. capture=1 generates a GS that records the
+// assembled VS output; capture=0 generates a VS that reads those records.
+// Both use a private raw UAV u0 in register_space. Records are packed in
+// output-signature element/row/component order, with vertex_stride bytes.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateGeometryCaptureShader(const void *code, size_t size,
+                                 uint32_t register_space, uint32_t vertices_per_primitive,
+                                 int capture, uint32_t *vertex_stride, void **binary,
+                                 size_t *binary_size, char *error_message,
+                                 size_t error_message_size);
+
+// Generated-geometry capture is bounded by the GS declaration. Each instance
+// owns a 16-byte header (emitted vertex count at byte zero), followed by
+// max_vertices records. A record is {primitiveID, stripVertexIndex, payload};
+// payload uses output-signature element/row/component order. Replay parameters
+// primitive_id/reserved select the instance header/first vertex record in bytes.
+typedef struct ScorpiGeometryCaptureLayout {
+  uint32_t vertex_stride;
+  uint32_t max_vertices;
+  uint32_t instance_count;
+  uint32_t vertices_per_primitive;
+} ScorpiGeometryCaptureLayout;
+
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateGeometryShaderCapture(const void *code, size_t size,
+                                 uint32_t register_space, int capture,
+                                 ScorpiGeometryCaptureLayout *layout,
+                                 void **binary, size_t *binary_size,
+                                 char *error_message, size_t error_message_size);
+
+// Batched generated replay reads a compact table in private UAV u0. Each
+// 16-byte entry is {vertexRecord0, vertexRecord1, vertexRecord2, PrimitiveID}.
+// Parameters.reserved selects its first entry in bytes. Coverage uses a distinct
+// width*height slice per raster primitive in the batch.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateGeneratedRasterReplayPixelShader(const void *code, size_t size,
+    uint32_t register_space, uint32_t samples, uint32_t sample_mask,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateCompactedGeometryReplayShader(const void *code, size_t size,
+    uint32_t register_space, ScorpiGeometryCaptureLayout *layout,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
+// Optional backend adaptation: carry an application GS PrimitiveID as a flat
+// user varying when a backend cannot link the native primitive system value.
+// Apply consistently to GS output and PS input; no logical shader value changes.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLowerGeometryPrimitiveId(const void *code, size_t size, void **binary,
+    size_t *binary_size, char *error, size_t error_size);
+
+// One output-signature row and its location in the capture payload. This is
+// logical shader metadata, independent of any backend's stream-output encoding.
+typedef struct ScorpiGeometryCaptureElement {
+  char semantic_name[64];
+  uint32_t semantic_index, register_index, start_component, component_count;
+  uint32_t byte_offset, stream;
+} ScorpiGeometryCaptureElement;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiGetGeometryCaptureElements(const void *code, size_t size,
+    ScorpiGeometryCaptureElement *elements, uint32_t capacity, uint32_t *count,
+    char *error, size_t error_size);
+
 SCORPI_DXBC_TO_DXIL_EXPORT void
 ScorpiFreeDxilBinary(void *dxil_binary);
 

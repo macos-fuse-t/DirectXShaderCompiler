@@ -2,9 +2,14 @@
 
 #define SCORPI_DXBC_TO_DXIL_BUILD_DLL
 #include "ScorpiDxbcToDxil.h"
+#include "ScorpiRasterReplay.h"
+#include "ScorpiGeometryCapture.h"
 
 #include "DxbcConverterImpl.h"
+#include "dxc/DxilHash/DxilHash.h"
 #include "dxc/DxilContainer/DxilContainer.h"
+#include "dxc/DxilContainer/DxilContainerAssembler.h"
+#include "dxc/Support/dxcapi.impl.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/IR/Instructions.h"
@@ -550,6 +555,243 @@ extern "C" int ScorpiCreateDxilBinary(
 
 extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
   std::free(dxil_binary);
+}
+
+static int CreateRasterReplayShader(
+    const void *code, size_t size, uint32_t register_space,
+    uint32_t sample_count, uint32_t sample_mask, void **binary,
+    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false) {
+  SetError(error_message, error_message_size, "");
+  if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr;
+  *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid replay shader container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("replay shader has no DXIL program");
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(
+        llvm::StringRef(hlsl::GetDxilBitcodeData(program),
+                        hlsl::GetDxilBitcodeSize(program)), "raster-replay", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid replay shader bitcode");
+    auto *dxil = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    std::string error;
+    if (!dxil || !(geometry_link ? scorpi::LowerGeometryPrimitiveId(*dxil, error)
+        : vertex ? scorpi::PrepareRasterReplayVertexShader(*dxil, register_space, error)
+        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated)))
+      throw std::runtime_error(error.empty() ? "missing DXIL module" : error);
+    hlsl::DxilModule::ClearDxilMetadata(*parsed.get());
+    dxil->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    {
+      raw_stream_ostream stream(bitcode.p);
+      llvm::WriteBitcodeToFile(parsed.get().get(), stream);
+    }
+    hlsl::SerializeDxilContainerForModule(dxil, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    void *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate replay shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset =
+        static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result;
+    *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error_message, error_message_size, e.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error_message, error_message_size, "unexpected raster replay conversion failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
+extern "C" int ScorpiCreateRasterReplayPixelShader(
+    const void *code, size_t size, uint32_t space, uint32_t samples,
+    uint32_t mask, void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return CreateRasterReplayShader(code, size, space, samples, mask, binary,
+      binary_size, error, error_size, false);
+}
+
+extern "C" int ScorpiCreateRasterReplayVertexShader(
+    const void *code, size_t size, uint32_t space, void **binary,
+    size_t *binary_size, char *error, size_t error_size) {
+  return CreateRasterReplayShader(code, size, space, 0, 0, binary,
+      binary_size, error, error_size, true);
+}
+
+extern "C" int ScorpiCreateGeneratedRasterReplayPixelShader(
+    const void *code, size_t size, uint32_t space, uint32_t samples,
+    uint32_t mask, void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return CreateRasterReplayShader(code, size, space, samples, mask, binary,
+      binary_size, error, error_size, false, true);
+}
+
+extern "C" int ScorpiLowerGeometryPrimitiveId(
+    const void *code, size_t size, void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return CreateRasterReplayShader(code, size, 0, 0, 0, binary,
+      binary_size, error, error_size, false, false, true);
+}
+
+static int CreateGeometryCaptureBinary(
+    const void *code, size_t size, uint32_t register_space,
+    uint32_t vertices_per_primitive, int capture, uint32_t *vertex_stride, void **binary,
+    size_t *binary_size, char *error_message, size_t error_message_size,
+    ScorpiGeometryCaptureLayout *layout, bool compacted = false) {
+  SetError(error_message, error_message_size, "");
+  if (!binary || !binary_size || !vertex_stride) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr;
+  *binary_size = 0;
+  const char *phase = "parse source";
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid replay shader container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("replay shader has no DXIL program");
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(
+        llvm::StringRef(hlsl::GetDxilBitcodeData(program),
+                        hlsl::GetDxilBitcodeSize(program)), "raster-replay", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid replay shader bitcode");
+    auto *dxil = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    std::string error;
+    if (!dxil) throw std::runtime_error("missing DXIL module");
+    phase = "generate capture IR";
+    std::unique_ptr<llvm::Module> generated;
+    if (layout) {
+      if (!scorpi::GetGeometryCaptureLayout(*dxil, *layout, error)) throw std::runtime_error(error);
+      *vertex_stride = layout->vertex_stride;
+      if (capture) {
+        if (!scorpi::PrepareGeometryShaderCapture(*dxil, register_space, *layout, error)) throw std::runtime_error(error);
+        generated = std::move(parsed.get());
+      } else generated = scorpi::CreateGeometryCaptureModule(*dxil, register_space,
+          layout->vertices_per_primitive, false, *vertex_stride, error, layout, compacted);
+    } else generated = scorpi::CreateGeometryCaptureModule(*dxil, register_space,
+        vertices_per_primitive, capture != 0, *vertex_stride, error);
+    if (!generated) throw std::runtime_error(error);
+    dxil = &generated->GetOrCreateDxilModule();
+    hlsl::DxilModule::ClearDxilMetadata(*generated);
+    phase = "emit capture metadata";
+    dxil->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    {
+      raw_stream_ostream stream(bitcode.p);
+      llvm::WriteBitcodeToFile(generated.get(), stream);
+    }
+    phase = "serialize capture container";
+    hlsl::SerializeDxilContainerForModule(dxil, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    void *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate replay shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset =
+        static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result;
+    *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error_message, error_message_size, (std::string(phase) + ": " + e.what()).c_str());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error_message, error_message_size, "unexpected raster replay conversion failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
+extern "C" int ScorpiCreateGeometryCaptureShader(
+    const void *code, size_t size, uint32_t space, uint32_t vertices,
+    int capture, uint32_t *stride, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  return CreateGeometryCaptureBinary(code, size, space, vertices, capture,
+      stride, binary, binary_size, error, error_size, nullptr);
+}
+
+extern "C" int ScorpiCreateGeometryShaderCapture(
+    const void *code, size_t size, uint32_t space, int capture,
+    ScorpiGeometryCaptureLayout *layout, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  if (!layout) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  uint32_t stride = 0;
+  return CreateGeometryCaptureBinary(code, size, space, 0, capture,
+      &stride, binary, binary_size, error, error_size, layout);
+}
+
+extern "C" int ScorpiCreateCompactedGeometryReplayShader(
+    const void *code, size_t size, uint32_t space, ScorpiGeometryCaptureLayout *layout,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (!layout) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  uint32_t stride = 0;
+  return CreateGeometryCaptureBinary(code, size, space, 0, 0, &stride,
+      binary, binary_size, error, error_size, layout, true);
+}
+
+extern "C" int ScorpiGetGeometryCaptureElements(const void *code, size_t size,
+    ScorpiGeometryCaptureElement *elements, uint32_t capacity, uint32_t *count,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!count || (capacity && !elements)) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *count = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto binary = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(binary.data());
+    if (!hlsl::IsValidDxilContainer(container, binary.size())) throw std::runtime_error("invalid capture container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing capture DXIL program");
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "capture-signature", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid capture bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing capture module");
+    std::vector<ScorpiGeometryCaptureElement> rows;
+    uint32_t offset = 0;
+    for (const auto &element : dm->GetOutputSignature().GetElements()) {
+      const auto &e = *element;
+      if (e.GetCompType().Is64Bit() || e.GetCompType().Is16Bit())
+        throw std::runtime_error("capture requires 32-bit signature storage");
+      if (std::strlen(e.GetName()) >= sizeof(ScorpiGeometryCaptureElement::semantic_name))
+        throw std::runtime_error("capture semantic name too long");
+      for (uint32_t row = 0; row < e.GetRows(); ++row) {
+        ScorpiGeometryCaptureElement out{};
+        std::memcpy(out.semantic_name, e.GetName(), std::strlen(e.GetName()));
+        out.semantic_index = e.GetSemanticIndexVec().at(row);
+        out.register_index = e.GetStartRow() + row;
+        out.start_component = e.GetStartCol(); out.component_count = e.GetCols();
+        out.byte_offset = offset; out.stream = e.GetOutputStream();
+        rows.push_back(out); offset += e.GetCols() * 4;
+      }
+    }
+    *count = static_cast<uint32_t>(rows.size());
+    if (capacity < rows.size()) {
+      if (!capacity) return SCORPI_DXBC_TO_DXIL_OK;
+      throw std::runtime_error("capture element capacity too small");
+    }
+    std::copy(rows.begin(), rows.end(), elements);
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) { SetError(error, error_size, e.what()); }
+  catch (...) { SetError(error, error_size, "unexpected capture signature exception"); }
+  return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
 }
 
 // This deliberately recognizes a narrow, side-effect-free mask producer rather

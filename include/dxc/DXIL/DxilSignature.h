@@ -37,6 +37,9 @@ public:
   unsigned AppendElement(std::unique_ptr<DxilSignatureElement> pSE,
                          bool bSetID = true);
 
+  // The caller must remove all IR references to the old signature elements.
+  void ClearElements() { m_Elements.clear(); }
+
   DxilSignatureElement &GetElement(unsigned idx);
   const DxilSignatureElement &GetElement(unsigned idx) const;
   const std::vector<std::unique_ptr<DxilSignatureElement>> &GetElements() const;
