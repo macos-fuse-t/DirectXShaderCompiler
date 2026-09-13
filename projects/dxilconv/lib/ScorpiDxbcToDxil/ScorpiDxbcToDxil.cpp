@@ -97,6 +97,7 @@ private:
 };
 
 struct SignatureView {
+  uint32_t flags = 0;
   const D3D12DDIARG_SIGNATURE_ENTRY_0012 *input = nullptr;
   const D3D12DDIARG_SIGNATURE_ENTRY_0012 *output = nullptr;
   const D3D12DDIARG_SIGNATURE_ENTRY_0012 *patch = nullptr;
@@ -106,12 +107,14 @@ struct SignatureView {
 };
 
 struct SignatureStorage {
+  uint32_t flags = 0;
   std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> input;
   std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> output;
   std::vector<D3D12DDIARG_SIGNATURE_ENTRY_0012> patch;
 
   SignatureView View() const {
     SignatureView view = {};
+    view.flags = flags;
     view.input = input.empty() ? nullptr : input.data();
     view.output = output.empty() ? nullptr : output.data();
     view.patch = patch.empty() ? nullptr : patch.data();
@@ -196,6 +199,9 @@ SignatureView ParseSignatures(const void *signature_dump,
     throw std::runtime_error("signature entry size does not match DXC");
   }
 
+  if (metadata->flags & ~SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY)
+    throw std::runtime_error("unsupported signature metadata flags");
+  storage->flags = metadata->flags;
   storage->input = ConvertWireSignatureEntries(
       SignaturePointer(data, signature_dump_size, metadata->input_offset,
                        metadata->input_count,
@@ -383,9 +389,15 @@ ConvertTokenStreamToDxilContainer(const void *shader_code,
   void *dxil_binary = nullptr;
   uint32_t dxil_size = 0;
   LPWSTR diagnostics = nullptr;
+  const wchar_t *options = nullptr;
+  if (signatures.flags & SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY) {
+    if ((token_stream[0] >> 16) != 2)
+      throw std::runtime_error("stream-output-only signatures require a geometry shader");
+    options = L"-scorpi-stream-output-only";
+  }
   const HRESULT status = converter.ConvertInDriverToContainer(
       token_stream, signatures.input, signatures.input_count, signatures.output,
-      signatures.output_count, signatures.patch, signatures.patch_count, nullptr,
+      signatures.output_count, signatures.patch, signatures.patch_count, options,
       &dxil_binary, &dxil_size, &diagnostics);
   if (FAILED(status)) {
     char message[128] = {};

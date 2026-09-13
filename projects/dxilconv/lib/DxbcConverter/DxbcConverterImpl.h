@@ -342,6 +342,7 @@ protected:
   std::unique_ptr<IRBuilder<>> m_pBuilder;
 
   bool m_bDisableHashCheck;
+  bool m_bStreamOutputOnly;
   bool m_bRunDxilCleanup;
 
   bool m_bLegacyCBufferLoad;

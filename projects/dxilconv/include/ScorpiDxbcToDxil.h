@@ -29,6 +29,9 @@ enum ScorpiDxbcToDxilStatus {
 
 enum {
   SCORPI_SHADER_SIGNATURE_METADATA_VERSION = 2,
+  // No output is rasterized. Missing arbitrary GS output types represent raw
+  // 32-bit stream-output storage, not an interpolated shader interface.
+  SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY = 1,
 };
 
 typedef struct ScorpiShaderSignatureMetadata {
