@@ -69,8 +69,9 @@ static ssize_t LLVM_ATTRIBUTE_UNUSED readCpuInfo(void *Buf, size_t Size) {
 }
 #endif
 
-#if defined(i386) || defined(__i386__) || defined(__x86__) || defined(_M_IX86)\
- || defined(__x86_64__) || defined(_M_AMD64) || defined (_M_X64)
+#if !defined(_M_ARM64EC) && (defined(i386) || defined(__i386__) || \
+    defined(__x86__) || defined(_M_IX86) || defined(__x86_64__) || \
+    defined(_M_AMD64) || defined(_M_X64))
 
 /// GetX86CpuIDAndInfo - Execute the specified cpuid and return the 4 values in the
 /// specified arguments.  If we can't run cpuid on the host, return true.
@@ -731,8 +732,9 @@ StringRef sys::getHostCPUName() {
 }
 #endif
 
-#if defined(i386) || defined(__i386__) || defined(__x86__) || defined(_M_IX86)\
- || defined(__x86_64__) || defined(_M_AMD64) || defined (_M_X64)
+#if !defined(_M_ARM64EC) && (defined(i386) || defined(__i386__) || \
+    defined(__x86__) || defined(_M_IX86) || defined(__x86_64__) || \
+    defined(_M_AMD64) || defined(_M_X64))
 bool sys::getHostCPUFeatures(StringMap<bool> &Features) {
   unsigned EAX = 0, EBX = 0, ECX = 0, EDX = 0;
   unsigned MaxLevel;
