@@ -6,6 +6,9 @@
 namespace llvm { class Module; }
 namespace hlsl { class DxilModule; }
 namespace scorpi {
+bool PrepareTessellationPixelPatchId(hlsl::DxilModule &dm, uint32_t space, std::string &error);
+bool PrepareTessellationPatchBias(hlsl::DxilModule &dm, uint32_t space, std::string &error);
+bool PrepareTessellationCaptureDomain(hlsl::DxilModule &source, uint32_t &vertexStride, std::string &error, uint32_t registerSpace);
 bool LowerGeometryPrimitiveId(hlsl::DxilModule &source, std::string &error);
 bool PrepareRasterReplayVertexShader(hlsl::DxilModule &source,
     uint32_t registerSpace, std::string &error);
@@ -14,10 +17,10 @@ bool PrepareRasterReplayVertexShader(hlsl::DxilModule &source,
 std::unique_ptr<llvm::Module> CreateGeometryCaptureModule(
     const hlsl::DxilModule &source, uint32_t registerSpace,
     uint32_t verticesPerPrimitive, bool capture, uint32_t &vertexStride,
-    std::string &error, const ScorpiGeometryCaptureLayout *generated = nullptr, bool compacted = false);
+    std::string &error, const ScorpiGeometryCaptureLayout *generated = nullptr, bool compacted = false, bool tessellated = false, bool passthrough = false, bool discardCapture = false);
 bool GetGeometryCaptureLayout(const hlsl::DxilModule &source,
     ScorpiGeometryCaptureLayout &layout, std::string &error);
 bool PrepareGeometryShaderCapture(hlsl::DxilModule &source,
     uint32_t registerSpace, const ScorpiGeometryCaptureLayout &layout,
-    std::string &error);
+    std::string &error, bool batched = false, bool rasterize = true);
 }

@@ -7,7 +7,7 @@ namespace hlsl {
 class DxilModule;
 }
 namespace scorpi {
-// Adds a private cbuffer b0 and raw SRV t0 in registerSpace. The caller must
+// Adds a private cbuffer b0, raw SRV t0 and visibility UAV u1 in registerSpace. The caller must
 // provide a per-generated-primitive coverage slice and matching root bindings.
 bool PrepareRasterReplayPixelShader(hlsl::DxilModule &module,
                                     uint32_t registerSpace,

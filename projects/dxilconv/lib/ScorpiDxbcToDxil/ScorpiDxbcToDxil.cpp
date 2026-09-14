@@ -659,7 +659,7 @@ static int CreateGeometryCaptureBinary(
     const void *code, size_t size, uint32_t register_space,
     uint32_t vertices_per_primitive, int capture, uint32_t *vertex_stride, void **binary,
     size_t *binary_size, char *error_message, size_t error_message_size,
-    ScorpiGeometryCaptureLayout *layout, bool compacted = false) {
+    ScorpiGeometryCaptureLayout *layout, bool compacted = false, unsigned tessellation_mode = 0) {
   SetError(error_message, error_message_size, "");
   if (!binary || !binary_size || !vertex_stride) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr;
@@ -684,11 +684,33 @@ static int CreateGeometryCaptureBinary(
     if (!dxil) throw std::runtime_error("missing DXIL module");
     phase = "generate capture IR";
     std::unique_ptr<llvm::Module> generated;
-    if (layout) {
+    if (tessellation_mode == 7) {
+      if(!scorpi::PrepareTessellationPixelPatchId(*dxil,register_space,error))throw std::runtime_error(error);
+      generated=std::move(parsed.get());
+    } else if (tessellation_mode == 5) {
+      if(!scorpi::PrepareTessellationPatchBias(*dxil,register_space,error))throw std::runtime_error(error);
+      generated=std::move(parsed.get());
+    } else if (tessellation_mode == 1) {
+      if(!scorpi::PrepareTessellationPatchBias(*dxil,register_space,error))throw std::runtime_error(error);
+      if (!scorpi::PrepareTessellationCaptureDomain(*dxil,*vertex_stride,error,register_space)) throw std::runtime_error(error);
+      generated=std::move(parsed.get());
+    } else if (tessellation_mode == 4) {
+      generated=scorpi::CreateGeometryCaptureModule(*dxil,register_space,vertices_per_primitive,true,
+          *vertex_stride,error,nullptr,false,false,true);
+    } else if (tessellation_mode == 3) {
+      ScorpiGeometryCaptureLayout replay{};
+      replay.max_vertices=vertices_per_primitive;replay.instance_count=1;replay.vertices_per_primitive=vertices_per_primitive;
+      for(const auto &e:dxil->GetOutputSignature().GetElements()) replay.vertex_stride+=e->GetRows()*e->GetCols()*4;
+      generated=scorpi::CreateGeometryCaptureModule(*dxil,register_space,vertices_per_primitive,false,
+          *vertex_stride,error,&replay,true,true);
+    } else if (tessellation_mode == 2 || tessellation_mode == 6) {
+      generated=scorpi::CreateGeometryCaptureModule(*dxil,register_space,vertices_per_primitive,true,
+          *vertex_stride,error,nullptr,false,true,false,tessellation_mode == 6);
+    } else if (layout) {
       if (!scorpi::GetGeometryCaptureLayout(*dxil, *layout, error)) throw std::runtime_error(error);
       *vertex_stride = layout->vertex_stride;
       if (capture) {
-        if (!scorpi::PrepareGeometryShaderCapture(*dxil, register_space, *layout, error)) throw std::runtime_error(error);
+        if (!scorpi::PrepareGeometryShaderCapture(*dxil, register_space, *layout, error, capture >= 2, capture != 3)) throw std::runtime_error(error);
         generated = std::move(parsed.get());
       } else generated = scorpi::CreateGeometryCaptureModule(*dxil, register_space,
           layout->vertices_per_primitive, false, *vertex_stride, error, layout, compacted);
@@ -727,6 +749,13 @@ static int CreateGeometryCaptureBinary(
     SetError(error_message, error_message_size, "unexpected raster replay conversion failure");
     return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
   }
+}
+
+extern "C" int ScorpiCreateTessellationCaptureShader(
+    const void *code, size_t size, uint32_t space, uint32_t vertices, uint32_t mode,
+    uint32_t *stride, void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if(mode < 1 || mode > 7) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  return CreateGeometryCaptureBinary(code,size,space,vertices,1,stride,binary,binary_size,error,error_size,nullptr,false,mode);
 }
 
 extern "C" int ScorpiCreateGeometryCaptureShader(

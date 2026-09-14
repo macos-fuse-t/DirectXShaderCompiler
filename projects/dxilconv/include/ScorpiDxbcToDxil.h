@@ -91,7 +91,7 @@ typedef struct ScorpiRasterReplayParameters {
   int32_t origin_x, origin_y;
   uint32_t primitive_id, reserved;
   // Offsets within the original draw when capture/replay splits its work.
-  uint32_t vertex_bias, instance_bias, reserved_draw[2];
+  uint32_t vertex_bias, instance_bias, visibility_enabled, reserved_draw;
 } ScorpiRasterReplayParameters;
 
 SCORPI_DXBC_TO_DXIL_EXPORT int
@@ -101,16 +101,33 @@ ScorpiCreateRasterReplayVertexShader(const void *code, size_t size,
                                    size_t error_message_size);
 
 // Internal renderer ABI. Produces an attachment-free PS variant with private
-// b0=ScorpiRasterReplayParameters and raw coverage SRV t0 in
+// b0=ScorpiRasterReplayParameters, raw coverage SRV t0 and raw visibility UAV u1 in
 // register_space. Coverage belongs to one generated primitive, after all sample
 // groups have been accumulated. Inactive replay lanes retain derivative work
-// but cannot write application UAVs. The caller owns the returned binary.
+// but cannot write application UAVs. When visibility_enabled is nonzero, u1
+// receives surviving sample masks at the same element indices as t0. The caller
+// clears u1 before replay and accumulates its popcounts after all sample groups.
+// The caller owns the returned binary.
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateRasterReplayPixelShader(const void *code, size_t size,
                                   uint32_t register_space, uint32_t sample_count,
                                   uint32_t sample_mask, void **binary,
                                   size_t *binary_size, char *error_message,
                                   size_t error_message_size);
+
+// Private tessellation capture linkage. mode 1 rewrites DS outputs to uint4
+// key/payload rows; mode 2 produces the matching ordered capture GS;
+// mode 3 replays compacted capture through a VS with the original DS signature;
+// mode 4 produces a passthrough GS; mode 5 preserves HS/patch-constant primitive
+// IDs when drawing one patch at a time, using private b0 primitive_id as a bias.
+// Mode 6 consumes canonical DS output without capture stores, for backends
+// that capture point-domain results directly before primitive assembly.
+// Mode 7 supplies the per-patch pixel PrimitiveID when there is no application GS.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateTessellationCaptureShader(const void *code, size_t size,
+    uint32_t register_space, uint32_t vertices_per_primitive, uint32_t mode,
+    uint32_t *vertex_stride, void **binary, size_t *binary_size,
+    char *error_message, size_t error_message_size);
 
 // Internal geometry capture ABI. capture=1 generates a GS that records the
 // assembled VS output; capture=0 generates a VS that reads those records.
@@ -135,6 +152,15 @@ typedef struct ScorpiGeometryCaptureLayout {
   uint32_t vertices_per_primitive;
 } ScorpiGeometryCaptureLayout;
 
+// Batched modes index records by input primitive, then GS instance. The
+// no-raster variant keeps all captured payload but exports only dummy position
+// to Metal's disabled raster stage; it does not consume pixel attribute slots.
+enum ScorpiGeometryCaptureMode {
+  SCORPI_GEOMETRY_REPLAY = 0,
+  SCORPI_GEOMETRY_CAPTURE = 1,
+  SCORPI_GEOMETRY_CAPTURE_BATCHED = 2,
+  SCORPI_GEOMETRY_CAPTURE_BATCHED_NO_RASTER = 3
+};
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateGeometryShaderCapture(const void *code, size_t size,
                                  uint32_t register_space, int capture,

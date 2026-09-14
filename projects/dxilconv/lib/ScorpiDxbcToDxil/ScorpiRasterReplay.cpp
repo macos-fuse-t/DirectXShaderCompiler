@@ -80,6 +80,10 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   for (const auto &r : dm.GetSRVs())
     if (r->GetSpaceID() == registerSpace && r->GetLowerBound() == 0)
       return fail("raster replay coverage binding collides with application");
+  for (const auto &r : dm.GetUAVs())
+    if (r->GetSpaceID() == registerSpace && r->GetLowerBound() <= 1 &&
+        uint64_t(r->GetLowerBound()) + r->GetRangeSize() > 1)
+      return fail("raster replay visibility binding collides with application");
 
   if (generated) for (const auto &r : dm.GetUAVs())
     if (r->GetSpaceID() == registerSpace && r->GetLowerBound() == 0)
@@ -127,10 +131,10 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   cb->SetSpaceID(registerSpace);
   cb->SetLowerBound(0);
   cb->SetRangeSize(1);
-  cb->SetSize(32);
+  cb->SetSize(48);
   cb->SetGlobalName("ScorpiRasterReplay");
   auto *cbType = StructType::create(
-      ctx, {i32, i32, i32, i32, i32, i32, i32, i32}, "ScorpiRasterReplay");
+      ctx, {i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32}, "ScorpiRasterReplay");
   cb->SetGlobalSymbol(UndefValue::get(cbType->getPointerTo()));
   unsigned cbID = dm.AddCBuffer(std::move(cb));
   auto srv = std::make_unique<DxilResource>();
@@ -144,6 +148,14 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   auto *srvType = StructType::create(ctx, {i32}, "ScorpiRasterCoverage");
   srv->SetGlobalSymbol(UndefValue::get(srvType->getPointerTo()));
   unsigned srvID = dm.AddSRV(std::move(srv));
+  auto visibility = std::make_unique<DxilResource>();
+  visibility->SetID(unsigned(dm.GetUAVs().size())); visibility->SetRW(true);
+  visibility->SetKind(DXIL::ResourceKind::RawBuffer); visibility->SetSpaceID(registerSpace);
+  visibility->SetLowerBound(1); visibility->SetRangeSize(1);
+  visibility->SetGlobalName("ScorpiRasterVisibility");
+  visibility->SetGlobalSymbol(UndefValue::get(
+      StructType::create(ctx, {i32}, "ScorpiRasterVisibility")->getPointerTo()));
+  unsigned visibilityID = dm.AddUAV(std::move(visibility));
   unsigned captureID = 0;
   if (generated) {
     auto storage = std::make_unique<DxilResource>();
@@ -154,16 +166,16 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     captureID = dm.AddUAV(std::move(storage));
   }
   auto handle = [&](DXIL::ResourceClass cls, unsigned id) {
-    if (dm.GetShaderModel()->GetMinor() >= 6) {
-      DxilResourceBase *resource =
+    DxilResourceBase *resource =
           cls == DXIL::ResourceClass::CBuffer
               ? static_cast<DxilResourceBase *>(&dm.GetCBuffer(id))
               : cls == DXIL::ResourceClass::UAV ? &dm.GetUAV(id) : &dm.GetSRV(id);
+    if (dm.GetShaderModel()->GetMinor() >= 6) {
       auto binding = resource_helper::loadBindingFromResourceBase(resource);
       auto *bindingValue = resource_helper::getAsConstant(
           binding, ops->GetResourceBindingType(), *dm.GetShaderModel());
       auto *unannotated = opCall(OpCode::CreateHandleFromBinding, b.getVoidTy(),
-                                 {bindingValue, b.getInt32(0), b.getFalse()});
+                                 {bindingValue, b.getInt32(resource->GetLowerBound()), b.getFalse()});
       auto properties = resource_helper::loadPropsFromResourceBase(resource);
       auto *propertiesValue = resource_helper::getAsConstant(
           properties, ops->GetResourcePropertiesType(), *dm.GetShaderModel());
@@ -172,10 +184,13 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     }
     return opCall(OpCode::CreateHandle, b.getVoidTy(),
                   {b.getInt8(static_cast<unsigned>(cls)), b.getInt32(id),
-                   b.getInt32(0), b.getFalse()});
+                   b.getInt32(resource->GetLowerBound()), b.getFalse()});
   };
   auto *cbHandle = handle(DXIL::ResourceClass::CBuffer, cbID);
   auto *coverageHandle = handle(DXIL::ResourceClass::SRV, srvID);
+  auto *visibilityHandle = handle(DXIL::ResourceClass::UAV, visibilityID);
+  auto *queryParams = opCall(OpCode::CBufferLoadLegacy, i32, {cbHandle, b.getInt32(2)});
+  auto *queryEnabled = b.CreateICmpNE(b.CreateExtractValue(queryParams, 2), b.getInt32(0));
   auto *params =
       opCall(OpCode::CBufferLoadLegacy, i32, {cbHandle, b.getInt32(0)});
   auto *width = b.CreateExtractValue(params, 0);
@@ -251,6 +266,19 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   }
   auto *alive = b.CreateAlloca(b.getInt1Ty(), nullptr, "replay.alive");
   b.CreateStore(active, alive);
+  auto *outputCoverage = b.CreateAlloca(i32, nullptr, "replay.outputCoverage");
+  auto *queryStart = b.CreateStore(b.getInt32(UINT32_MAX), outputCoverage);
+  const bool earlyDepth = dm.m_ShaderFlags.GetForceEarlyDepthStencil();
+  auto recordVisibility = [&](IRBuilder<> &at, Value *survives, Value *outputMask) {
+    Value *bits = sampleFrequency ? bit : maskedCoverage;
+    bits = at.CreateAnd(bits, outputMask);
+    auto *enabled = at.CreateAnd(queryEnabled, survives);
+    auto *write = at.CreateCall(ops->GetOpFunc(OpCode::AtomicBinOp, i32),
+        {at.getInt32(unsigned(OpCode::AtomicBinOp)), visibilityHandle,
+         at.getInt32(unsigned(DXIL::AtomicBinOpCode::Or)), address,
+         UndefValue::get(i32), UndefValue::get(i32), bits});
+    PredicateWrite(write, enabled);
+  };
   // DXIL EvalSnapped offsets use sixteenths of a pixel about its center.
   static const int8_t positions[3][16][2] = {
       {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}},
@@ -345,6 +373,13 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                      alive);
       // Keep the discard itself as an ordering boundary.
     } else if (op == OpCode::StoreOutput) {
+      // SV_Coverage affects ordinary visibility even with no attachments.
+      if (auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1)))
+        for (const auto &e : dm.GetOutputSignature().GetElements())
+          if (e->GetID() == id->getZExtValue() && e->GetKind() == DXIL::SemanticKind::Coverage) {
+            IRBuilder<> at(call);
+            at.CreateStore(call->getArgOperand(4), outputCoverage);
+          }
       // This variant is used only with no color or depth/stencil attachments.
       // Outputs are discarded, but computations leading to them (including
       // UAV side effects) remain subject to the normal replay predicates.
@@ -354,10 +389,24 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       PredicateWrite(call, at.CreateLoad(alive));
     }
   }
+  if (earlyDepth) {
+    // Insert before original shader work, so neither discard nor output
+    // coverage can reduce a FORCE_EARLY_DEPTH_STENCIL query.
+    IRBuilder<> at(queryStart);
+    recordVisibility(at, active, at.getInt32(UINT32_MAX));
+  } else {
+    std::vector<ReturnInst *> returns;
+    for (auto &block : *entry)
+      if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) returns.push_back(ret);
+    for (auto *ret : returns) {
+      IRBuilder<> at(ret);
+      recordVisibility(at, at.CreateLoad(alive), at.CreateLoad(outputCoverage));
+    }
+  }
   dm.GetOutputSignature().ClearElements();
   DominatorTree dominators;
   dominators.recalculate(*entry);
-  PromoteMemToReg({alive}, dominators);
+  PromoteMemToReg({alive, outputCoverage}, dominators);
   dm.CollectShaderFlagsForModule();
   // DXIL rejects declarations left behind after replacing an intrinsic.
   for (auto it = module->begin(); it != module->end();) {
