@@ -40,7 +40,7 @@ static void SetDxilTargetTriple(llvm::Module *pModule) {
 static void AddMissingSignatureRecordsFromDeclarations(
     SignatureHelper &SigHelper, const ShaderModel *SM,
     D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
-    bool HasCoverageOut, bool StreamOutputOnly = false);
+    bool HasCoverageOut, bool StreamOutputOnly = false, unsigned RasterizedStream = UINT_MAX);
 
 static bool SameBaseCompType(CompType A, CompType B) {
   if (A.IsInvalid() || B.IsInvalid())
@@ -177,7 +177,7 @@ HRESULT STDMETHODCALLTYPE DxbcConverter::ConvertInDriverToContainer(
 
 DxbcConverter::DxbcConverter()
     : m_dwRef(0), m_pPR(nullptr), m_pOP(nullptr), m_pSM(nullptr),
-      m_DxbcMajor(0), m_DxbcMinor(0), m_bDisableHashCheck(false), m_bStreamOutputOnly(false),
+      m_DxbcMajor(0), m_DxbcMinor(0), m_bDisableHashCheck(false), m_bStreamOutputOnly(false), m_RasterizedStream(UINT_MAX),
       m_bRunDxilCleanup(true), m_bLegacyCBufferLoad(true),
       m_DepthRegType(D3D10_SB_OPERAND_TYPE_NULL), m_bHasStencilRef(false),
       m_bHasCoverageOut(false), m_pUnusedF32(nullptr), m_pUnusedI32(nullptr),
@@ -485,7 +485,7 @@ void DxbcConverter::ConvertInDriverImpl(
                           *m_pOutputSignature);
   AddMissingSignatureRecordsFromDeclarations(
       *m_pOutputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
-      m_bHasCoverageOut, m_bStreamOutputOnly);
+      m_bHasCoverageOut, m_bStreamOutputOnly, m_RasterizedStream);
   ConvertSignature(*m_pOutputSignature, m_pPR->GetOutputSignature());
   if (m_pSM->IsHS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
@@ -596,7 +596,7 @@ void DxbcConverter::ConvertInDriverToContainerImpl(
                           *m_pOutputSignature);
   AddMissingSignatureRecordsFromDeclarations(
       *m_pOutputSignature, m_pSM, m_DepthRegType, m_bHasStencilRef,
-      m_bHasCoverageOut, m_bStreamOutputOnly);
+      m_bHasCoverageOut, m_bStreamOutputOnly, m_RasterizedStream);
   ConvertSignature(*m_pOutputSignature, m_pPR->GetOutputSignature());
   if (m_pSM->IsHS()) {
     ExtractSignatureFromDDI(pPatchConstantSignature,
@@ -664,6 +664,11 @@ void DxbcConverter::ParseExtraOptions(const wchar_t *pExtraOptions) {
 
   if (Str.find(L"-scorpi-stream-output-only") != wstring::npos)
     m_bStreamOutputOnly = true;
+
+  for (unsigned stream = 0; stream < 4; ++stream) {
+    if (Str.find(L"-scorpi-rasterized-stream=" + std::to_wstring(stream)) != wstring::npos)
+      m_RasterizedStream = stream;
+  }
 
   // Opt out from DXIL cleanup pass.
   if (Str.find(L"-no-dxil-cleanup") != wstring::npos)
@@ -1156,7 +1161,7 @@ static void FillPixelOutputSystemValueRecord(
 static void AddMissingSignatureRecordsFromDeclarations(
     SignatureHelper &SigHelper, const ShaderModel *SM,
     D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
-    bool HasCoverageOut, bool StreamOutputOnly) {
+    bool HasCoverageOut, bool StreamOutputOnly, unsigned RasterizedStream) {
   if (SigHelper.m_UsedElements.empty())
     return;
 
@@ -1214,10 +1219,10 @@ static void AddMissingSignatureRecordsFromDeclarations(
       continue;
     }
 
-    if (StreamOutputOnly && SM != nullptr && SM->IsGS() &&
-        SigHelper.IsOutput()) {
-      // DDI may omit all output signature entries when no stream is
-      // rasterized. Arbitrary SO outputs have no interpolation/type contract:
+    if ((StreamOutputOnly || (RasterizedStream < 4 && used.OutputStream != RasterizedStream)) &&
+        SM != nullptr && SM->IsGS() && SigHelper.IsOutput()) {
+      // DDI omits the signatures of streams not sent to the rasterizer.
+      // Arbitrary SO outputs have no interpolation/type contract:
       // transport their 32 bits unchanged, including floats and mixed writes.
       // System-value declarations above retain their required DXIL types.
       record.SemanticName = "SCORPI";

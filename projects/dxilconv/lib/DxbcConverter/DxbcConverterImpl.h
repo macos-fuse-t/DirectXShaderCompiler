@@ -343,6 +343,7 @@ protected:
 
   bool m_bDisableHashCheck;
   bool m_bStreamOutputOnly;
+  unsigned m_RasterizedStream;
   bool m_bRunDxilCleanup;
 
   bool m_bLegacyCBufferLoad;

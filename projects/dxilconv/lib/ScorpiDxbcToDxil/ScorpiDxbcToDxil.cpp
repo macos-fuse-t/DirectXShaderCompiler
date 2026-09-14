@@ -203,7 +203,13 @@ SignatureView ParseSignatures(const void *signature_dump,
     throw std::runtime_error("signature entry size does not match DXC");
   }
 
-  if (metadata->flags & ~SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY)
+  const uint32_t allowed = SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY |
+      SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM | SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK;
+  if ((metadata->flags & ~allowed) ||
+      ((metadata->flags & SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK) &&
+       !(metadata->flags & SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM)) ||
+      ((metadata->flags & SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY) &&
+       (metadata->flags & SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM)))
     throw std::runtime_error("unsupported signature metadata flags");
   storage->flags = metadata->flags;
   storage->input = ConvertWireSignatureEntries(
@@ -394,6 +400,15 @@ ConvertTokenStreamToDxilContainer(const void *shader_code,
   uint32_t dxil_size = 0;
   LPWSTR diagnostics = nullptr;
   const wchar_t *options = nullptr;
+  std::wstring rasterizedOption;
+  if (signatures.flags & SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM) {
+    if ((token_stream[0] >> 16) != 2)
+      throw std::runtime_error("rasterized stream signatures require a geometry shader");
+    const uint32_t stream = (signatures.flags & SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK) >>
+        SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_SHIFT;
+    rasterizedOption = L"-scorpi-rasterized-stream=" + std::to_wstring(stream);
+    options = rasterizedOption.c_str();
+  }
   if (signatures.flags & SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY) {
     if ((token_stream[0] >> 16) != 2)
       throw std::runtime_error("stream-output-only signatures require a geometry shader");

@@ -32,6 +32,11 @@ enum {
   // No output is rasterized. Missing arbitrary GS output types represent raw
   // 32-bit stream-output storage, not an interpolated shader interface.
   SCORPI_SHADER_SIGNATURE_STREAM_OUTPUT_ONLY = 1,
+  // The runtime supplies the rasterized stream's typed signature; other GS
+  // streams carry raw SO values. Bits 2-3 identify the rasterized stream.
+  SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM = 2,
+  SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_SHIFT = 2,
+  SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK = 12,
 };
 
 typedef struct ScorpiShaderSignatureMetadata {
