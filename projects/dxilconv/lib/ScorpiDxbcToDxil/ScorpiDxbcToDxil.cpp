@@ -19,6 +19,10 @@
 #include "dxc/DXIL/DxilShaderModel.h"
 #include "dxc/DXIL/DxilSignature.h"
 #include "dxc/DXIL/DxilSignatureElement.h"
+#include "dxc/DXIL/DxilResource.h"
+#include "dxc/DXIL/DxilResourceProperties.h"
+#include "dxc/DXIL/DxilOperations.h"
+#include "llvm/IR/Verifier.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -597,6 +601,9 @@ static int CreateRasterReplayShader(
         : vertex ? scorpi::PrepareRasterReplayVertexShader(*dxil, register_space, error)
         : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated)))
       throw std::runtime_error(error.empty() ? "missing DXIL module" : error);
+    // The replay transforms change signatures. Serialized ViewID state still
+    // describes the source signature and cannot be reused for the new PSV.
+    dxil->GetSerializedViewIdState().clear();
     hlsl::DxilModule::ClearDxilMetadata(*parsed.get());
     dxil->EmitDxilMetadata();
     CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
@@ -655,11 +662,208 @@ extern "C" int ScorpiLowerGeometryPrimitiveId(
       binary_size, error, error_size, false, false, true);
 }
 
+namespace {
+using TextureKind = hlsl::DXIL::ResourceKind;
+TextureKind OriginalTextureKind(llvm::Value *value, hlsl::DxilModule &dm,
+                                unsigned depth = 0) {
+  if (!value || depth > 12) return TextureKind::Invalid;
+  auto *call = llvm::dyn_cast<llvm::CallInst>(value);
+  if (call && call->getNumArgOperands() > 2) {
+    auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+    if (opcode) switch (static_cast<hlsl::DXIL::OpCode>(opcode->getZExtValue())) {
+    case hlsl::DXIL::OpCode::AnnotateHandle:
+      if (auto *properties = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2)))
+        return hlsl::resource_helper::loadPropsFromConstant(*properties).getResourceKind();
+      break;
+    case hlsl::DXIL::OpCode::CreateHandle: {
+      auto *type = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+      auto *id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+      if (!type || !id) break;
+      const auto index = id->getZExtValue();
+      if (type->getZExtValue() == unsigned(hlsl::DXIL::ResourceClass::SRV) &&
+          index < dm.GetSRVs().size()) return dm.GetSRV(unsigned(index)).GetKind();
+      if (type->getZExtValue() == unsigned(hlsl::DXIL::ResourceClass::UAV) &&
+          index < dm.GetUAVs().size()) return dm.GetUAV(unsigned(index)).GetKind();
+      break;
+    }
+    default: break;
+    }
+  }
+  if (auto *select = llvm::dyn_cast<llvm::SelectInst>(value)) {
+    auto a = OriginalTextureKind(select->getTrueValue(), dm, depth + 1);
+    auto b = OriginalTextureKind(select->getFalseValue(), dm, depth + 1);
+    return a == b ? a : TextureKind::Invalid;
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    TextureKind result = TextureKind::Invalid;
+    for (auto &incoming : phi->incoming_values()) {
+      auto kind = OriginalTextureKind(incoming, dm, depth + 1);
+      if (result != TextureKind::Invalid && result != kind) return TextureKind::Invalid;
+      result = kind;
+    }
+    return result;
+  }
+  return TextureKind::Invalid;
+}
+}
+
+extern "C" int ScorpiPromoteTexture1D(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size || !code || !size)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid texture shader container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("texture shader has no DXIL program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)),
+        "texture-1d", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid texture shader bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing texture shader module");
+    auto promoted = [](TextureKind kind) {
+      return kind == TextureKind::Texture1D ? TextureKind::Texture2D :
+          kind == TextureKind::Texture1DArray ? TextureKind::Texture2DArray : kind;
+    };
+    bool changed = false;
+    for (const auto &resource : dm->GetSRVs()) changed |= promoted(resource->GetKind()) != resource->GetKind();
+    for (const auto &resource : dm->GetUAVs()) changed |= promoted(resource->GetKind()) != resource->GetKind();
+    if (!changed) return SCORPI_DXBC_TO_DXIL_OK;
+
+    std::vector<llvm::CallInst *> annotated;
+    for (auto &function : *parsed.get()) for (auto &block : function)
+      for (auto &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (!call || !call->getNumArgOperands()) continue;
+        auto *opcodeValue = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+        if (!opcodeValue || !call->getCalledFunction() ||
+            !call->getCalledFunction()->getName().startswith("dx.op.")) continue;
+        const auto opcode = static_cast<hlsl::DXIL::OpCode>(opcodeValue->getZExtValue());
+        if (opcode == hlsl::DXIL::OpCode::AnnotateHandle) {
+          annotated.push_back(call);
+          continue;
+        }
+        if (call->getNumArgOperands() < 2) continue;
+        const auto kind = OriginalTextureKind(call->getArgOperand(1), *dm);
+        if (kind != TextureKind::Texture1D && kind != TextureKind::Texture1DArray) continue;
+        const bool array = kind == TextureKind::Texture1DArray;
+        const auto zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
+        const auto half = llvm::ConstantFP::get(llvm::Type::getFloatTy(context), 0.5);
+        switch (opcode) {
+        case hlsl::DXIL::OpCode::Sample:
+        case hlsl::DXIL::OpCode::SampleBias:
+        case hlsl::DXIL::OpCode::SampleLevel:
+        case hlsl::DXIL::OpCode::SampleGrad:
+        case hlsl::DXIL::OpCode::SampleCmp:
+        case hlsl::DXIL::OpCode::SampleCmpLevelZero:
+        case hlsl::DXIL::OpCode::TextureGather:
+        case hlsl::DXIL::OpCode::TextureGatherCmp:
+          if (array) call->setArgOperand(5, call->getArgOperand(4));
+          call->setArgOperand(4, half);
+          call->setArgOperand(8, zero);
+          if (opcode == hlsl::DXIL::OpCode::SampleGrad) {
+            call->setArgOperand(11, llvm::ConstantFP::get(llvm::Type::getFloatTy(context), 0));
+            call->setArgOperand(14, llvm::ConstantFP::get(llvm::Type::getFloatTy(context), 0));
+          }
+          break;
+        case hlsl::DXIL::OpCode::TextureLoad:
+          if (array) call->setArgOperand(5, call->getArgOperand(4));
+          call->setArgOperand(4, zero);
+          call->setArgOperand(7, zero);
+          break;
+        case hlsl::DXIL::OpCode::TextureStore:
+          if (array) call->setArgOperand(4, call->getArgOperand(3));
+          call->setArgOperand(3, zero);
+          break;
+        case hlsl::DXIL::OpCode::AtomicBinOp:
+          if (array) call->setArgOperand(5, call->getArgOperand(4));
+          call->setArgOperand(4, zero);
+          break;
+        case hlsl::DXIL::OpCode::AtomicCompareExchange:
+          if (array) call->setArgOperand(4, call->getArgOperand(3));
+          call->setArgOperand(3, zero);
+          break;
+        case hlsl::DXIL::OpCode::CalculateLOD:
+          if (array) call->setArgOperand(5, call->getArgOperand(4));
+          call->setArgOperand(4, half);
+          break;
+        case hlsl::DXIL::OpCode::GetDimensions: {
+          std::vector<llvm::ExtractValueInst *> extracts;
+          for (auto *user : call->users()) {
+            auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(user);
+            if (!extract) throw std::runtime_error("unsupported 1D dimensions consumer");
+            extracts.push_back(extract);
+          }
+          for (auto *extract : extracts) {
+            if (extract->getNumIndices() != 1) throw std::runtime_error("unsupported 1D dimensions result");
+            unsigned index = *extract->idx_begin();
+            if (array && index == 1) index = 2;
+            else if (array && index == 2) index = 3;
+            else if (!array && index == 1) index = 3;
+            if (index == *extract->idx_begin()) continue;
+            auto *replacement = llvm::ExtractValueInst::Create(call, {index}, "", extract);
+            extract->replaceAllUsesWith(replacement);
+            extract->eraseFromParent();
+          }
+          break;
+        }
+        default:
+          throw std::runtime_error("unsupported 1D texture DXIL operation");
+        }
+      }
+    for (auto *call : annotated)
+      if (auto *constant = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
+        auto properties = hlsl::resource_helper::loadPropsFromConstant(*constant);
+        const auto kind = promoted(properties.getResourceKind());
+        if (kind != properties.getResourceKind()) {
+          properties.setResourceKind(kind);
+          call->setArgOperand(2, hlsl::resource_helper::getAsConstant(
+              properties, dm->GetOP()->GetResourcePropertiesType(), *dm->GetShaderModel()));
+        }
+      }
+    for (auto &resource : dm->GetSRVs()) resource->SetKind(promoted(resource->GetKind()));
+    for (auto &resource : dm->GetUAVs()) resource->SetKind(promoted(resource->GetKind()));
+    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid promoted texture IR");
+    hlsl::DxilModule::ClearDxilMetadata(*parsed.get());
+    dm->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); llvm::WriteBitcodeToFile(parsed.get().get(), stream); }
+    hlsl::SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate promoted texture shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected 1D texture promotion failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 static int CreateGeometryCaptureBinary(
     const void *code, size_t size, uint32_t register_space,
     uint32_t vertices_per_primitive, int capture, uint32_t *vertex_stride, void **binary,
     size_t *binary_size, char *error_message, size_t error_message_size,
-    ScorpiGeometryCaptureLayout *layout, bool compacted = false, unsigned tessellation_mode = 0) {
+    ScorpiGeometryCaptureLayout *layout, bool compacted = false, unsigned tessellation_mode = 0,
+    uint32_t rasterized_stream = 0) {
   SetError(error_message, error_message_size, "");
   if (!binary || !binary_size || !vertex_stride) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr;
@@ -700,6 +904,7 @@ static int CreateGeometryCaptureBinary(
     } else if (tessellation_mode == 3) {
       ScorpiGeometryCaptureLayout replay{};
       replay.max_vertices=vertices_per_primitive;replay.instance_count=1;replay.vertices_per_primitive=vertices_per_primitive;
+      replay.stream_mask=1;
       for(const auto &e:dxil->GetOutputSignature().GetElements()) replay.vertex_stride+=e->GetRows()*e->GetCols()*4;
       generated=scorpi::CreateGeometryCaptureModule(*dxil,register_space,vertices_per_primitive,false,
           *vertex_stride,error,&replay,true,true);
@@ -710,10 +915,12 @@ static int CreateGeometryCaptureBinary(
       if (!scorpi::GetGeometryCaptureLayout(*dxil, *layout, error)) throw std::runtime_error(error);
       *vertex_stride = layout->vertex_stride;
       if (capture) {
-        if (!scorpi::PrepareGeometryShaderCapture(*dxil, register_space, *layout, error, capture >= 2, capture != 3)) throw std::runtime_error(error);
+        if (!scorpi::PrepareGeometryShaderCapture(*dxil, register_space, *layout, error,
+            capture == 2 || capture == 3, capture == 1 || capture == 2)) throw std::runtime_error(error);
         generated = std::move(parsed.get());
       } else generated = scorpi::CreateGeometryCaptureModule(*dxil, register_space,
-          layout->vertices_per_primitive, false, *vertex_stride, error, layout, compacted);
+          layout->vertices_per_primitive, false, *vertex_stride, error, layout,
+          compacted, false, false, false, rasterized_stream);
     } else generated = scorpi::CreateGeometryCaptureModule(*dxil, register_space,
         vertices_per_primitive, capture != 0, *vertex_stride, error);
     if (!generated) throw std::runtime_error(error);
@@ -783,6 +990,16 @@ extern "C" int ScorpiCreateCompactedGeometryReplayShader(
   uint32_t stride = 0;
   return CreateGeometryCaptureBinary(code, size, space, 0, 0, &stride,
       binary, binary_size, error, error_size, layout, true);
+}
+
+extern "C" int ScorpiCreateCompactedGeometryReplayShaderForStream(
+    const void *code, size_t size, uint32_t space, uint32_t rasterized_stream,
+    ScorpiGeometryCaptureLayout *layout, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  if (!layout) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  uint32_t stride = 0;
+  return CreateGeometryCaptureBinary(code, size, space, 0, 0, &stride,
+      binary, binary_size, error, error_size, layout, true, 0, rasterized_stream);
 }
 
 extern "C" int ScorpiGetGeometryCaptureElements(const void *code, size_t size,

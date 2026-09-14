@@ -142,7 +142,8 @@ ScorpiCreateGeometryCaptureShader(const void *code, size_t size,
 
 // Generated-geometry capture is bounded by the GS declaration. Each instance
 // owns a 16-byte header (emitted vertex count at byte zero), followed by
-// max_vertices records. A record is {primitiveID, stripVertexIndex, payload};
+// max_vertices records per active stream. Each stream has its own header and
+// contiguous records {primitiveID, stripVertexIndex, payload} within a slot.
 // payload uses output-signature element/row/component order. Replay parameters
 // primitive_id/reserved select the instance header/first vertex record in bytes.
 typedef struct ScorpiGeometryCaptureLayout {
@@ -150,6 +151,7 @@ typedef struct ScorpiGeometryCaptureLayout {
   uint32_t max_vertices;
   uint32_t instance_count;
   uint32_t vertices_per_primitive;
+  uint32_t stream_mask;
 } ScorpiGeometryCaptureLayout;
 
 // Batched modes index records by input primitive, then GS instance. The
@@ -159,7 +161,8 @@ enum ScorpiGeometryCaptureMode {
   SCORPI_GEOMETRY_REPLAY = 0,
   SCORPI_GEOMETRY_CAPTURE = 1,
   SCORPI_GEOMETRY_CAPTURE_BATCHED = 2,
-  SCORPI_GEOMETRY_CAPTURE_BATCHED_NO_RASTER = 3
+  SCORPI_GEOMETRY_CAPTURE_BATCHED_NO_RASTER = 3,
+  SCORPI_GEOMETRY_CAPTURE_NO_RASTER = 4
 };
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateGeometryShaderCapture(const void *code, size_t size,
@@ -180,12 +183,24 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateCompactedGeometryReplayShader(const void *code, size_t size,
     uint32_t register_space, ScorpiGeometryCaptureLayout *layout,
     void **binary, size_t *binary_size, char *error, size_t error_size);
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateCompactedGeometryReplayShaderForStream(const void *code, size_t size,
+    uint32_t register_space, uint32_t rasterized_stream,
+    ScorpiGeometryCaptureLayout *layout, void **binary, size_t *binary_size,
+    char *error, size_t error_size);
 
 // Optional backend adaptation: carry an application GS PrimitiveID as a flat
 // user varying when a backend cannot link the native primitive system value.
 // Apply consistently to GS output and PS input; no logical shader value changes.
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerGeometryPrimitiveId(const void *code, size_t size, void **binary,
+    size_t *binary_size, char *error, size_t error_size);
+
+// Metal stores logical 1D mip chains as height-one 2D textures. Promote the
+// DXIL resource kind and texture coordinates to match that physical storage.
+// An unchanged shader returns a null binary and zero size.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiPromoteTexture1D(const void *code, size_t size, void **binary,
     size_t *binary_size, char *error, size_t error_size);
 
 // One output-signature row and its location in the capture payload. This is

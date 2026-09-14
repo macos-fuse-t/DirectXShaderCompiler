@@ -311,6 +311,7 @@ bool PrepareTessellationCaptureDomain(hlsl::DxilModule &dm, uint32_t &vertexStri
     if(call && call->getCalledFunction() && call->getCalledFunction()->getName().startswith("dx.op.storeOutput.")) outputs.push_back(call);
   }
   AddTessellationCaptureSignature(dm.GetOutputSignature(),words);
+  dm.GetSerializedViewIdState().clear();
   for(auto *original:outputs) {
     auto *id=dyn_cast<ConstantInt>(original->getArgOperand(1));
     if(!id || !elements.count(unsigned(id->getZExtValue()))) {error="invalid domain output ID";return false;}
@@ -341,15 +342,40 @@ bool LowerGeometryPrimitiveId(hlsl::DxilModule &dm, std::string &error) {
     error = "geometry PrimitiveID linking requires GS or PS"; return false;
   }
   auto &signature = dm.GetShaderModel()->IsGS() ? dm.GetOutputSignature() : dm.GetInputSignature();
+  struct Element {
+    std::string name;
+    hlsl::CompType type;
+    hlsl::InterpolationMode interpolation;
+    unsigned rows, cols, id, usage, stream, dynamic_mask;
+    int row, col;
+    std::vector<unsigned> indices;
+    hlsl::DXIL::SemanticKind kind;
+  };
+  std::vector<Element> elements;
+  bool changed = false;
   for (auto &element : signature.GetElements()) {
-    if (element->GetKind() != DXIL::SemanticKind::PrimitiveID) continue;
-    if (!element->IsAllocated()) { error = "unallocated geometry PrimitiveID signature"; return false; }
-    auto indices = element->GetSemanticIndexVec();
-    auto usage = element->GetUsageMask();
-    element->Initialize("SCORPI_GS_PRIMITIVE_ID", element->GetCompType(),
-        DXIL::InterpolationMode::Constant, element->GetRows(), element->GetCols(),
-        element->GetStartRow(), element->GetStartCol(), element->GetID(), indices);
-    element->SetKind(DXIL::SemanticKind::Arbitrary); element->SetUsageMask(usage);
+    const bool primitive = element->GetKind() == DXIL::SemanticKind::PrimitiveID;
+    if (primitive && !element->IsAllocated()) { error = "unallocated geometry PrimitiveID signature"; return false; }
+    changed |= primitive;
+    elements.push_back({primitive ? "SCORPI_GS_PRIMITIVE_ID" : element->GetName(),
+        element->GetCompType(), primitive ? DXIL::InterpolationMode::Constant :
+        *element->GetInterpolationMode(), element->GetRows(), element->GetCols(),
+        element->GetID(), element->GetUsageMask(), element->GetOutputStream(),
+        element->GetDynIdxCompMask(), element->GetStartRow(), element->GetStartCol(),
+        element->GetSemanticIndexVec(), primitive ? DXIL::SemanticKind::Arbitrary : element->GetKind()});
+  }
+  if (!changed) return true;
+  signature.ClearElements();
+  dm.GetSerializedViewIdState().clear();
+  for (const auto &source : elements) {
+    auto element = signature.CreateElement();
+    element->Initialize(source.name, source.type, source.interpolation,
+        source.rows, source.cols, source.row, source.col, source.id, source.indices);
+    element->SetKind(source.kind);
+    element->SetUsageMask(source.usage);
+    element->SetOutputStream(source.stream);
+    element->SetDynIdxCompMask(source.dynamic_mask);
+    signature.AppendElement(std::move(element));
   }
   dm.CollectShaderFlagsForModule();
   return true;
@@ -416,10 +442,12 @@ bool PrepareRasterReplayVertexShader(hlsl::DxilModule &dm, uint32_t space,
 bool GetGeometryCaptureLayout(const hlsl::DxilModule &source,
     ScorpiGeometryCaptureLayout &layout, std::string &error) {
   layout = {};
-  if (!source.GetShaderModel()->IsGS() || source.GetActiveStreamMask() != 1) {
-    error = "generated geometry capture requires a single rasterized GS stream";
+  if (!source.GetShaderModel()->IsGS() || !source.GetActiveStreamMask() ||
+      (source.GetActiveStreamMask() & ~15u)) {
+    error = "generated geometry capture requires one to four GS streams";
     return false;
   }
+  layout.stream_mask = source.GetActiveStreamMask();
   switch (source.GetStreamPrimitiveTopology()) {
   case hlsl::DXIL::PrimitiveTopology::PointList: layout.vertices_per_primitive = 1; break;
   case hlsl::DXIL::PrimitiveTopology::LineStrip: layout.vertices_per_primitive = 2; break;
@@ -471,9 +499,15 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
   const uint32_t recordStride = layout.vertex_stride + 8;
   Value *slot=instance;
   if(batched) slot=b.CreateAdd(b.CreateMul(call(OpCode::PrimitiveID,i32,{}),b.getInt32(layout.instance_count)),instance);
-  auto *base = b.CreateMul(slot, b.getInt32(16 + layout.max_vertices * recordStride));
-  auto *count = b.CreateAlloca(i32, nullptr, "capture.count"); b.CreateStore(b.getInt32(0), count);
-  auto *strip = b.CreateAlloca(i32, nullptr, "capture.strip"); b.CreateStore(b.getInt32(0), strip);
+  const uint32_t streamStride = 16 + layout.max_vertices * recordStride;
+  const uint32_t streamCount = layout.stream_mask == 1 ? 1 : 4;
+  auto *base = b.CreateMul(slot, b.getInt32(streamCount * streamStride));
+  auto *counts = b.CreateAlloca(ArrayType::get(i32, 4), nullptr, "capture.counts");
+  for (unsigned stream = 0; stream < 4; ++stream)
+    b.CreateStore(b.getInt32(0), b.CreateGEP(counts, {b.getInt32(0), b.getInt32(stream)}));
+  auto *strips = b.CreateAlloca(ArrayType::get(i32, 4), nullptr, "capture.strips");
+  for (unsigned stream = 0; stream < 4; ++stream)
+    b.CreateStore(b.getInt32(0), b.CreateGEP(strips, {b.getInt32(0), b.getInt32(stream)}));
   auto *values = b.CreateAlloca(ArrayType::get(i32, layout.vertex_stride / 4), nullptr, "capture.values");
   auto valuePointer = [&](Value *index) { return b.CreateGEP(values, {b.getInt32(0), index}); };
   std::unordered_map<unsigned, unsigned> offsets;
@@ -505,15 +539,25 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
       b.CreateStore(value->getType() == i32 ? value : b.CreateBitCast(value, i32), valuePointer(index));
       if (!rasterize) original->eraseFromParent();
     } else if (opcode == OpCode::EmitStream || opcode == OpCode::EmitThenCutStream || opcode == OpCode::CutStream) {
+      auto *streamID = dyn_cast<ConstantInt>(original->getArgOperand(1));
+      if (!streamID || streamID->getZExtValue() >= 4 ||
+          !(layout.stream_mask & (1u << streamID->getZExtValue()))) {
+        error = "invalid geometry emission stream"; return false;
+      }
+      const unsigned stream = unsigned(streamID->getZExtValue());
+      auto *count = b.CreateGEP(counts, {b.getInt32(0), b.getInt32(stream)});
+      auto *streamBase = b.CreateAdd(base, b.getInt32(stream * streamStride));
+      auto *strip = b.CreateGEP(strips, {b.getInt32(0), b.getInt32(stream)});
       if (opcode != OpCode::CutStream) {
         if (!rasterize) for(unsigned col=0;col<4;++col)
           call(OpCode::StoreOutput,b.getFloatTy(),{b.getInt32(0),b.getInt32(0),b.getInt8(col),
               ConstantFP::get(b.getFloatTy(),col==3?1.0:0.0)});
         auto *emitted = b.CreateLoad(count);
         auto *safeIndex = b.CreateSelect(b.CreateICmpULT(emitted, b.getInt32(layout.max_vertices)), emitted, b.getInt32(layout.max_vertices - 1));
-        auto *record = b.CreateAdd(base, b.CreateAdd(b.getInt32(16), b.CreateMul(safeIndex, b.getInt32(recordStride))));
+        auto *record = b.CreateAdd(streamBase, b.CreateAdd(b.getInt32(16), b.CreateMul(safeIndex, b.getInt32(recordStride))));
         Value *id = primitiveComponent == UINT32_MAX ? primitiveID : b.CreateLoad(valuePointer(b.getInt32(primitiveComponent)));
-        store(record, id); store(b.CreateAdd(record, b.getInt32(4)), b.CreateLoad(strip));
+        store(record, id);
+        store(b.CreateAdd(record, b.getInt32(4)), b.CreateLoad(strip));
         for (unsigned i = 0; i < offset; ++i)
           store(b.CreateAdd(record, b.getInt32(8 + i * 4)), b.CreateLoad(valuePointer(b.getInt32(i))));
         auto *next = b.CreateAdd(safeIndex, b.getInt32(1));
@@ -523,10 +567,14 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
     }
   }
   for (auto &block : *entry) if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) {
-    b.SetInsertPoint(ret); store(base, b.CreateLoad(count));
+    b.SetInsertPoint(ret);
+    for (unsigned stream = 0; stream < streamCount; ++stream)
+      store(b.CreateAdd(base, b.getInt32(stream * streamStride)),
+          b.CreateLoad(b.CreateGEP(counts, {b.getInt32(0), b.getInt32(stream)})));
   }
   if (!rasterize) {
     dm.GetOutputSignature().ClearElements();
+    dm.GetSerializedViewIdState().clear();
     auto position=dm.GetOutputSignature().CreateElement();
     position->Initialize("SV_Position",CompType::getF32(),DXIL::InterpolationMode::Linear,
         1,4,0,0,DxilSignatureElement::kUndefinedID,{0});
@@ -548,7 +596,8 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
 std::unique_ptr<llvm::Module> CreateGeometryCaptureModule(
     const hlsl::DxilModule &source, uint32_t registerSpace,
     uint32_t verticesPerPrimitive, bool capture, uint32_t &vertexStride,
-    std::string &error, const ScorpiGeometryCaptureLayout *generated, bool compacted, bool tessellated, bool passthrough, bool discardCapture) {
+    std::string &error, const ScorpiGeometryCaptureLayout *generated, bool compacted, bool tessellated, bool passthrough, bool discardCapture,
+    uint32_t rasterizedStream) {
   using namespace llvm;
   using namespace hlsl;
   using DXIL::OpCode;
@@ -559,6 +608,9 @@ std::unique_ptr<llvm::Module> CreateGeometryCaptureModule(
   if ((!source.GetShaderModel()->IsVS() && !generated && !((tessellated || passthrough) && source.GetShaderModel()->IsDS())) || verticesPerPrimitive < 1 ||
       verticesPerPrimitive > 3)
     return fail("geometry capture requires VS output and point/line/triangle input");
+  if (generated && !capture &&
+      (rasterizedStream >= 4 || !(generated->stream_mask & (1u << rasterizedStream))))
+    return fail("invalid generated geometry rasterized stream");
   vertexStride = 0;
   for (const auto &e : source.GetOutputSignature().GetElements()) {
     if (e->GetCompType().Is64Bit() || e->GetCompType().Is16Bit())
@@ -605,6 +657,7 @@ std::unique_ptr<llvm::Module> CreateGeometryCaptureModule(
   };
   for (const auto &e : source.GetOutputSignature().GetElements()) {
     if (generated && e->GetKind() == DXIL::SemanticKind::PrimitiveID) continue;
+    if (generated && !capture && e->GetOutputStream() != rasterizedStream) continue;
     if (capture) copyElement(dm.GetInputSignature(), *e);
     if (!(tessellated && capture)) copyElement(dm.GetOutputSignature(), *e);
   }
@@ -704,6 +757,10 @@ std::unique_ptr<llvm::Module> CreateGeometryCaptureModule(
     unsigned offset=0,id=0;
     for (const auto &e:source.GetOutputSignature().GetElements()) {
       if (generated && e->GetKind() == DXIL::SemanticKind::PrimitiveID) {
+        offset += e->GetRows() * e->GetCols() * 4;
+        continue;
+      }
+      if (generated && !capture && e->GetOutputStream() != rasterizedStream) {
         offset += e->GetRows() * e->GetCols() * 4;
         continue;
       }
