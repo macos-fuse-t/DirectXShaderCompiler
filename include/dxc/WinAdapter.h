@@ -562,7 +562,7 @@ template <typename T> inline void **IID_PPV_ARGS_Helper(T **pp) {
 
 // Needed for d3d headers, but fail to create actual interfaces
 #define DEFINE_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8)           \
-  const GUID name = {l, w1, w2, {b1, b2, b3, b4, b5, b6, b7, b8}}
+  inline const GUID name = {l, w1, w2, {b1, b2, b3, b4, b5, b6, b7, b8}}
 #define DECLSPEC_UUID(x)
 #define MIDL_INTERFACE(x) struct DECLSPEC_UUID(x)
 #define DECLARE_INTERFACE(iface) struct iface
