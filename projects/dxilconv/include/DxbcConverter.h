@@ -53,7 +53,11 @@ struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) IDxbcConverter
 };
 CROSS_PLATFORM_UUIDOF(IDxbcConverter, "5F956ED5-78D1-4B15-8247-F7187614A041")
 
+#if defined(_WIN32)
 __declspec(selectany) extern const CLSID
+#else
+inline const CLSID
+#endif
     CLSID_DxbcConverter = {/* 4900391E-B752-4EDD-A885-6FB76E25ADDB */
                            0x4900391e,
                            0xb752,
