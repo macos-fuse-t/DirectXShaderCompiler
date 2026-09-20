@@ -57,7 +57,7 @@ class Lowering {
   size_t count;
   uint32_t space, selfOffset, resourceID;
   std::map<Function *, Value *> metadataHandles;
-  std::map<Value *, Value *> prefixes;
+  std::map<std::pair<Value *, unsigned>, Value *> words;
 
   CallInst *Call(IRBuilder<> &b, OpCode opcode, Type *type, std::vector<Value *> args) {
     args.insert(args.begin(), b.getInt32(unsigned(opcode)));
@@ -101,31 +101,34 @@ public:
     resourceID = dm.AddSRV(std::move(resource));
   }
 
-  Value *Prefix(Value *handle) {
-    auto found = prefixes.find(handle);
-    if (found != prefixes.end()) return found->second;
+  Value *Word(Value *handle, unsigned word) {
+    auto key = std::make_pair(handle, word);
+    auto found = words.find(key);
+    if (found != words.end()) return found->second;
     if (auto *phi = dyn_cast<PHINode>(handle)) {
       auto *value = PHINode::Create(Type::getInt32Ty(phi->getContext()), phi->getNumIncomingValues(),
           "scorpi.view.prefix", phi);
-      prefixes[handle] = value;
+      words[key] = value;
       for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
-        value->addIncoming(Prefix(phi->getIncomingValue(i)), phi->getIncomingBlock(i));
+        value->addIncoming(Word(phi->getIncomingValue(i), word), phi->getIncomingBlock(i));
       return value;
     }
     if (auto *select = dyn_cast<SelectInst>(handle)) {
-      auto *a = Prefix(select->getTrueValue()), *b = Prefix(select->getFalseValue());
+      auto *a = Word(select->getTrueValue(), word), *b = Word(select->getFalseValue(), word);
       IRBuilder<> builder(select->getNextNode());
-      return prefixes[handle] = builder.CreateSelect(select->getCondition(), a, b);
+      return words[key] = builder.CreateSelect(select->getCondition(), a, b);
     }
     auto *call = dyn_cast<CallInst>(handle);
     if (!call) throw std::runtime_error("unsupported typed-buffer handle");
-    if (Opcode(call) == OpCode::AnnotateHandle) return prefixes[handle] = Prefix(call->getArgOperand(1));
+    if (Opcode(call) == OpCode::AnnotateHandle) return words[key] = Word(call->getArgOperand(1), word);
     uint32_t cls, resourceSpace, lower;
     Value *index;
     if (Opcode(call) == OpCode::CreateHandle) {
       cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
       unsigned id = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
-      auto &resource = cls == unsigned(ResourceClass::SRV) ? dm.GetSRV(id) : dm.GetUAV(id);
+      const DxilResourceBase &resource = cls == unsigned(ResourceClass::Sampler) ?
+          static_cast<const DxilResourceBase &>(dm.GetSampler(id)) :
+          cls == unsigned(ResourceClass::SRV) ? dm.GetSRV(id) : dm.GetUAV(id);
       resourceSpace = resource.GetSpaceID(); lower = resource.GetLowerBound(); index = call->getArgOperand(3);
     } else if (Opcode(call) == OpCode::CreateHandleFromBinding) {
       auto binding = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
@@ -146,14 +149,15 @@ public:
     auto *relative = b.CreateSub(Load(b, metadata, b.getInt32(range->root_offset)),
         Load(b, metadata, b.getInt32(selfOffset)));
     auto *slot = b.CreateAdd(b.CreateSub(index, b.getInt32(range->base_register)), b.getInt32(range->table_offset));
-    auto *offset = b.CreateAdd(relative, b.CreateAdd(b.CreateMul(slot, b.getInt32(24)), b.getInt32(20)));
-    return prefixes[handle] = b.CreateAnd(Load(b, metadata, offset), b.getInt32(255), "scorpi.view.prefix");
+    auto *offset = b.CreateAdd(relative, b.CreateAdd(b.CreateMul(slot, b.getInt32(24)), b.getInt32(word * 4)));
+    return words[key] = Load(b, metadata, offset);
   }
 
   void Rewrite(CallInst *call) {
     auto *handle = call->getArgOperand(1);
-    auto *prefix = Prefix(handle);
+    auto *word = Word(handle, 5);
     IRBuilder<> b(call);
+    auto *prefix = b.CreateAnd(word, b.getInt32(255), "scorpi.view.prefix");
     if (Opcode(call) == OpCode::GetDimensions) {
       b.SetInsertPoint(call->getNextNode());
       auto *width = cast<Instruction>(b.CreateExtractValue(call, 0));
@@ -169,24 +173,145 @@ public:
     auto *valid = b.CreateICmpULT(index, length);
     call->setArgOperand(indexOperand, b.CreateSelect(valid, b.CreateAdd(index, prefix), b.getInt32(UINT32_MAX)));
   }
+
+  // Software reduction uses integer texture reads, so every addressing mode,
+  // zero-weight exclusion and mip clamp is independent of native sampler
+  // reduction support. Ordinary sampling keeps the original instruction.
+  void RewriteSampleLevel(CallInst *call, ResourceKind kind) {
+    auto *texture = call->getArgOperand(1), *sampler = call->getArgOperand(2);
+    auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
+    auto *resourceMinimum = Word(texture, 4);
+    auto *before = call->getParent();
+    auto *fn = before->getParent();
+    auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.sample.end");
+    auto *normal = BasicBlock::Create(call->getContext(), "scorpi.sample.native", fn, after);
+    auto *reduce = BasicBlock::Create(call->getContext(), "scorpi.sample.reduce", fn, after);
+    before->getTerminator()->eraseFromParent();
+    call->removeFromParent(); normal->getInstList().push_back(call);
+    IRBuilder<> nb(normal); nb.CreateBr(after);
+    IRBuilder<> pre(before);
+    pre.CreateCondBr(pre.CreateICmpNE(pre.CreateAnd(state, pre.getInt32(0x100)), pre.getInt32(0)), reduce, normal);
+    IRBuilder<> b(reduce);
+    auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
+    auto unary = [&](OpCode op, Value *v) -> Value * { return Call(b, op, b.getFloatTy(), {v}); };
+    auto min = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMin, b.getFloatTy(), {a,z}); };
+    auto max = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMax, b.getFloatTy(), {a,z}); };
+    auto *dims = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, b.getInt32(0)});
+    Value *lod = call->getArgOperand(10);
+    lod = min(max(lod, b.CreateBitCast(minimum, b.getFloatTy())), b.CreateBitCast(maximum, b.getFloatTy()));
+    lod = max(lod, b.CreateBitCast(resourceMinimum, b.getFloatTy()));
+    lod = min(max(lod, f(0)), b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims, 3), b.getInt32(1)), b.getFloatTy()));
+    auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
+    auto *linear = b.CreateICmpNE(b.CreateAnd(state,
+        b.CreateSelect(b.CreateFCmpOGT(lod, f(0)), b.getInt32(0x10), b.getInt32(4))), b.getInt32(0));
+    auto *isMin = b.CreateICmpEQ(b.CreateAnd(state, b.getInt32(0x180)), b.getInt32(0x100));
+    auto *base = unary(OpCode::Round_ni, lod);
+    auto *mip0 = b.CreateFPToUI(b.CreateSelect(mipLinear, base, unary(OpCode::Round_ni, b.CreateFAdd(lod,f(.5)))), b.getInt32Ty());
+    auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
+    const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
+    const bool array = kind == ResourceKind::Texture2DArray;
+    auto *elementType = call->getType()->getStructElementType(0);
+    Value *result = UndefValue::get(call->getType());
+    auto combine = [&](Value *a, Value *z) -> Value * {
+      return b.CreateSelect(isMin, Call(b, OpCode::FMin, elementType, {a,z}), Call(b, OpCode::FMax, elementType, {a,z}));
+    };
+    for (unsigned mip = 0; mip < 2; ++mip) {
+      auto *level = mip == 0 ? mip0 : b.CreateAdd(mip0, b.CreateZExt(useMip1, b.getInt32Ty()));
+      auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, level});
+      Value *length[3], *start[3], *upper[3];
+      for (unsigned axis = 0; axis < axes; ++axis) {
+        length[axis] = b.CreateExtractValue(size, axis);
+        auto *coord = b.CreateFMul(call->getArgOperand(3+axis), b.CreateUIToFP(length[axis], b.getFloatTy()));
+        coord = b.CreateFSub(coord, b.CreateSelect(linear, f(.5), f(0)));
+        auto *floor = unary(OpCode::Round_ni, coord);
+        start[axis] = b.CreateFPToSI(floor, b.getInt32Ty());
+        if (!isa<UndefValue>(call->getArgOperand(7+axis)))
+          start[axis] = b.CreateAdd(start[axis], call->getArgOperand(7+axis));
+        upper[axis] = b.CreateAnd(linear, b.CreateFCmpONE(coord, floor));
+      }
+      for (unsigned tap = 0; tap < (1u << axes); ++tap) {
+        Value *active = mip == 0 ? b.getTrue() : useMip1;
+        Value *outside = b.getFalse();
+        Value *coords[3] = {UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty())};
+        for (unsigned axis = 0; axis < axes; ++axis) {
+          const bool high = (tap & (1u << axis)) != 0;
+          if (high) active = b.CreateAnd(active, upper[axis]);
+          auto *index = high ? b.CreateAdd(start[axis], b.getInt32(1)) : start[axis];
+          auto *n = length[axis];
+          auto *last = b.CreateSub(n,b.getInt32(1));
+          auto clamp = [&](Value *v) -> Value * {
+            v = b.CreateSelect(b.CreateICmpSLT(v,b.getInt32(0)),b.getInt32(0),v);
+            return b.CreateSelect(b.CreateICmpSGT(v,last),last,v);
+          };
+          auto wrap = [&](Value *v, Value *period) -> Value * {
+            auto *r = b.CreateSRem(v,period);
+            return b.CreateSelect(b.CreateICmpSLT(r,b.getInt32(0)),b.CreateAdd(r,period),r);
+          };
+          auto *mode = b.CreateAnd(b.CreateLShr(state,b.getInt32(9+axis*3)),b.getInt32(7));
+          auto *period = b.CreateMul(n,b.getInt32(2));
+          auto *mirror = wrap(index,period);
+          mirror = b.CreateSelect(b.CreateICmpSGE(mirror,n),b.CreateSub(b.CreateSub(period,b.getInt32(1)),mirror),mirror);
+          auto *once = clamp(b.CreateSelect(b.CreateICmpSLT(index,b.getInt32(0)),b.CreateSub(b.getInt32(-1),index),index));
+          coords[axis] = b.CreateSelect(b.CreateICmpEQ(mode,b.getInt32(1)),wrap(index,n),
+              b.CreateSelect(b.CreateICmpEQ(mode,b.getInt32(2)),mirror,
+              b.CreateSelect(b.CreateICmpEQ(mode,b.getInt32(5)),once,clamp(index))));
+          outside = b.CreateOr(outside,b.CreateAnd(b.CreateICmpEQ(mode,b.getInt32(4)),b.CreateICmpUGE(index,n)));
+        }
+        if (array) {
+          auto *layer = b.CreateFPToSI(unary(OpCode::Round_ne,call->getArgOperand(5)),b.getInt32Ty());
+          auto *last = b.CreateSub(b.CreateExtractValue(size,2),b.getInt32(1));
+          layer = b.CreateSelect(b.CreateICmpSLT(layer,b.getInt32(0)),b.getInt32(0),layer);
+          coords[2] = b.CreateSelect(b.CreateICmpSGT(layer,last),last,layer);
+        }
+        auto *loaded = Call(b,OpCode::TextureLoad,elementType,
+            {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),b.getInt32(0)});
+        auto *border = b.CreateAnd(b.CreateLShr(state,b.getInt32(18)),b.getInt32(3));
+        for (unsigned c = 0; c < 4; ++c) {
+          auto *borderValue = b.CreateSelect(c == 3 ? b.CreateICmpNE(border,b.getInt32(0)) : b.CreateICmpEQ(border,b.getInt32(2)),
+              ConstantFP::get(elementType,1),ConstantFP::get(elementType,0));
+          auto *value = b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,c));
+          if (mip || tap) {
+            auto *old = b.CreateExtractValue(result,c);
+            value = b.CreateSelect(active,combine(old,value),old);
+          }
+          result = b.CreateInsertValue(result,value,c);
+        }
+        // Non-sparse resources are fully mapped. Sparse residency reduction is
+        // added with the reserved-resource backend, before its tier is exposed.
+        result = b.CreateInsertValue(result,b.CreateExtractValue(loaded,4),4);
+      }
+    }
+    b.CreateBr(after);
+    auto *phi = PHINode::Create(call->getType(),2,"scorpi.sample.result",&*after->begin());
+    call->replaceAllUsesWith(phi);
+    phi->addIncoming(call,normal); phi->addIncoming(result,reduce);
+  }
 };
 }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset) {
   std::vector<CallInst *> calls;
+  std::vector<std::pair<CallInst *, ResourceKind>> samples;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
+    if (op == OpCode::SampleLevel) {
+      std::set<Value *> seen;
+      auto kind = Kind(call->getArgOperand(1), dm, seen);
+      if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
+        samples.emplace_back(call,kind);
+    }
     if (op != OpCode::BufferLoad && op != OpCode::BufferStore && op != OpCode::GetDimensions &&
         op != OpCode::AtomicBinOp && op != OpCode::AtomicCompareExchange) continue;
     std::set<Value *> seen;
     if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::TypedBuffer) calls.push_back(call);
   }
-  if (calls.empty()) return false;
+  if (calls.empty() && samples.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)
     throw std::runtime_error("typed-buffer metadata root binding missing");
   Lowering lowering(dm, bindings, count, space, selfOffset);
   for (auto *call : calls) lowering.Rewrite(call);
+  for (auto &sample : samples) lowering.RewriteSampleLevel(sample.first,sample.second);
   return true;
 }
