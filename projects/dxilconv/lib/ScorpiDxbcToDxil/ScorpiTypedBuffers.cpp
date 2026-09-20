@@ -186,6 +186,7 @@ public:
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
     auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
+    auto *borderMapping = Word(texture, 5);
     auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     Value *sourceLod = call->getArgOperand(10);
@@ -320,7 +321,12 @@ public:
             {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),b.getInt32(0)});
         auto *border = b.CreateAnd(b.CreateLShr(state,b.getInt32(18)),b.getInt32(3));
         for (unsigned c = 0; c < 4; ++c) {
-          auto *borderValue = b.CreateSelect(c == 3 ? b.CreateICmpNE(border,b.getInt32(0)) : b.CreateICmpEQ(border,b.getInt32(2)),
+          auto *selector = b.CreateAnd(b.CreateLShr(borderMapping,b.getInt32(c*3)),b.getInt32(7));
+          auto *colorOne = b.CreateOr(b.CreateICmpEQ(border,b.getInt32(2)),
+              b.CreateAnd(b.CreateICmpEQ(border,b.getInt32(1)),b.CreateICmpEQ(selector,b.getInt32(3))));
+          auto *isOne = b.CreateOr(b.CreateICmpEQ(selector,b.getInt32(5)),
+              b.CreateAnd(b.CreateICmpULT(selector,b.getInt32(4)),colorOne));
+          auto *borderValue = b.CreateSelect(isOne,
               ConstantFP::get(elementType,1),ConstantFP::get(elementType,0));
           auto *value = b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,c));
           if (mip || tap) {
