@@ -186,6 +186,7 @@ public:
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
     auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
+    auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     Value *sourceLod = call->getArgOperand(10);
     if (opcode == OpCode::SampleGrad || implicit) {
@@ -212,11 +213,18 @@ public:
     auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.sample.end");
     auto *normal = BasicBlock::Create(call->getContext(), "scorpi.sample.native", fn, after);
     auto *reduce = BasicBlock::Create(call->getContext(), "scorpi.sample.reduce", fn, after);
+    auto *present = BasicBlock::Create(call->getContext(), "scorpi.sample.present", fn, after);
+    auto *missing = BasicBlock::Create(call->getContext(), "scorpi.sample.null", fn, after);
     before->getTerminator()->eraseFromParent();
     // Keep native implicit derivatives in the original control-flow context.
     if (!implicit) { call->removeFromParent(); normal->getInstList().push_back(call); }
     IRBuilder<> nb(normal); nb.CreateBr(after);
     IRBuilder<> pre(before);
+    // A null SRV must not enter footprint math (dimensions are zero, which
+    // would otherwise lead to integer modulo/division by zero).
+    pre.CreateCondBr(pre.CreateICmpNE(pre.CreateOr(textureLow,textureHigh),pre.getInt32(0)),present,missing);
+    IRBuilder<> zero(missing); zero.CreateBr(after);
+    pre.SetInsertPoint(present);
     pre.CreateCondBr(pre.CreateICmpNE(pre.CreateAnd(state, pre.getInt32(0x100)), pre.getInt32(0)), reduce, normal);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
@@ -313,9 +321,21 @@ public:
       }
     }
     b.CreateBr(after);
-    auto *phi = PHINode::Create(call->getType(),2,"scorpi.sample.result",&*after->begin());
-    call->replaceAllUsesWith(phi);
-    phi->addIncoming(call,normal); phi->addIncoming(result,reduce);
+    // Keep PHIs scalar. The converter's AIR serializer cannot reliably encode
+    // an aggregate sample-result PHI with a zero/undef constant incoming edge.
+    std::vector<User *> users(call->user_begin(),call->user_end());
+    IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reduce->getTerminator());
+    IRBuilder<> merged(&*after->begin());
+    Value *assembled = UndefValue::get(call->getType());
+    for (unsigned c=0;c<5;++c) {
+      auto *type = call->getType()->getStructElementType(c);
+      auto *phi = PHINode::Create(type,3,"scorpi.sample.component",&*after->begin());
+      phi->addIncoming(nativeResult.CreateExtractValue(call,c),normal);
+      phi->addIncoming(reducedResult.CreateExtractValue(result,c),reduce);
+      phi->addIncoming(Constant::getNullValue(type),missing);
+      assembled = merged.CreateInsertValue(assembled,phi,c);
+    }
+    for (auto *user : users) user->replaceUsesOfWith(call,assembled);
   }
 };
 }
