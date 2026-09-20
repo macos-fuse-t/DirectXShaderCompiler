@@ -215,6 +215,8 @@ public:
     auto *reduce = BasicBlock::Create(call->getContext(), "scorpi.sample.reduce", fn, after);
     auto *present = BasicBlock::Create(call->getContext(), "scorpi.sample.present", fn, after);
     auto *missing = BasicBlock::Create(call->getContext(), "scorpi.sample.null", fn, after);
+    auto *bounded = BasicBlock::Create(call->getContext(), "scorpi.sample.bounded", fn, after);
+    auto *empty = BasicBlock::Create(call->getContext(), "scorpi.sample.empty", fn, after);
     before->getTerminator()->eraseFromParent();
     // Keep native implicit derivatives in the original control-flow context.
     if (!implicit) { call->removeFromParent(); normal->getInstList().push_back(call); }
@@ -225,22 +227,35 @@ public:
     pre.CreateCondBr(pre.CreateICmpNE(pre.CreateOr(textureLow,textureHigh),pre.getInt32(0)),present,missing);
     IRBuilder<> zero(missing); zero.CreateBr(after);
     pre.SetInsertPoint(present);
+    auto *dims = Call(pre, OpCode::GetDimensions, pre.getInt32Ty(), {texture, pre.getInt32(0)});
+    auto *lastMip = pre.CreateUIToFP(pre.CreateSub(pre.CreateExtractValue(dims,3),pre.getInt32(1)),pre.getFloatTy());
+    Value *accessMinimum = pre.CreateBitCast(resourceMinimum,pre.getFloatTy());
+    if (opcode != OpCode::SampleLevel) {
+      const unsigned clamp = opcode == OpCode::SampleGrad ? 16 : opcode == OpCode::SampleBias ? 11 : 10;
+      if (!isa<UndefValue>(call->getArgOperand(clamp)))
+        accessMinimum = Call(pre,OpCode::FMax,pre.getFloatTy(),{accessMinimum,call->getArgOperand(clamp)});
+    }
+    // Unlike sampler clamps, resource/instruction clamps can empty the view.
+    // Even a fractional clamp past its last mip is out of bounds. Use a real
+    // out-of-bounds load to retain the view's missing-component defaults.
+    pre.CreateCondBr(pre.CreateFCmpOGT(accessMinimum,lastMip),empty,bounded);
+    auto *elementType = call->getType()->getStructElementType(0);
+    IRBuilder<> out(empty);
+    auto *emptyResult = Call(out,OpCode::TextureLoad,elementType,
+        {texture,out.getInt32(0),out.getInt32(UINT32_MAX),out.getInt32(0),out.getInt32(0),
+         out.getInt32(0),out.getInt32(0),out.getInt32(0)});
+    out.CreateBr(after);
+    pre.SetInsertPoint(bounded);
     pre.CreateCondBr(pre.CreateICmpNE(pre.CreateAnd(state, pre.getInt32(0x100)), pre.getInt32(0)), reduce, normal);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
     auto unary = [&](OpCode op, Value *v) -> Value * { return Call(b, op, b.getFloatTy(), {v}); };
     auto min = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMin, b.getFloatTy(), {a,z}); };
     auto max = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMax, b.getFloatTy(), {a,z}); };
-    auto *dims = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, b.getInt32(0)});
     Value *lod = b.CreateFAdd(sourceLod,b.CreateBitCast(bias,b.getFloatTy()));
     // D3D gives MinLOD precedence even when it exceeds MaxLOD.
     lod = max(min(lod, b.CreateBitCast(maximum, b.getFloatTy())), b.CreateBitCast(minimum, b.getFloatTy()));
-    lod = max(lod, b.CreateBitCast(resourceMinimum, b.getFloatTy()));
-    if (opcode != OpCode::SampleLevel) {
-      const unsigned clamp = opcode == OpCode::SampleGrad ? 16 : opcode == OpCode::SampleBias ? 11 : 10;
-      if (!isa<UndefValue>(call->getArgOperand(clamp))) lod = max(lod,call->getArgOperand(clamp));
-    }
-    lod = min(max(lod, f(0)), b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims, 3), b.getInt32(1)), b.getFloatTy()));
+    lod = min(max(max(lod, accessMinimum), f(0)), lastMip);
     auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
     auto *linear = b.CreateICmpNE(b.CreateAnd(state,
         b.CreateSelect(b.CreateFCmpOGT(lod, f(0)), b.getInt32(0x10), b.getInt32(4))), b.getInt32(0));
@@ -249,7 +264,6 @@ public:
     auto *mip0 = b.CreateFPToUI(b.CreateSelect(mipLinear, base, unary(OpCode::Round_ni, b.CreateFAdd(lod,f(.5)))), b.getInt32Ty());
     auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
     const bool array = kind == ResourceKind::Texture2DArray;
-    auto *elementType = call->getType()->getStructElementType(0);
     Value *result = UndefValue::get(call->getType());
     auto combine = [&](Value *a, Value *z) -> Value * {
       return b.CreateSelect(isMin, Call(b, OpCode::FMin, elementType, {a,z}), Call(b, OpCode::FMax, elementType, {a,z}));
@@ -324,15 +338,16 @@ public:
     // Keep PHIs scalar. The converter's AIR serializer cannot reliably encode
     // an aggregate sample-result PHI with a zero/undef constant incoming edge.
     std::vector<User *> users(call->user_begin(),call->user_end());
-    IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reduce->getTerminator());
+    IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reduce->getTerminator()), outResult(empty->getTerminator());
     IRBuilder<> merged(&*after->begin());
     Value *assembled = UndefValue::get(call->getType());
     for (unsigned c=0;c<5;++c) {
       auto *type = call->getType()->getStructElementType(c);
-      auto *phi = PHINode::Create(type,3,"scorpi.sample.component",&*after->begin());
+      auto *phi = PHINode::Create(type,4,"scorpi.sample.component",&*after->begin());
       phi->addIncoming(nativeResult.CreateExtractValue(call,c),normal);
       phi->addIncoming(reducedResult.CreateExtractValue(result,c),reduce);
       phi->addIncoming(Constant::getNullValue(type),missing);
+      phi->addIncoming(outResult.CreateExtractValue(emptyResult,c),empty);
       assembled = merged.CreateInsertValue(assembled,phi,c);
     }
     for (auto *user : users) user->replaceUsesOfWith(call,assembled);
