@@ -180,25 +180,32 @@ public:
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
+    const auto opcode = Opcode(call);
+    const bool implicit = opcode == OpCode::Sample || opcode == OpCode::SampleBias;
     auto *texture = call->getArgOperand(1), *sampler = call->getArgOperand(2);
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
     auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     Value *sourceLod = call->getArgOperand(10);
-    if (Opcode(call) == OpCode::SampleGrad) {
+    if (opcode == OpCode::SampleGrad || implicit) {
       IRBuilder<> b(call);
       auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture,b.getInt32(0)});
       Value *dx2 = ConstantFP::get(b.getFloatTy(),0), *dy2 = dx2;
       for (unsigned axis=0;axis<axes;++axis) {
         auto *n = b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy());
-        auto *dx = b.CreateFMul(call->getArgOperand(10+axis),n);
-        auto *dy = b.CreateFMul(call->getArgOperand(13+axis),n);
+        // Derivatives must execute before the sampler-mode branch: descriptor
+        // indexing can make that branch non-uniform within a pixel quad.
+        auto *gx = implicit ? Call(b,OpCode::DerivCoarseX,b.getFloatTy(),{call->getArgOperand(3+axis)}) : call->getArgOperand(10+axis);
+        auto *gy = implicit ? Call(b,OpCode::DerivCoarseY,b.getFloatTy(),{call->getArgOperand(3+axis)}) : call->getArgOperand(13+axis);
+        auto *dx = b.CreateFMul(gx,n);
+        auto *dy = b.CreateFMul(gy,n);
         dx2 = b.CreateFAdd(dx2,b.CreateFMul(dx,dx));
         dy2 = b.CreateFAdd(dy2,b.CreateFMul(dy,dy));
       }
       auto *rho2 = Call(b,OpCode::FMax,b.getFloatTy(),{dx2,dy2});
       sourceLod = b.CreateFMul(Call(b,OpCode::Log,b.getFloatTy(),{rho2}),ConstantFP::get(b.getFloatTy(),.5));
+      if (opcode == OpCode::SampleBias) sourceLod = b.CreateFAdd(sourceLod,call->getArgOperand(10));
     }
     auto *before = call->getParent();
     auto *fn = before->getParent();
@@ -206,7 +213,8 @@ public:
     auto *normal = BasicBlock::Create(call->getContext(), "scorpi.sample.native", fn, after);
     auto *reduce = BasicBlock::Create(call->getContext(), "scorpi.sample.reduce", fn, after);
     before->getTerminator()->eraseFromParent();
-    call->removeFromParent(); normal->getInstList().push_back(call);
+    // Keep native implicit derivatives in the original control-flow context.
+    if (!implicit) { call->removeFromParent(); normal->getInstList().push_back(call); }
     IRBuilder<> nb(normal); nb.CreateBr(after);
     IRBuilder<> pre(before);
     pre.CreateCondBr(pre.CreateICmpNE(pre.CreateAnd(state, pre.getInt32(0x100)), pre.getInt32(0)), reduce, normal);
@@ -220,8 +228,10 @@ public:
     // D3D gives MinLOD precedence even when it exceeds MaxLOD.
     lod = max(min(lod, b.CreateBitCast(maximum, b.getFloatTy())), b.CreateBitCast(minimum, b.getFloatTy()));
     lod = max(lod, b.CreateBitCast(resourceMinimum, b.getFloatTy()));
-    if (Opcode(call) == OpCode::SampleGrad && !isa<UndefValue>(call->getArgOperand(16)))
-      lod = max(lod,call->getArgOperand(16));
+    if (opcode != OpCode::SampleLevel) {
+      const unsigned clamp = opcode == OpCode::SampleGrad ? 16 : opcode == OpCode::SampleBias ? 11 : 10;
+      if (!isa<UndefValue>(call->getArgOperand(clamp))) lod = max(lod,call->getArgOperand(clamp));
+    }
     lod = min(max(lod, f(0)), b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims, 3), b.getInt32(1)), b.getFloatTy()));
     auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
     auto *linear = b.CreateICmpNE(b.CreateAnd(state,
@@ -317,7 +327,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
-    if (op == OpCode::SampleLevel || op == OpCode::SampleGrad) {
+    if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || op == OpCode::Sample || op == OpCode::SampleBias) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
       if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
