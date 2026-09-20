@@ -176,9 +176,26 @@ public:
     call->setArgOperand(indexOperand, b.CreateSelect(valid, b.CreateAdd(index, prefix), b.getInt32(UINT32_MAX)));
   }
 
+  void RewriteTextureLoad(CallInst *call) {
+    auto *texture = call->getArgOperand(1);
+    auto *minimum = Word(texture,4);
+    IRBuilder<> b(call);
+    auto *clamp = b.CreateBitCast(minimum,b.getFloatTy());
+    auto *dims = Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
+    auto *last = b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
+    auto *first = Call(b,OpCode::Round_ni,b.getFloatTy(),{clamp});
+    auto *mip = b.CreateUIToFP(call->getArgOperand(2),b.getFloatTy());
+    auto *valid = b.CreateAnd(b.CreateFCmpOLE(clamp,last),b.CreateFCmpOGE(mip,first));
+    // Preserve the native out-of-bounds format defaults and SRV swizzle.
+    Value *outside = b.getInt32(UINT32_MAX);
+    if (!isa<UndefValue>(call->getArgOperand(6)))
+      outside = b.CreateSub(outside,call->getArgOperand(6));
+    call->setArgOperand(3,b.CreateSelect(valid,call->getArgOperand(3),outside));
+  }
+
   // Software reduction uses integer texture reads, so every addressing mode,
   // zero-weight exclusion and mip clamp is independent of native sampler
-  // reduction support. Ordinary sampling keeps the original instruction.
+  // reduction support. Unclamped ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
     const auto opcode = Opcode(call);
     const bool implicit = opcode == OpCode::Sample || opcode == OpCode::SampleBias;
@@ -247,7 +264,15 @@ public:
          out.getInt32(0),out.getInt32(0),out.getInt32(0)});
     out.CreateBr(after);
     pre.SetInsertPoint(bounded);
-    pre.CreateCondBr(pre.CreateICmpNE(pre.CreateAnd(state, pre.getInt32(0x100)), pre.getInt32(0)), reduce, normal);
+    auto *ordinary = pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
+    // The converter ignores resource MinLOD for SampleLevel. Use the same
+    // footprint machinery with weighted taps for clamped isotropic sampling.
+    // Unclamped ordinary sampling, including its native precision, is intact.
+    auto *clampedOrdinary = pre.CreateAnd(ordinary,pre.CreateAnd(
+        pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x40)),pre.getInt32(0)),
+        pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
+    pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
+        pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0))),reduce,normal);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
     auto unary = [&](OpCode op, Value *v) -> Value * { return Call(b, op, b.getFloatTy(), {v}); };
@@ -262,6 +287,7 @@ public:
         b.CreateSelect(b.CreateFCmpOGT(lod, f(0)), b.getInt32(0x10), b.getInt32(4))), b.getInt32(0));
     auto *isMin = b.CreateICmpEQ(b.CreateAnd(state, b.getInt32(0x180)), b.getInt32(0x100));
     auto *base = unary(OpCode::Round_ni, lod);
+    auto *mipFraction = b.CreateSelect(mipLinear,b.CreateFSub(lod,base),f(0));
     auto *mip0 = b.CreateFPToUI(b.CreateSelect(mipLinear, base, unary(OpCode::Round_ni, b.CreateFAdd(lod,f(.5)))), b.getInt32Ty());
     auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
     const bool array = kind == ResourceKind::Texture2DArray;
@@ -272,12 +298,13 @@ public:
     for (unsigned mip = 0; mip < 2; ++mip) {
       auto *level = mip == 0 ? mip0 : b.CreateAdd(mip0, b.CreateZExt(useMip1, b.getInt32Ty()));
       auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, level});
-      Value *length[3], *start[3], *upper[3];
+      Value *length[3], *start[3], *upper[3], *fraction[3];
       for (unsigned axis = 0; axis < axes; ++axis) {
         length[axis] = b.CreateExtractValue(size, axis);
         auto *coord = b.CreateFMul(call->getArgOperand(3+axis), b.CreateUIToFP(length[axis], b.getFloatTy()));
         coord = b.CreateFSub(coord, b.CreateSelect(linear, f(.5), f(0)));
         auto *floor = unary(OpCode::Round_ni, coord);
+        fraction[axis] = b.CreateSelect(linear,b.CreateFSub(coord,floor),f(0));
         start[axis] = b.CreateFPToSI(floor, b.getInt32Ty());
         if (!isa<UndefValue>(call->getArgOperand(7+axis)))
           start[axis] = b.CreateAdd(start[axis], call->getArgOperand(7+axis));
@@ -285,10 +312,12 @@ public:
       }
       for (unsigned tap = 0; tap < (1u << axes); ++tap) {
         Value *active = mip == 0 ? b.getTrue() : useMip1;
+        Value *weight = mip == 0 ? b.CreateFSub(f(1),mipFraction) : mipFraction;
         Value *outside = b.getFalse();
         Value *coords[3] = {UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty())};
         for (unsigned axis = 0; axis < axes; ++axis) {
           const bool high = (tap & (1u << axis)) != 0;
+          weight = b.CreateFMul(weight,high ? fraction[axis] : b.CreateFSub(f(1),fraction[axis]));
           if (high) active = b.CreateAnd(active, upper[axis]);
           auto *index = high ? b.CreateAdd(start[axis], b.getInt32(1)) : start[axis];
           auto *n = length[axis];
@@ -329,10 +358,11 @@ public:
           auto *borderValue = b.CreateSelect(isOne,
               ConstantFP::get(elementType,1),ConstantFP::get(elementType,0));
           auto *value = b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,c));
+          auto *weighted = b.CreateFMul(value,b.CreateFPCast(weight,elementType));
           if (mip || tap) {
             auto *old = b.CreateExtractValue(result,c);
-            value = b.CreateSelect(active,combine(old,value),old);
-          }
+            value = b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);
+          } else value = b.CreateSelect(ordinary,weighted,value);
           result = b.CreateInsertValue(result,value,c);
         }
         // Non-sparse resources are fully mapped. Sparse residency reduction is
@@ -365,9 +395,16 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     size_t count, uint32_t space, uint32_t selfOffset) {
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
+  std::vector<CallInst *> textureLoads;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
+    if (op == OpCode::TextureLoad && !isa<UndefValue>(call->getArgOperand(2))) {
+      std::set<Value *> seen;
+      auto kind = Kind(call->getArgOperand(1),dm,seen);
+      if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
+        textureLoads.push_back(call);
+    }
     if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || op == OpCode::Sample || op == OpCode::SampleBias) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
@@ -379,11 +416,12 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     std::set<Value *> seen;
     if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::TypedBuffer) calls.push_back(call);
   }
-  if (calls.empty() && samples.empty()) return false;
+  if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)
     throw std::runtime_error("typed-buffer metadata root binding missing");
   Lowering lowering(dm, bindings, count, space, selfOffset);
   for (auto *call : calls) lowering.Rewrite(call);
+  for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
   for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
   if (!samples.empty()) {
     // Canonicalize aggregate sample-result PHIs and dead descriptor arithmetic
