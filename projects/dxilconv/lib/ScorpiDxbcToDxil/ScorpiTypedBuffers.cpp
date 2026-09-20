@@ -7,6 +7,8 @@
 #include "dxc/DXIL/DxilShaderModel.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/Scalar.h"
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -177,10 +179,27 @@ public:
   // Software reduction uses integer texture reads, so every addressing mode,
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Ordinary sampling keeps the original instruction.
-  void RewriteSampleLevel(CallInst *call, ResourceKind kind) {
+  void RewriteSample(CallInst *call, ResourceKind kind) {
     auto *texture = call->getArgOperand(1), *sampler = call->getArgOperand(2);
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
+    auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
+    const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
+    Value *sourceLod = call->getArgOperand(10);
+    if (Opcode(call) == OpCode::SampleGrad) {
+      IRBuilder<> b(call);
+      auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture,b.getInt32(0)});
+      Value *dx2 = ConstantFP::get(b.getFloatTy(),0), *dy2 = dx2;
+      for (unsigned axis=0;axis<axes;++axis) {
+        auto *n = b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy());
+        auto *dx = b.CreateFMul(call->getArgOperand(10+axis),n);
+        auto *dy = b.CreateFMul(call->getArgOperand(13+axis),n);
+        dx2 = b.CreateFAdd(dx2,b.CreateFMul(dx,dx));
+        dy2 = b.CreateFAdd(dy2,b.CreateFMul(dy,dy));
+      }
+      auto *rho2 = Call(b,OpCode::FMax,b.getFloatTy(),{dx2,dy2});
+      sourceLod = b.CreateFMul(Call(b,OpCode::Log,b.getFloatTy(),{rho2}),ConstantFP::get(b.getFloatTy(),.5));
+    }
     auto *before = call->getParent();
     auto *fn = before->getParent();
     auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.sample.end");
@@ -197,9 +216,12 @@ public:
     auto min = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMin, b.getFloatTy(), {a,z}); };
     auto max = [&](Value *a, Value *z) -> Value * { return Call(b, OpCode::FMax, b.getFloatTy(), {a,z}); };
     auto *dims = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, b.getInt32(0)});
-    Value *lod = call->getArgOperand(10);
-    lod = min(max(lod, b.CreateBitCast(minimum, b.getFloatTy())), b.CreateBitCast(maximum, b.getFloatTy()));
+    Value *lod = b.CreateFAdd(sourceLod,b.CreateBitCast(bias,b.getFloatTy()));
+    // D3D gives MinLOD precedence even when it exceeds MaxLOD.
+    lod = max(min(lod, b.CreateBitCast(maximum, b.getFloatTy())), b.CreateBitCast(minimum, b.getFloatTy()));
     lod = max(lod, b.CreateBitCast(resourceMinimum, b.getFloatTy()));
+    if (Opcode(call) == OpCode::SampleGrad && !isa<UndefValue>(call->getArgOperand(16)))
+      lod = max(lod,call->getArgOperand(16));
     lod = min(max(lod, f(0)), b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims, 3), b.getInt32(1)), b.getFloatTy()));
     auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
     auto *linear = b.CreateICmpNE(b.CreateAnd(state,
@@ -208,7 +230,6 @@ public:
     auto *base = unary(OpCode::Round_ni, lod);
     auto *mip0 = b.CreateFPToUI(b.CreateSelect(mipLinear, base, unary(OpCode::Round_ni, b.CreateFAdd(lod,f(.5)))), b.getInt32Ty());
     auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
-    const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     const bool array = kind == ResourceKind::Texture2DArray;
     auto *elementType = call->getType()->getStructElementType(0);
     Value *result = UndefValue::get(call->getType());
@@ -296,7 +317,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
-    if (op == OpCode::SampleLevel) {
+    if (op == OpCode::SampleLevel || op == OpCode::SampleGrad) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
       if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
@@ -312,6 +333,16 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     throw std::runtime_error("typed-buffer metadata root binding missing");
   Lowering lowering(dm, bindings, count, space, selfOffset);
   for (auto *call : calls) lowering.Rewrite(call);
-  for (auto &sample : samples) lowering.RewriteSampleLevel(sample.first,sample.second);
+  for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
+  if (!samples.empty()) {
+    // Canonicalize aggregate sample-result PHIs and dead descriptor arithmetic
+    // before IR conversion. Conditional multi-sample shaders otherwise produce
+    // AIR rejected by the Metal compiler's bitcode reader.
+    legacy::PassManager cleanup;
+    cleanup.add(createInstructionCombiningPass());
+    cleanup.add(createCFGSimplificationPass());
+    cleanup.run(*dm.GetModule());
+    dm.CollectShaderFlagsForModule();
+  }
   return true;
 }
