@@ -4,6 +4,7 @@
 #include "ScorpiDxbcToDxil.h"
 #include "ScorpiRasterReplay.h"
 #include "ScorpiGeometryCapture.h"
+#include "ScorpiTypedBuffers.h"
 
 #include "DxbcConverterImpl.h"
 #include "dxc/DxilHash/DxilHash.h"
@@ -720,6 +721,58 @@ TextureKind OriginalTextureKind(llvm::Value *value, hlsl::DxilModule &dm,
   }
   return TextureKind::Invalid;
 }
+}
+
+extern "C" int ScorpiLowerTypedBufferViews(const void *code, size_t size,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    uint32_t metadata_space, uint32_t self_offset,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size || !code || !size || (!bindings && binding_count))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid typed-buffer shader container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("typed-buffer shader has no DXIL program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "typed-buffer", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid typed-buffer shader bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing typed-buffer shader module");
+    if (!ScorpiLowerTypedBuffers(*dm, bindings, binding_count, metadata_space, self_offset))
+      return SCORPI_DXBC_TO_DXIL_OK;
+    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid typed-buffer lowering IR");
+    hlsl::DxilModule::ClearDxilMetadata(*parsed.get());
+    dm->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); llvm::WriteBitcodeToFile(parsed.get().get(), stream); }
+    hlsl::SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate typed-buffer shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "typed-buffer lowering failed");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
 }
 
 extern "C" int ScorpiPromoteTexture1D(const void *code, size_t size,
