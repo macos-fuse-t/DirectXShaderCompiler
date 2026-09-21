@@ -244,6 +244,9 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
 #define SCORPI_SAMPLING_SPARSE 1u
 #define SCORPI_SAMPLING_RESOURCE_MIN_LOD 2u
 #define SCORPI_SAMPLING_REDUCTION 4u
+#define SCORPI_SAMPLING_TYPED_PREFIX 8u
+// Renderer selection must account for every reachable typed SRV/UAV prefix.
+#define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;

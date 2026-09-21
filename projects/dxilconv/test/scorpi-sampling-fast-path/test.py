@@ -38,6 +38,24 @@ bindings = (Binding * 2)(Binding(*(0, 0, 0, 1, 0, 0, 32)[:len(fields)]),
 with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
     folder = Path(folder)
     for model in ('6_0', '6_6'):
+        for resource, cls in (('Buffer',0), ('RWBuffer',1)):
+            source = (f'{resource}<uint> aligned:register({"t" if cls==0 else "u"}1);\n'
+                      f'{resource}<uint> prefixed:register({"t" if cls==0 else "u"}0);\n'
+                      'RWByteAddressBuffer result:register(u5);\n'
+                      '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                      'uint n; aligned.GetDimensions(n); result.Store(0,n+aligned[id.x]+prefixed[id.x]); }')
+            (folder / 'input.hlsl').write_text(source)
+            subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'input.dxil'),str(folder/'input.hlsl')],check=True)
+            code=(folder/'input.dxil').read_bytes()
+            view=(Binding*1)(Binding(*(cls,0,0,1,0,0,32)[:len(fields)]))
+            for prefix in (False,True):
+                policy=(Requirement*1)(Requirement(cls,0,0,1,8))
+                output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
+                status=specialize(code,len(code),view,1,99,16,4,policy,1 if prefix else 0,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and bool(output.value)==prefix,error.value
+                if output.value:lib.ScorpiFreeDxilBinary(output)
+            print('PASS',model,resource,'aligned accesses untouched beside prefixed view')
         # A special binding must not require metadata for unrelated accesses in
         # the same stage. Constant array indices use only their actual register;
         # dynamic indexing conservatively unions only that declared array.
@@ -62,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                     status = specialize(code, len(code), arrays, len(arrays), 99,16,4,
                                         policy,len(policy),C.byref(output),C.byref(size),error,len(error))
                     assert status == 0, error.value
-                    assert bool(output.value) == (index != '2'), (model,cube,index,flags)
+                    assert bool(output.value) == (index != '2' and flags != 1), (model,cube,index,flags)
                     if output.value:
                         (folder / 'binding-policy.dxil').write_bytes(C.string_at(output,size.value))
                         lib.ScorpiFreeDxilBinary(output)
@@ -141,6 +159,27 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                       'native original bytes', len(code), 'native added instructions 0')
 
         # A binding hint must not suppress application-visible residency status.
+        for cube in (False, True):
+            coord='float3(p.xy,1)' if cube else 'p.xy'
+            offset='' if cube else ',int2(0,0)'
+            source=(f'Texture{"Cube" if cube else "2D"}<float4> t:register(t0); SamplerState s:register(s0);\n'
+                    'float4 main(float4 p:SV_Position):SV_Target { uint status;\n'
+                    f'float4 v=t.SampleLevel(s,{coord},0{offset},status);\n'
+                    'return CheckAccessFullyMapped(status)?v:0; }')
+            (folder/'input.hlsl').write_text(source)
+            subprocess.run([dxc,'-T','ps_'+model,'-E','main','-Fo',str(folder/'input.dxil'),str(folder/'input.hlsl')],check=True)
+            code=(folder/'input.dxil').read_bytes()
+            policy=(Requirement*1)(Requirement(0,0,0,1,1))
+            status=specialize(code,len(code),bindings,len(bindings),99,16,4,policy,1,
+                              C.byref(output),C.byref(size),error,len(error))
+            assert status==0 and output.value,error.value
+            (folder/'sparse-native-color.dxil').write_bytes(C.string_at(output,size.value))
+            lib.ScorpiFreeDxilBinary(output)
+            ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'sparse-native-color.dxil')],text=True)
+            assert len(re.findall(r'call .*@dx.op.sampleLevel',ir))==1, 'sparse feedback duplicated color sampling'
+            assert not re.search(r'call .*@dx.op.textureLoad',ir), 'sparse feedback recreated color filtering'
+            assert 'scorpi.tap.loop' in ir, 'sparse status footprint was lost'
+            print('PASS',model,'cube' if cube else '2D','sparse native color, status-only footprint')
         source = '''Texture2D<float4> t:register(t0); SamplerState s:register(s0);
 float4 main(float4 p:SV_Position):SV_Target {
  uint status; float4 v=t.SampleLevel(s,p.xy,0,int2(0,0),status);

@@ -135,7 +135,7 @@ uint32_t SamplingRequirements(DxilModule &dm, Value *handle,
     return SamplingRequirements(dm, s->getTrueValue(), policy, count, seen) |
         SamplingRequirements(dm, s->getFalseValue(), policy, count, seen);
   auto *call = dyn_cast<CallInst>(handle);
-  if (!call) return 7;
+  if (!call) return UINT32_MAX;
   if (Opcode(call) == OpCode::AnnotateHandle)
     return SamplingRequirements(dm, call->getArgOperand(1), policy, count, seen);
   uint32_t cls, space;
@@ -144,19 +144,19 @@ uint32_t SamplingRequirements(DxilModule &dm, Value *handle,
   if (Opcode(call) == OpCode::CreateHandle) {
     cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
     auto id = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
-    if (cls != unsigned(ResourceClass::SRV) && cls != unsigned(ResourceClass::Sampler)) return 7;
+    if (cls != unsigned(ResourceClass::SRV) && cls != unsigned(ResourceClass::UAV) && cls != unsigned(ResourceClass::Sampler)) return UINT32_MAX;
     const DxilResourceBase &r = cls == unsigned(ResourceClass::Sampler) ?
-        static_cast<const DxilResourceBase &>(dm.GetSampler(id)) : dm.GetSRV(id);
+        static_cast<const DxilResourceBase &>(dm.GetSampler(id)) : cls == unsigned(ResourceClass::SRV) ? dm.GetSRV(id) : dm.GetUAV(id);
     space = r.GetSpaceID(); first = r.GetLowerBound(); end = first + r.GetRangeSize();
     index = call->getArgOperand(3);
   } else if (Opcode(call) == OpCode::CreateHandleFromBinding) {
     auto r = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
     cls = r.resourceClass; space = r.spaceID; first = r.rangeLowerBound;
     end = uint64_t(r.rangeUpperBound) + 1; index = call->getArgOperand(2);
-  } else return 7;
+  } else return UINT32_MAX;
   if (auto *constant = dyn_cast<ConstantInt>(index)) {
     auto reg = constant->getZExtValue();
-    if (reg < first || reg >= end) return 7;
+    if (reg < first || reg >= end) return UINT32_MAX;
     first = reg; end = reg + 1;
   }
   uint32_t result = 0;
@@ -380,6 +380,7 @@ public:
   }
 
   void RewriteCubeSample(CallInst *call,ResourceKind kind) {
+    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     std::set<Value *> seen;
     const bool minmaxFiltering = bindingPolicy ?
         (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, seen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
@@ -388,6 +389,10 @@ public:
     auto *texture=call->getArgOperand(1),*sampler=call->getArgOperand(2);
     auto *state=Word(sampler,2),*minimum=Word(sampler,5),*maximum=Word(sampler,3),*bias=Word(sampler,4);
     auto *resourceMinimum=Word(texture,4),*mapping=Word(texture,5);
+    // Metal's comparison-cube corner ordering differs from D3D when one of
+    // the contributing faces is unmapped. Retain only that required fallback.
+    const bool comparisonSample = opcode == OpCode::SampleCmp || opcode == OpCode::SampleCmpLevelZero;
+    const bool nativeColor = !comparisonSample && !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
     auto *low=Word(texture,2),*high=Word(texture,3);
     auto *fn=call->getParent()->getParent();auto *point=PointSampler(fn);
     auto *footprintAnchor=call->getPrevNode();
@@ -438,7 +443,7 @@ public:
     auto *present=BasicBlock::Create(call->getContext(),"scorpi.cube.present",fn,after);
     auto *missing=BasicBlock::Create(call->getContext(),"scorpi.cube.null",fn,after);
     before->getTerminator()->eraseFromParent();
-    if(!implicit){call->removeFromParent();normal->getInstList().push_back(call);}
+    if(!implicit&&!nativeColor){call->removeFromParent();normal->getInstList().push_back(call);}
     b.SetInsertPoint(before);b.CreateCondBr(b.CreateICmpNE(b.CreateOr(low,high),b.getInt32(0)),present,missing);
     b.SetInsertPoint(missing);b.CreateBr(after);
     b.SetInsertPoint(normal);b.CreateBr(after);
@@ -474,7 +479,7 @@ public:
           auto *index=min(max(unary(OpCode::Round_ni,coord),f(0)),b.CreateFSub(n,f(1)));indices[a]=b.CreateFPToUI(index,b.getInt32Ty());st[a]=b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index,f(.5)),f(2)),n),f(1));}
         Value *center[3];direction(sampleFace,st[0],st[1],center);
         Value *layer=kind==ResourceKind::TextureCubeArray?call->getArgOperand(6):UndefValue::get(b.getFloatTy());
-        auto *value=Call(b,OpCode::SampleLevel,element,{texture,point,center[0],center[1],center[2],layer,
+        Value *value=nativeColor?static_cast<Value*>(UndefValue::get(call->getType())):Call(b,OpCode::SampleLevel,element,{texture,point,center[0],center[1],center[2],layer,
           UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),b.CreateUIToFP(level,b.getFloatTy())});
         Value *slice=sampleFace;
         if(kind==ResourceKind::TextureCubeArray){auto *lastCube=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,2),b.getInt32(1)),b.getFloatTy());auto *cube=b.CreateFPToUI(min(max(unary(OpCode::Round_ne,layer),f(0)),lastCube),b.getInt32Ty());slice=b.CreateAdd(slice,b.CreateMul(cube,b.getInt32(6)));}
@@ -494,6 +499,7 @@ public:
         auto *fx=faceOf(nx),*fy=faceOf(ny);auto *selected=b.CreateSelect(corner,face,b.CreateSelect(outside[0],fx,b.CreateSelect(outside[1],fy,face)));
         auto *v=sample(selected,edge),*x=sample(fx,edge),*y=sample(fy,edge);
         for(unsigned c=0;c<4;++c){
+          if(nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
           Value *value=b.CreateExtractValue(v,c),*xc=b.CreateExtractValue(x,c),*yc=b.CreateExtractValue(y,c);
           auto *cornerValue=b.CreateSelect(ordinary,b.CreateFDiv(b.CreateFAdd(value,b.CreateFAdd(xc,yc)),f(3)),combine(value,combine(xc,yc)));
           value=b.CreateSelect(corner,cornerValue,value);
@@ -513,15 +519,16 @@ public:
     auto *reducedExit=b.GetInsertBlock();
     b.CreateBr(after);
     b.SetInsertPoint(reducedExit->getTerminator());
-    std::vector<User*> users(call->user_begin(),call->user_end());IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
+    IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
     for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());phi->addIncoming(c==4?normalResult.getInt32(1):normalResult.CreateExtractValue(call,c),normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reducedExit);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
-    for(auto *user:users)user->replaceUsesOfWith(call,assembled);
+    for(auto *user:originalUsers)user->replaceUsesOfWith(call,assembled);
   }
 
   // Software reduction uses integer texture reads, so every addressing mode,
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Unclamped ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
+    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     std::set<Value *> policySeen;
     const bool minmaxFiltering = bindingPolicy ?
         (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, policySeen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
@@ -532,6 +539,7 @@ public:
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
     auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
+    const bool nativeColor = !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
     auto *borderMapping = Word(texture, 5);
     auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
     auto *footprintAnchor = call->getPrevNode();
@@ -605,7 +613,7 @@ public:
     auto *empty = BasicBlock::Create(call->getContext(), "scorpi.sample.empty", fn, after);
     before->getTerminator()->eraseFromParent();
     // Keep native implicit derivatives in the original control-flow context.
-    if (!implicit) { call->removeFromParent(); normal->getInstList().push_back(call); }
+    if (!implicit&&!nativeColor) { call->removeFromParent(); normal->getInstList().push_back(call); }
     IRBuilder<> nb(normal); nb.CreateBr(after);
     IRBuilder<> pre(before);
     // A null SRV must not enter footprint math (dimensions are zero, which
@@ -743,10 +751,11 @@ public:
           layer = b.CreateSelect(b.CreateICmpSLT(layer,b.getInt32(0)),b.getInt32(0),layer);
           coords[2] = b.CreateSelect(b.CreateICmpSGT(layer,last),last,layer);
         }
-        auto *loaded = Call(b,OpCode::TextureLoad,elementType,
+        Value *loaded = nativeColor ? static_cast<Value *>(UndefValue::get(call->getType())) : Call(b,OpCode::TextureLoad,elementType,
             {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),b.getInt32(0)});
         auto *border = b.CreateAnd(b.CreateLShr(state,b.getInt32(18)),b.getInt32(3));
         for (unsigned c = 0; c < 4; ++c) {
+          if(nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
           auto *selector = b.CreateAnd(b.CreateLShr(borderMapping,b.getInt32(c*3)),b.getInt32(7));
           auto *colorOne = b.CreateOr(b.CreateICmpEQ(border,b.getInt32(2)),
               b.CreateAnd(b.CreateICmpEQ(border,b.getInt32(1)),b.CreateICmpEQ(selector,b.getInt32(3))));
@@ -783,7 +792,6 @@ public:
     b.CreateBr(after);
     // Keep PHIs scalar. The converter's AIR serializer cannot reliably encode
     // an aggregate sample-result PHI with a zero/undef constant incoming edge.
-    std::vector<User *> users(call->user_begin(),call->user_end());
     IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reducedExit->getTerminator()), outResult(empty->getTerminator());
     IRBuilder<> merged(&*after->begin());
     Value *assembled = UndefValue::get(call->getType());
@@ -791,12 +799,12 @@ public:
       auto *type = call->getType()->getStructElementType(c);
       auto *phi = PHINode::Create(type,4,"scorpi.sample.component",&*after->begin());
       phi->addIncoming(c==4?nativeResult.getInt32(1):nativeResult.CreateExtractValue(call,c),normal);
-      phi->addIncoming(reducedResult.CreateExtractValue(result,c),reducedExit);
+      phi->addIncoming(reducedResult.CreateExtractValue(nativeColor && c < 4 ? static_cast<Value *>(call) : result,c),reducedExit);
       phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);
       phi->addIncoming(c==4?outResult.getInt32(1):outResult.CreateExtractValue(emptyResult,c),empty);
       assembled = merged.CreateInsertValue(assembled,phi,c);
     }
-    for (auto *user : users) user->replaceUsesOfWith(call,assembled);
+    for (auto *user : originalUsers) user->replaceUsesOfWith(call,assembled);
   }
 };
 }
@@ -859,14 +867,21 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     std::set<Value *> seen;
     return SamplingRequirements(dm, handle, policy, policyCount, seen);
   };
+  if (options & (SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_BINDING_POLICY))
+    calls.erase(std::remove_if(calls.begin(), calls.end(), [&](CallInst *call) {
+      return !(options & SCORPI_SHADER_BINDING_POLICY) ||
+          !(requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_PREFIX);
+    }), calls.end());
   if (options & (SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_BINDING_POLICY)) {
     // A clamp belongs to one instruction, not the entire shader. Ordinary
     // accesses remain untouched even when another sample needs emulation.
     samples.erase(std::remove_if(samples.begin(), samples.end(),
         [&](const std::pair<CallInst *, ResourceKind> &sample) {
           auto *call = sample.first;
+          const bool cubeComparison = (sample.second == ResourceKind::TextureCube || sample.second == ResourceKind::TextureCubeArray) &&
+              (Opcode(call) == OpCode::SampleCmp || Opcode(call) == OpCode::SampleCmpLevelZero);
           if ((options & SCORPI_SHADER_BINDING_POLICY) &&
-              ((requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_SPARSE | SCORPI_SAMPLING_RESOURCE_MIN_LOD)) ||
+              ((requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_RESOURCE_MIN_LOD | (feedbackUsed(call) || cubeComparison ? SCORPI_SAMPLING_SPARSE : 0))) ||
                (requirements(call->getArgOperand(2)) & SCORPI_SAMPLING_REDUCTION))) return false;
           return !instructionClamp(sample) && !feedbackUsed(call);
         }), samples.end());

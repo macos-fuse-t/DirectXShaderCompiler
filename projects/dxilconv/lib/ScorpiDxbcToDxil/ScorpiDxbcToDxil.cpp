@@ -750,6 +750,8 @@ extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
     std::vector<ScorpiSamplingBinding> ranges;
     for (const auto &r : dm->GetSRVs())
       ranges.push_back({0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+    for (const auto &r : dm->GetUAVs())
+      ranges.push_back({1, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
     for (const auto &r : dm->GetSamplers())
       ranges.push_back({3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
     const auto capacity = *count;
@@ -780,7 +782,7 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
       (!policy && policy_count) ||
-      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY)))
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {
@@ -798,8 +800,13 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
     if (!parsed) throw std::runtime_error("invalid typed-buffer shader bitcode");
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) throw std::runtime_error("missing typed-buffer shader module");
+    const bool trace = std::getenv("SCORPI_SHADER_TRACE") != nullptr;
+    auto instructions = [&]() { size_t n = 0; for (const auto &f : *parsed.get()) for (const auto &b : f) n += b.size(); return n; };
+    const size_t before = trace ? instructions() : 0;
     if (!ScorpiLowerTypedBuffers(*dm, bindings, binding_count, metadata_space, self_offset, options, policy, policy_count))
       return SCORPI_DXBC_TO_DXIL_OK;
+    if (trace) std::fprintf(stderr, "shader lowering options=%u requirements=%zu instructions_before=%zu instructions_after=%zu\n",
+        options, policy_count, before, instructions());
     if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid typed-buffer lowering IR");
     hlsl::DxilModule::ClearDxilMetadata(*parsed.get());
     dm->EmitDxilMetadata();
