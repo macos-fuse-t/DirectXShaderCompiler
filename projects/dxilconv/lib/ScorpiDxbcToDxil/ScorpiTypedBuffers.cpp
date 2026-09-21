@@ -2,6 +2,7 @@
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/DXIL/DxilResource.h"
+#include "dxc/DXIL/DxilSampler.h"
 #include "dxc/DXIL/DxilResourceBinding.h"
 #include "dxc/DXIL/DxilResourceProperties.h"
 #include "dxc/DXIL/DxilShaderModel.h"
@@ -10,6 +11,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/Scalar.h"
 #include <map>
+#include <functional>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -59,6 +61,8 @@ class Lowering {
   size_t count;
   uint32_t space, selfOffset, resourceID;
   std::map<Function *, Value *> metadataHandles;
+  std::map<Function *, Value *> pointHandles;
+  uint32_t pointID = UINT32_MAX;
   std::map<std::pair<Value *, unsigned>, Value *> words;
 
   CallInst *Call(IRBuilder<> &b, OpCode opcode, Type *type, std::vector<Value *> args) {
@@ -88,6 +92,27 @@ class Lowering {
   Value *Load(IRBuilder<> &b, Value *handle, Value *offset) {
     return b.CreateExtractValue(Call(b, OpCode::BufferLoad, b.getInt32Ty(),
         {handle, offset, UndefValue::get(b.getInt32Ty())}), 0);
+  }
+  Value *PointSampler(Function *fn) {
+    if(pointHandles.count(fn))return pointHandles[fn];
+    if(pointID==UINT32_MAX){
+      auto sampler=std::make_unique<DxilSampler>();
+      sampler->SetID(dm.GetSamplers().size());sampler->SetKind(ResourceKind::Sampler);
+      sampler->SetSamplerKind(SamplerKind::Default);sampler->SetSpaceID(space);
+      sampler->SetLowerBound(0);sampler->SetRangeSize(1);sampler->SetGlobalName("ScorpiCubePointSampler");
+      sampler->SetGlobalSymbol(UndefValue::get(StructType::create(fn->getContext(),{Type::getInt32Ty(fn->getContext())},"ScorpiCubePointSampler")->getPointerTo()));
+      pointID=dm.AddSampler(std::move(sampler));
+    }
+    IRBuilder<> b(&*fn->getEntryBlock().getFirstInsertionPt());
+    auto &sampler=dm.GetSampler(pointID);Value *handle;
+    if(dm.GetShaderModel()->GetMinor()>=6){
+      auto binding=resource_helper::loadBindingFromResourceBase(&sampler);
+      auto *value=resource_helper::getAsConstant(binding,dm.GetOP()->GetResourceBindingType(),*dm.GetShaderModel());
+      auto *raw=Call(b,OpCode::CreateHandleFromBinding,b.getVoidTy(),{value,b.getInt32(0),b.getFalse()});
+      auto props=resource_helper::loadPropsFromResourceBase(&sampler);
+      handle=Call(b,OpCode::AnnotateHandle,b.getVoidTy(),{raw,resource_helper::getAsConstant(props,dm.GetOP()->GetResourcePropertiesType(),*dm.GetShaderModel())});
+    }else handle=Call(b,OpCode::CreateHandle,b.getVoidTy(),{b.getInt8(unsigned(ResourceClass::Sampler)),b.getInt32(pointID),b.getInt32(0),b.getFalse()});
+    return pointHandles[fn]=handle;
   }
 public:
   Lowering(DxilModule &module, const ScorpiTypedBufferBinding *ranges,
@@ -176,6 +201,28 @@ public:
     call->setArgOperand(indexOperand, b.CreateSelect(valid, b.CreateAdd(index, prefix), b.getInt32(UINT32_MAX)));
   }
 
+  Value *TextureResident(IRBuilder<> &b,Value *texture,Value *mip,Value *x,Value *y,Value *slice) {
+    auto *offset=Word(texture,0);auto *sparse=b.CreateICmpNE(offset,b.getInt32(0));
+    auto *handle=MetadataHandle(b.GetInsertBlock()->getParent());
+    auto read=[&](Value *word)->Value*{
+      auto *address=b.CreateSelect(sparse,b.CreateAdd(offset,b.CreateMul(word,b.getInt32(4))),b.getInt32(0));
+      return Load(b,handle,address);
+    };
+    auto constant=[&](unsigned word){return read(b.getInt32(word));};
+    auto safeDivisor=[&](Value *v){return b.CreateSelect(b.CreateICmpEQ(v,b.getInt32(0)),b.getInt32(1),v);};
+    auto *validMip=b.CreateICmpULT(mip,constant(0));
+    auto *record=b.CreateAdd(b.getInt32(8),b.CreateMul(b.CreateSelect(validMip,mip,b.getInt32(0)),b.getInt32(5)));
+    auto field=[&](unsigned n){return read(b.CreateAdd(record,b.getInt32(n)));};
+    auto *valid=b.CreateAnd(validMip,b.CreateAnd(b.CreateICmpULT(x,field(2)),b.CreateAnd(b.CreateICmpULT(y,field(3)),b.CreateICmpULT(slice,constant(5)))));
+    auto *tile=b.CreateAdd(field(0),b.CreateAdd(b.CreateUDiv(x,safeDivisor(constant(1))),b.CreateMul(b.CreateUDiv(y,safeDivisor(constant(2))),field(1))));
+    tile=b.CreateAdd(tile,b.CreateMul(b.CreateAdd(slice,constant(6)),constant(3)));
+    tile=b.CreateSelect(b.CreateAnd(sparse,valid),tile,b.getInt32(0));
+    auto *bits=read(b.CreateAdd(constant(4),b.CreateUDiv(tile,b.getInt32(32))));
+    auto *mapped=b.CreateICmpNE(b.CreateAnd(b.CreateLShr(bits,b.CreateAnd(tile,b.getInt32(31))),b.getInt32(1)),b.getInt32(0));
+    mapped=b.CreateSelect(b.CreateICmpEQ(field(4),b.getInt32(UINT32_MAX)),mapped,b.CreateICmpNE(field(4),b.getInt32(0)));
+    return b.CreateOr(b.CreateNot(sparse),b.CreateOr(b.CreateNot(valid),mapped));
+  }
+
   void RewriteTextureLoad(CallInst *call) {
     auto *texture = call->getArgOperand(1);
     auto *minimum = Word(texture,4);
@@ -191,12 +238,146 @@ public:
     if (!isa<UndefValue>(call->getArgOperand(6)))
       outside = b.CreateSub(outside,call->getArgOperand(6));
     call->setArgOperand(3,b.CreateSelect(valid,call->getArgOperand(3),outside));
+    std::set<Value*> seen;auto kind=Kind(texture,dm,seen);
+    Value *coord[3];for(unsigned i=0;i<3;++i){coord[i]=call->getArgOperand(3+i);if(isa<UndefValue>(coord[i]))coord[i]=b.getInt32(0);if(!isa<UndefValue>(call->getArgOperand(6+i)))coord[i]=b.CreateAdd(coord[i],call->getArgOperand(6+i));}
+    auto *resident=TextureResident(b,texture,call->getArgOperand(2),coord[0],coord[1],kind==ResourceKind::Texture2DArray?coord[2]:b.getInt32(0));
+    std::vector<ExtractValueInst*> statuses;for(auto *user:call->users())if(auto *extract=dyn_cast<ExtractValueInst>(user))if(extract->getNumIndices()==1 && *extract->idx_begin()==4)statuses.push_back(extract);
+    for(auto *extract:statuses){extract->replaceAllUsesWith(b.CreateZExt(resident,b.getInt32Ty()));extract->eraseFromParent();}
+  }
+
+  void RewriteCubeSample(CallInst *call,ResourceKind kind) {
+    const auto opcode=Opcode(call);
+    const bool implicit=opcode==OpCode::Sample || opcode==OpCode::SampleBias;
+    auto *texture=call->getArgOperand(1),*sampler=call->getArgOperand(2);
+    auto *state=Word(sampler,2),*minimum=Word(sampler,5),*maximum=Word(sampler,3),*bias=Word(sampler,4);
+    auto *resourceMinimum=Word(texture,4),*mapping=Word(texture,5);
+    auto *low=Word(texture,2),*high=Word(texture,3);
+    auto *fn=call->getParent()->getParent();auto *point=PointSampler(fn);
+    IRBuilder<> b(call);
+    auto f=[&](double n){return ConstantFP::get(b.getFloatTy(),n);};
+    auto unary=[&](OpCode op,Value *v){return Call(b,op,b.getFloatTy(),{v});};
+    auto min=[&](Value *a,Value *z){return Call(b,OpCode::FMin,b.getFloatTy(),{a,z});};
+    auto max=[&](Value *a,Value *z){return Call(b,OpCode::FMax,b.getFloatTy(),{a,z});};
+    // Face basis: normal, horizontal and vertical, in D3D's +X,-X,+Y,-Y,+Z,-Z order.
+    const int basis[6][3][3]={{{1,0,0},{0,0,-1},{0,-1,0}},{{-1,0,0},{0,0,1},{0,-1,0}},
+      {{0,1,0},{1,0,0},{0,0,1}},{{0,-1,0},{1,0,0},{0,0,-1}},
+      {{0,0,1},{1,0,0},{0,-1,0}},{{0,0,-1},{-1,0,0},{0,-1,0}}};
+    auto basisValue=[&](Value *face,unsigned vector,unsigned axis)->Value*{
+      Value *v=f(basis[5][vector][axis]);for(int i=4;i>=0;--i)v=b.CreateSelect(b.CreateICmpEQ(face,b.getInt32(i)),f(basis[i][vector][axis]),v);return v;
+    };
+    auto faceOf=[&](Value **d)->Value*{
+      Value *ax=unary(OpCode::FAbs,d[0]),*ay=unary(OpCode::FAbs,d[1]),*az=unary(OpCode::FAbs,d[2]);
+      auto *z=b.CreateAnd(b.CreateFCmpOGE(az,ax),b.CreateFCmpOGE(az,ay));auto *y=b.CreateFCmpOGE(ay,ax);
+      auto *axis=b.CreateSelect(z,b.getInt32(2),b.CreateSelect(y,b.getInt32(1),b.getInt32(0)));
+      auto *major=b.CreateSelect(z,d[2],b.CreateSelect(y,d[1],d[0]));
+      return b.CreateAdd(b.CreateMul(axis,b.getInt32(2)),b.CreateZExt(b.CreateFCmpOLT(major,f(0)),b.getInt32Ty()));
+    };
+    auto dot=[&](Value *face,unsigned vector,Value **d)->Value*{
+      Value *v=f(0);for(unsigned a=0;a<3;++a)v=b.CreateFAdd(v,b.CreateFMul(basisValue(face,vector,a),d[a]));return v;
+    };
+    auto direction=[&](Value *face,Value *s,Value *t,Value **d){for(unsigned a=0;a<3;++a)d[a]=b.CreateFAdd(basisValue(face,0,a),b.CreateFAdd(b.CreateFMul(s,basisValue(face,1,a)),b.CreateFMul(t,basisValue(face,2,a))));};
+    Value *d[3]={call->getArgOperand(3),call->getArgOperand(4),call->getArgOperand(5)};
+    auto *face=faceOf(d);auto *ma=max(dot(face,0,d),f(1e-20));auto *sc=dot(face,1,d),*tc=dot(face,2,d);
+    Value *uv[2]={b.CreateFMul(b.CreateFAdd(b.CreateFDiv(sc,ma),f(1)),f(.5)),b.CreateFMul(b.CreateFAdd(b.CreateFDiv(tc,ma),f(1)),f(.5))};
+    auto *dims=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
+    Value *lod=call->getArgOperand(10);
+    if(opcode==OpCode::SampleGrad || implicit){
+      Value *length[2];auto *scale=b.CreateFMul(b.CreateUIToFP(b.CreateExtractValue(dims,0),b.getFloatTy()),f(.5));
+      for(unsigned axis=0;axis<2;++axis){
+        Value *g[3];for(unsigned c=0;c<3;++c)g[c]=implicit?static_cast<Value*>(unary(axis?OpCode::DerivCoarseY:OpCode::DerivCoarseX,d[c])):call->getArgOperand(10+axis*3+c);
+        auto *dm=dot(face,0,g);Value *grad[2];Value *numerators[2]={sc,tc};
+        for(unsigned c=0;c<2;++c)grad[c]=b.CreateFMul(b.CreateFDiv(b.CreateFSub(b.CreateFMul(dot(face,c+1,g),ma),b.CreateFMul(numerators[c],dm)),b.CreateFMul(ma,ma)),scale);
+        length[axis]=b.CreateFAdd(b.CreateFMul(grad[0],grad[0]),b.CreateFMul(grad[1],grad[1]));
+      }
+      // Cube anisotropy may use trilinear quality (D3D functional spec 7.18.11).
+      lod=b.CreateFMul(unary(OpCode::Log,max(max(length[0],length[1]),f(1e-30))),f(.5));
+      if(opcode==OpCode::SampleBias)lod=b.CreateFAdd(lod,call->getArgOperand(10));
+    }
+    auto *before=call->getParent();auto *after=before->splitBasicBlock(call->getNextNode(),"scorpi.cube.end");
+    auto *normal=BasicBlock::Create(call->getContext(),"scorpi.cube.native",fn,after);
+    auto *reduce=BasicBlock::Create(call->getContext(),"scorpi.cube.reduce",fn,after);
+    auto *present=BasicBlock::Create(call->getContext(),"scorpi.cube.present",fn,after);
+    auto *missing=BasicBlock::Create(call->getContext(),"scorpi.cube.null",fn,after);
+    before->getTerminator()->eraseFromParent();
+    if(!implicit){call->removeFromParent();normal->getInstList().push_back(call);}
+    b.SetInsertPoint(before);b.CreateCondBr(b.CreateICmpNE(b.CreateOr(low,high),b.getInt32(0)),present,missing);
+    b.SetInsertPoint(missing);b.CreateBr(after);
+    b.SetInsertPoint(normal);b.CreateBr(after);
+    b.SetInsertPoint(present);
+    auto *ordinary=b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0));
+    auto *resMin=b.CreateBitCast(resourceMinimum,b.getFloatTy());Value *accessMin=resMin;
+    if(opcode!=OpCode::SampleLevel){unsigned at=opcode==OpCode::SampleGrad?16:opcode==OpCode::SampleBias?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
+    b.CreateCondBr(b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0))),reduce,normal);
+    b.SetInsertPoint(reduce);
+    auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
+    auto *empty=b.CreateFCmpOGT(accessMin,last);
+    lod=b.CreateFAdd(lod,b.CreateBitCast(bias,b.getFloatTy()));
+    lod=min(max(max(max(min(lod,b.CreateBitCast(maximum,b.getFloatTy())),b.CreateBitCast(minimum,b.getFloatTy())),accessMin),f(0)),last);
+    auto *mipLinear=b.CreateICmpNE(b.CreateAnd(state,b.getInt32(1)),b.getInt32(0));
+    auto *linear=b.CreateICmpNE(b.CreateAnd(state,b.CreateSelect(b.CreateFCmpOGT(lod,f(0)),b.getInt32(16),b.getInt32(4))),b.getInt32(0));
+    auto *isMin=b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0x100));
+    auto *base=unary(OpCode::Round_ni,lod);auto *mf=b.CreateSelect(mipLinear,b.CreateFSub(lod,base),f(0));
+    auto *mip0=b.CreateFPToUI(b.CreateSelect(mipLinear,base,unary(OpCode::Round_ni,b.CreateFAdd(lod,f(.5)))),b.getInt32Ty());
+    auto *more=b.CreateFCmpOGT(mf,f(0));
+    auto *element=call->getType()->getStructElementType(0);
+    auto combine=[&](Value *a,Value *z)->Value*{return b.CreateSelect(isMin,Call(b,OpCode::FMin,element,{a,z}),Call(b,OpCode::FMax,element,{a,z}));};
+    Value *result=UndefValue::get(call->getType());
+    for(unsigned m=0;m<2;++m){
+      auto *level=m?b.CreateAdd(mip0,b.CreateZExt(more,b.getInt32Ty())):mip0;
+      auto *size=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,level});auto *n=b.CreateUIToFP(b.CreateExtractValue(size,0),b.getFloatTy());
+      Value *start[2],*fraction[2];for(unsigned a=0;a<2;++a){auto *coord=b.CreateFSub(b.CreateFMul(uv[a],n),b.CreateSelect(linear,f(.5),f(0)));start[a]=unary(OpCode::Round_ni,coord);fraction[a]=b.CreateSelect(linear,b.CreateFSub(coord,start[a]),f(0));}
+      // Read exact texel centers through a private point sampler. Guest
+      // addressing, mip bias and clamps must not be applied a second time.
+      auto sample=[&](Value *sampleFace,Value **dir)->Value*{
+        auto *denom=max(dot(sampleFace,0,dir),f(1e-20));Value *st[2],*indices[2];
+        for(unsigned a=0;a<2;++a){auto *coord=b.CreateFMul(b.CreateFAdd(b.CreateFDiv(dot(sampleFace,a+1,dir),denom),f(1)),b.CreateFMul(n,f(.5)));
+          auto *index=min(max(unary(OpCode::Round_ni,coord),f(0)),b.CreateFSub(n,f(1)));indices[a]=b.CreateFPToUI(index,b.getInt32Ty());st[a]=b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index,f(.5)),f(2)),n),f(1));}
+        Value *center[3];direction(sampleFace,st[0],st[1],center);
+        Value *layer=kind==ResourceKind::TextureCubeArray?call->getArgOperand(6):UndefValue::get(b.getFloatTy());
+        auto *value=Call(b,OpCode::SampleLevel,element,{texture,point,center[0],center[1],center[2],layer,
+          UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),b.CreateUIToFP(level,b.getFloatTy())});
+        Value *slice=sampleFace;
+        if(kind==ResourceKind::TextureCubeArray){auto *lastCube=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,2),b.getInt32(1)),b.getFloatTy());auto *cube=b.CreateFPToUI(min(max(unary(OpCode::Round_ne,layer),f(0)),lastCube),b.getInt32Ty());slice=b.CreateAdd(slice,b.CreateMul(cube,b.getInt32(6)));}
+        return b.CreateInsertValue(value,b.CreateZExt(TextureResident(b,texture,level,indices[0],indices[1],slice),b.getInt32Ty()),4);
+      };
+      for(unsigned tap=0;tap<4;++tap){
+        Value *index[2],*outside[2],*st[2],*sign[2];Value *weight=m?static_cast<Value*>(mf):b.CreateFSub(f(1),mf);
+        for(unsigned a=0;a<2;++a){bool highTap=tap&(1u<<a);index[a]=b.CreateFAdd(start[a],f(highTap?1:0));outside[a]=b.CreateOr(b.CreateFCmpOLT(index[a],f(0)),b.CreateFCmpOGE(index[a],n));
+          sign[a]=b.CreateSelect(b.CreateFCmpOLT(index[a],f(0)),f(-1),f(1));
+          st[a]=b.CreateSelect(outside[a],sign[a],b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index[a],f(.5)),f(2)),n),f(1)));
+          weight=b.CreateFMul(weight,highTap?fraction[a]:b.CreateFSub(f(1),fraction[a]));}
+        auto *active=b.CreateFCmpOGT(weight,f(0));auto *corner=b.CreateAnd(outside[0],outside[1]);
+        Value *edge[3],*nx[3],*ny[3];direction(face,st[0],st[1],edge);
+        for(unsigned a=0;a<3;++a){nx[a]=b.CreateFMul(sign[0],basisValue(face,1,a));ny[a]=b.CreateFMul(sign[1],basisValue(face,2,a));}
+        auto *fx=faceOf(nx),*fy=faceOf(ny);auto *selected=b.CreateSelect(corner,face,b.CreateSelect(outside[0],fx,b.CreateSelect(outside[1],fy,face)));
+        auto *v=sample(selected,edge),*x=sample(fx,edge),*y=sample(fy,edge);
+        for(unsigned c=0;c<4;++c){
+          Value *value=b.CreateExtractValue(v,c),*xc=b.CreateExtractValue(x,c),*yc=b.CreateExtractValue(y,c);
+          auto *cornerValue=b.CreateSelect(ordinary,b.CreateFDiv(b.CreateFAdd(value,b.CreateFAdd(xc,yc)),f(3)),combine(value,combine(xc,yc)));
+          value=b.CreateSelect(corner,cornerValue,value);
+          auto *weighted=b.CreateFMul(value,weight);
+          if(m||tap){auto *old=b.CreateExtractValue(result,c);value=b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);}
+          else value=b.CreateSelect(ordinary,weighted,value);
+          result=b.CreateInsertValue(result,value,c);
+        }
+        auto *resident=b.CreateAnd(b.CreateExtractValue(v,4),b.CreateSelect(corner,b.CreateAnd(b.CreateExtractValue(x,4),b.CreateExtractValue(y,4)),b.getInt32(1)));
+        auto *old=(m||tap)?b.CreateExtractValue(result,4):static_cast<Value*>(b.getInt32(1));
+        result=b.CreateInsertValue(result,b.CreateAnd(old,b.CreateSelect(active,resident,b.getInt32(1))),4);
+      }
+    }
+    for(unsigned c=0;c<4;++c){auto *selector=b.CreateAnd(b.CreateLShr(mapping,b.getInt32(c*3)),b.getInt32(7));auto *defaultValue=b.CreateSelect(b.CreateICmpEQ(selector,b.getInt32(5)),f(1),f(0));result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
+    b.CreateBr(after);
+    b.SetInsertPoint(reduce->getTerminator());
+    std::vector<User*> users(call->user_begin(),call->user_end());IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
+    for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());phi->addIncoming(c==4?normalResult.getInt32(1):normalResult.CreateExtractValue(call,c),normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reduce);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
+    for(auto *user:users)user->replaceUsesOfWith(call,assembled);
   }
 
   // Software reduction uses integer texture reads, so every addressing mode,
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Unclamped ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
+    if(kind==ResourceKind::TextureCube || kind==ResourceKind::TextureCubeArray){RewriteCubeSample(call,kind);return;}
     const auto opcode = Opcode(call);
     const bool implicit = opcode == OpCode::Sample || opcode == OpCode::SampleBias;
     auto *texture = call->getArgOperand(1), *sampler = call->getArgOperand(2);
@@ -305,8 +486,8 @@ public:
     // The converter ignores resource MinLOD for SampleLevel. Use the same
     // footprint machinery with weighted taps for clamped sampling.
     // Unclamped ordinary sampling, including its native precision, is intact.
-    auto *clampedOrdinary = pre.CreateAnd(ordinary,
-        pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0)));
+    auto *clampedOrdinary = pre.CreateAnd(ordinary,pre.CreateOr(pre.CreateICmpNE(Word(texture,0),pre.getInt32(0)),
+        pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
     pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
         pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0))),reduce,normal);
     IRBuilder<> b(reduce);
@@ -344,7 +525,7 @@ public:
       for(unsigned c=0;c<5;++c) {
         auto *type=call->getType()->getStructElementType(c);
         accumulators[c]=b.CreatePHI(type,2,"scorpi.aniso.value");
-        accumulators[c]->addIncoming(Constant::getNullValue(type),reduce);
+        accumulators[c]->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),reduce);
       }
       for(unsigned c=0;c<5;++c)result=b.CreateInsertValue(result,accumulators[c],c);
       loopResult=result;
@@ -436,9 +617,10 @@ public:
           }
           result = b.CreateInsertValue(result,value,c);
         }
-        // Non-sparse resources are fully mapped. Sparse residency reduction is
-        // added with the reserved-resource backend, before its tier is exposed.
-        result = b.CreateInsertValue(result,b.CreateExtractValue(loaded,4),4);
+        auto *resident=TextureResident(b,texture,level,coords[0],coords[1],array?coords[2]:b.getInt32(0));
+        auto *contributes=b.CreateAnd(active,b.CreateNot(outside));
+        Value *old=(iteration || mip || tap)?b.CreateExtractValue(result,4):static_cast<Value*>(b.getInt32(1));
+        result=b.CreateInsertValue(result,b.CreateAnd(old,b.CreateZExt(b.CreateOr(b.CreateNot(contributes),resident),b.getInt32Ty())),4);
       }
     }
     if(iteration) {
@@ -458,10 +640,10 @@ public:
     for (unsigned c=0;c<5;++c) {
       auto *type = call->getType()->getStructElementType(c);
       auto *phi = PHINode::Create(type,4,"scorpi.sample.component",&*after->begin());
-      phi->addIncoming(nativeResult.CreateExtractValue(call,c),normal);
+      phi->addIncoming(c==4?nativeResult.getInt32(1):nativeResult.CreateExtractValue(call,c),normal);
       phi->addIncoming(reducedResult.CreateExtractValue(result,c),reducedExit);
-      phi->addIncoming(Constant::getNullValue(type),missing);
-      phi->addIncoming(outResult.CreateExtractValue(emptyResult,c),empty);
+      phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);
+      phi->addIncoming(c==4?outResult.getInt32(1):outResult.CreateExtractValue(emptyResult,c),empty);
       assembled = merged.CreateInsertValue(assembled,phi,c);
     }
     for (auto *user : users) user->replaceUsesOfWith(call,assembled);
@@ -474,9 +656,11 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
+  std::vector<CallInst *> feedbackChecks;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
+    if(op==OpCode::CheckAccessFullyMapped)feedbackChecks.push_back(call);
     if (op == OpCode::TextureLoad && !isa<UndefValue>(call->getArgOperand(2))) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1),dm,seen);
@@ -486,7 +670,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || op == OpCode::Sample || op == OpCode::SampleBias) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
-      if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
+      if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D || kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray)
         samples.emplace_back(call,kind);
     }
     if (op != OpCode::BufferLoad && op != OpCode::BufferStore && op != OpCode::GetDimensions &&
@@ -497,6 +681,24 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)
     throw std::runtime_error("typed-buffer metadata root binding missing");
+  // Only statuses whose producers are replaced use our canonical 0/1 ABI.
+  // Leave unrelated instructions' opaque statuses to the native converter.
+  for(auto *check:feedbackChecks){
+    std::set<Value*> seen;
+    std::function<bool(Value*)> supported=[&](Value *v)->bool{
+      if(!seen.insert(v).second)return true;
+      if(auto *extract=dyn_cast<ExtractValueInst>(v)){
+        if(extract->getNumIndices()!=1 || *extract->idx_begin()!=4)return false;
+        auto *source=dyn_cast<CallInst>(extract->getAggregateOperand());
+        if(std::find(textureLoads.begin(),textureLoads.end(),source)!=textureLoads.end())return true;
+        for(auto &sample:samples)if(sample.first==source)return true;
+      }
+      if(auto *phi=dyn_cast<PHINode>(v)){for(auto &value:phi->incoming_values())if(!supported(value))return false;return true;}
+      if(auto *select=dyn_cast<SelectInst>(v))return supported(select->getTrueValue())&&supported(select->getFalseValue());
+      return false;
+    };
+    if(supported(check->getArgOperand(1))){IRBuilder<> b(check);check->replaceAllUsesWith(b.CreateICmpNE(check->getArgOperand(1),b.getInt32(0)));check->eraseFromParent();}
+  }
   Lowering lowering(dm, bindings, count, space, selfOffset);
   for (auto *call : calls) lowering.Rewrite(call);
   for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
