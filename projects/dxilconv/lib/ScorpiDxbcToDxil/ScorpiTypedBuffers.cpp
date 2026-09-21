@@ -11,6 +11,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/Scalar.h"
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <functional>
 #include <set>
@@ -54,6 +55,26 @@ ResourceKind Kind(Value *handle, DxilModule &dm, std::set<Value *> &seen) {
   if (auto *phi = dyn_cast<PHINode>(handle)) for (auto &v : phi->incoming_values()) merge(v);
   if (auto *select = dyn_cast<SelectInst>(handle)) { merge(select->getTrueValue()); merge(select->getFalseValue()); }
   return result;
+}
+bool Gather(OpCode op){return op==OpCode::TextureGather||op==OpCode::TextureGatherCmp;}
+bool Comparison(OpCode op){return op==OpCode::SampleCmp||op==OpCode::SampleCmpLevelZero||op==OpCode::TextureGatherCmp;}
+bool Implicit(OpCode op){return op==OpCode::Sample||op==OpCode::SampleBias||op==OpCode::SampleCmp;}
+bool ClampOperand(OpCode op){return op==OpCode::Sample||op==OpCode::SampleBias||op==OpCode::SampleGrad||op==OpCode::SampleCmp;}
+
+// This GPU's native minimum-LOD operand is quantized to sixteenths. Exact
+// native clamps stay native; only instructions requesting finer precision
+// need a fallback. Dynamic clamps make this decision at the access itself.
+bool NeedsClampPrecision(CallInst *call) {
+  auto op = Opcode(call);
+  if (!ClampOperand(op)) return false;
+  unsigned at = op == OpCode::SampleGrad ? 16 : (op == OpCode::SampleBias || op == OpCode::SampleCmp) ? 11 : 10;
+  auto *value = call->getArgOperand(at);
+  if (isa<UndefValue>(value)) return false;
+  if (auto *constant = dyn_cast<ConstantFP>(value)) {
+    double scaled = constant->getValueAPF().convertToDouble() * 16;
+    return scaled > 0 && std::isfinite(scaled) && scaled != std::floor(scaled);
+  }
+  return true;
 }
 
 // Only derivatives need quad-uniform execution before the mode branch. Keep
@@ -119,6 +140,29 @@ public:
     b.SetInsertPoint(exit);
   }
 };
+
+unsigned StructuredStride(Value *handle, DxilModule &dm, std::set<Value *> &seen) {
+  if (!seen.insert(handle).second) return 0;
+  if (auto *call = dyn_cast<CallInst>(handle)) {
+    if (Opcode(call) == OpCode::AnnotateHandle)
+      return resource_helper::loadPropsFromConstant(*cast<Constant>(call->getArgOperand(2))).getElementStride();
+    if (Opcode(call) == OpCode::CreateHandle) {
+      auto cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+      auto id = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
+      if (cls == unsigned(ResourceClass::SRV) && id < dm.GetSRVs().size()) return dm.GetSRV(id).GetElementStride();
+      if (cls == unsigned(ResourceClass::UAV) && id < dm.GetUAVs().size()) return dm.GetUAV(id).GetElementStride();
+    }
+  }
+  unsigned result = 0;
+  auto merge = [&](Value *v) {
+    unsigned next = StructuredStride(v, dm, seen);
+    if (result && next && result != next) throw std::runtime_error("mixed structured-buffer strides");
+    if (next) result = next;
+  };
+  if (auto *phi = dyn_cast<PHINode>(handle)) for (auto &v : phi->incoming_values()) merge(v);
+  if (auto *select = dyn_cast<SelectInst>(handle)) { merge(select->getTrueValue()); merge(select->getFalseValue()); }
+  return result;
+}
 
 // Resolve the union of semantic requirements reachable by this handle. A
 // dynamic array index affects its declared range, never an unrelated range.
@@ -305,6 +349,12 @@ public:
     if (!range) throw std::runtime_error("typed buffer not covered by a visible descriptor-table range");
     auto *metadata = MetadataHandle(call->getParent()->getParent());
     IRBuilder<> b(call->getNextNode());
+    if(word==6){
+      auto *directory=Load(b,metadata,b.getInt32(range->feedback_offset));
+      if(range->table_offset==UINT32_MAX)return words[key]=directory;
+      auto *slot=b.CreateAdd(b.CreateSub(index,b.getInt32(range->base_register)),b.getInt32(range->table_offset));
+      return words[key]=Load(b,metadata,b.CreateAdd(directory,b.CreateMul(slot,b.getInt32(4))));
+    }
     // All table entries live in the same <4GiB allocation. Low-word subtraction
     // is deliberately modular, including when a GPU address crosses 4GiB.
     auto *relative = b.CreateSub(Load(b, metadata, b.getInt32(range->root_offset)),
@@ -314,11 +364,18 @@ public:
     return words[key] = Load(b, metadata, offset);
   }
 
-  void Rewrite(CallInst *call, bool mayBeRGB32) {
+  void Rewrite(CallInst *call, bool mayBeRGB32, bool extendedPrefix, bool nativeAddressing) {
     auto *handle = call->getArgOperand(1);
     auto *word = Word(handle, 5);
     IRBuilder<> b(call);
-    auto *prefix = b.CreateAnd(word, b.getInt32(255), "scorpi.view.prefix");
+    Value *prefix = b.CreateAnd(word, b.getInt32(255), "scorpi.view.prefix");
+    Value *scale = b.getInt32(1), *extra = b.getInt32(0);
+    if (mayBeRGB32) scale = b.CreateSelect(b.CreateICmpNE(b.CreateAnd(word,b.getInt32(1u<<30)),b.getInt32(0)),b.getInt32(3),b.getInt32(1));
+    if (extendedPrefix) {
+      auto *high = b.CreateAnd(b.CreateLShr(word,b.getInt32(16)),b.getInt32(0x3fff));
+      extra = b.CreateMul(high,b.CreateSelect(b.CreateICmpEQ(scale,b.getInt32(3)),b.getInt32(1),b.getInt32(256)));
+      prefix = b.CreateAdd(prefix,b.CreateMul(extra,scale));
+    }
     if (Opcode(call) == OpCode::GetDimensions) {
       b.SetInsertPoint(call->getNextNode());
       auto *width = cast<Instruction>(b.CreateExtractValue(call, 0));
@@ -326,8 +383,7 @@ public:
       // private native addressing switch does not fix GetDimensions.
       Value *length = b.CreateSub(width, prefix);
       if (mayBeRGB32) {
-        auto *rgb32 = b.CreateICmpNE(b.CreateAnd(word, b.getInt32(1u << 30)), b.getInt32(0));
-        length = b.CreateUDiv(length, b.CreateSelect(rgb32, b.getInt32(3), b.getInt32(1)));
+        length = b.CreateUDiv(length, scale);
       }
       auto *fixed = cast<Instruction>(b.CreateInsertValue(call, length, 0));
       call->replaceAllUsesWith(fixed);
@@ -337,9 +393,12 @@ public:
     unsigned indexOperand = Opcode(call) == OpCode::AtomicBinOp ? 3 : 2;
     auto *index = call->getArgOperand(indexOperand);
     auto *dimensions = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {handle, b.getInt32(0)});
-    auto *length = b.CreateSub(b.CreateExtractValue(dimensions, 0), prefix);
+    auto *length = b.CreateUDiv(b.CreateSub(b.CreateExtractValue(dimensions, 0), prefix),scale);
     auto *valid = b.CreateICmpULT(index, length);
-    call->setArgOperand(indexOperand, b.CreateSelect(valid, b.CreateAdd(index, prefix), b.getInt32(UINT32_MAX)));
+    // Only a reachable extended sparse prefix adds this small index fixup.
+    // Ordinary accesses and native loads/stores/atomics retain their bodies.
+    auto *bounded = b.CreateSelect(valid, index, length);
+    call->setArgOperand(indexOperand, b.CreateAdd(bounded, nativeAddressing ? extra : prefix));
   }
 
   Value *TextureResident(IRBuilder<> &b,Value *texture,Value *mip,Value *x,Value *y,Value *slice) {
@@ -364,8 +423,74 @@ public:
     return b.CreateOr(b.CreateNot(sparse),b.CreateOr(b.CreateNot(valid),mapped));
   }
 
+  void ReplaceStatus(CallInst *call, Value *mapped) {
+    IRBuilder<> b(call);
+    std::vector<ExtractValueInst*> statuses;
+    for(auto *user:call->users())if(auto *extract=dyn_cast<ExtractValueInst>(user))
+      if(extract->getNumIndices()==1 && *extract->idx_begin()==4)statuses.push_back(extract);
+    for(auto *extract:statuses){extract->replaceAllUsesWith(b.CreateZExt(mapped,b.getInt32Ty()));extract->eraseFromParent();}
+  }
+
+  void RewriteBufferStatus(CallInst *call) {
+    bool used=false;for(auto *u:call->users())if(auto *e=dyn_cast<ExtractValueInst>(u))used|=e->getNumIndices()==1&&*e->idx_begin()==4;
+    if(!used)return;
+    auto *buffer=call->getArgOperand(1);auto *offset=Word(buffer,6);IRBuilder<> b(call);
+    auto *sparse=b.CreateICmpNE(offset,b.getInt32(0));auto *metadata=MetadataHandle(call->getParent()->getParent());
+    auto read=[&](Value *word){return Load(b,metadata,b.CreateSelect(sparse,b.CreateAdd(offset,b.CreateMul(word,b.getInt32(4))),b.getInt32(0)));};
+    auto word=[&](unsigned n){return read(b.getInt32(n));};
+    auto u64=[&](Value *v){return b.CreateZExt(v,b.getInt64Ty());};
+    auto pair=[&](unsigned n){return b.CreateOr(u64(word(n)),b.CreateShl(u64(word(n+1)),b.getInt64(32)));};
+    auto *size=pair(0),*viewOffset=pair(2);std::set<Value*> seen;auto kind=Kind(buffer,dm,seen);
+    Value *position=u64(call->getArgOperand(2));
+    if(kind==ResourceKind::TypedBuffer)position=b.CreateMul(position,u64(word(4)));
+    if(kind==ResourceKind::StructuredBuffer){
+      // Root descriptors have no stride in their descriptor metadata. DXIL
+      // carries the structured element size for both table and root handles.
+      seen.clear();unsigned stride=StructuredStride(buffer,dm,seen);
+      if(!stride)throw std::runtime_error("missing structured-buffer feedback stride");
+      position=b.CreateMul(position,b.getInt64(stride));
+    }
+    if(kind==ResourceKind::StructuredBuffer&&!isa<UndefValue>(call->getArgOperand(3)))position=b.CreateAdd(position,u64(call->getArgOperand(3)));
+    unsigned mask=0;
+    if(Opcode(call)==OpCode::RawBufferLoad)mask=cast<ConstantInt>(call->getArgOperand(4))->getZExtValue();
+    else for(auto *u:call->users())if(auto *e=dyn_cast<ExtractValueInst>(u))if(e->getNumIndices()==1&&*e->idx_begin()<4)mask|=1u<<*e->idx_begin();
+    if(!mask)mask=1;
+    const unsigned componentBytes=call->getType()->getStructElementType(0)->getPrimitiveSizeInBits()/8;
+    Value *mapped=b.getTrue();
+    for(unsigned c=0;c<(kind==ResourceKind::TypedBuffer?1u:4u);++c){
+      if(kind!=ResourceKind::TypedBuffer&&!(mask&(1u<<c)))continue;
+      auto *start=b.CreateAdd(position,b.getInt64(c*componentBytes));
+      Value *bytes=kind==ResourceKind::TypedBuffer?u64(word(4)):b.getInt64(componentBytes);
+      auto *valid=b.CreateAnd(b.CreateICmpULT(start,size),b.CreateICmpULE(bytes,b.CreateSub(size,start)));
+      auto *absolute=b.CreateAdd(viewOffset,start),*end=b.CreateAdd(absolute,b.CreateSub(bytes,b.getInt64(1)));
+      // Each returned component/typed texel spans at most two 64-KiB pages.
+      for(auto *address:{absolute,end}){
+        auto *tile=b.CreateTrunc(b.CreateLShr(address,b.getInt64(16)),b.getInt32Ty());
+        tile=b.CreateSelect(b.CreateAnd(sparse,valid),tile,b.getInt32(0));
+        auto *bits=read(b.CreateAdd(b.getInt32(8),b.CreateLShr(tile,b.getInt32(5))));
+        auto *present=b.CreateICmpNE(b.CreateAnd(b.CreateLShr(bits,b.CreateAnd(tile,b.getInt32(31))),b.getInt32(1)),b.getInt32(0));
+        mapped=b.CreateAnd(mapped,b.CreateOr(b.CreateNot(b.CreateAnd(sparse,valid)),present));
+      }
+    }
+    ReplaceStatus(call,mapped);
+  }
+
+  Value *Compare(IRBuilder<> &b,Value *state,Value *reference,Value *value) {
+    auto *function=b.CreateAnd(b.CreateLShr(state,b.getInt32(24)),b.getInt32(15));
+    Value *tests[]={b.getFalse(),b.getFalse(),b.CreateFCmpOLT(reference,value),b.CreateFCmpOEQ(reference,value),
+      b.CreateFCmpOLE(reference,value),b.CreateFCmpOGT(reference,value),b.CreateFCmpUNE(reference,value),b.CreateFCmpOGE(reference,value),b.getTrue()};
+    Value *result=b.getFalse();for(unsigned i=2;i<=8;++i)result=b.CreateSelect(b.CreateICmpEQ(function,b.getInt32(i)),tests[i],result);
+    return b.CreateUIToFP(result,value->getType());
+  }
+
   void RewriteTextureLoad(CallInst *call) {
     auto *texture = call->getArgOperand(1);
+    if(isa<UndefValue>(call->getArgOperand(2))){
+      IRBuilder<> b(call);std::set<Value*> seen;auto kind=Kind(texture,dm,seen);
+      ReplaceStatus(call,TextureResident(b,texture,b.getInt32(0),call->getArgOperand(3),call->getArgOperand(4),
+          kind==ResourceKind::Texture2DArray?call->getArgOperand(5):b.getInt32(0)));
+      return;
+    }
     auto *minimum = Word(texture,4);
     IRBuilder<> b(call);
     auto *clamp = b.CreateBitCast(minimum,b.getFloatTy());
@@ -387,19 +512,20 @@ public:
   }
 
   void RewriteCubeSample(CallInst *call,ResourceKind kind) {
-    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     std::set<Value *> seen;
     const bool minmaxFiltering = bindingPolicy ?
         (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, seen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
+    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     const auto opcode=Opcode(call);
-    const bool implicit=opcode==OpCode::Sample || opcode==OpCode::SampleBias;
+    const bool implicit=Implicit(opcode),gather=Gather(opcode),comparison=Comparison(opcode);
     auto *texture=call->getArgOperand(1),*sampler=call->getArgOperand(2);
     auto *state=Word(sampler,2),*minimum=Word(sampler,5),*maximum=Word(sampler,3),*bias=Word(sampler,4);
     auto *resourceMinimum=Word(texture,4),*mapping=Word(texture,5);
     // Metal's comparison-cube corner ordering differs from D3D when one of
     // the contributing faces is unmapped. Retain only that required fallback.
     const bool comparisonSample = opcode == OpCode::SampleCmp || opcode == OpCode::SampleCmpLevelZero;
-    const bool nativeColor = !comparisonSample && !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
+    const bool preciseClamp = NeedsClampPrecision(call);
+    const bool nativeColor = !preciseClamp && !comparisonSample && !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
     auto *low=Word(texture,2),*high=Word(texture,3);
     auto *fn=call->getParent()->getParent();auto *point=PointSampler(fn);
     auto *footprintAnchor=call->getPrevNode();
@@ -430,7 +556,7 @@ public:
     auto *face=faceOf(d);auto *ma=max(dot(face,0,d),f(1e-20));auto *sc=dot(face,1,d),*tc=dot(face,2,d);
     Value *uv[2]={b.CreateFMul(b.CreateFAdd(b.CreateFDiv(sc,ma),f(1)),f(.5)),b.CreateFMul(b.CreateFAdd(b.CreateFDiv(tc,ma),f(1)),f(.5))};
     auto *dims=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
-    Value *lod=call->getArgOperand(10);
+    Value *lod=(gather||comparison)?f(0):call->getArgOperand(10);
     if(opcode==OpCode::SampleGrad || implicit){
       Value *length[2];auto *scale=b.CreateFMul(b.CreateUIToFP(b.CreateExtractValue(dims,0),b.getFloatTy()),f(.5));
       for(unsigned axis=0;axis<2;++axis){
@@ -450,23 +576,27 @@ public:
     auto *present=BasicBlock::Create(call->getContext(),"scorpi.cube.present",fn,after);
     auto *missing=BasicBlock::Create(call->getContext(),"scorpi.cube.null",fn,after);
     before->getTerminator()->eraseFromParent();
-    if(!implicit&&!nativeColor){call->removeFromParent();normal->getInstList().push_back(call);}
+    if(!implicit&&!gather&&!nativeColor){call->removeFromParent();normal->getInstList().push_back(call);}
     b.SetInsertPoint(before);b.CreateCondBr(b.CreateICmpNE(b.CreateOr(low,high),b.getInt32(0)),present,missing);
     b.SetInsertPoint(missing);b.CreateBr(after);
     b.SetInsertPoint(normal);b.CreateBr(after);
     b.SetInsertPoint(present);
-    auto *ordinary=!minmaxFiltering ? b.getTrue() : b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0));
+    Value *ordinary=(!minmaxFiltering||comparison||gather)?b.getTrue():b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0));
     auto *resMin=b.CreateBitCast(resourceMinimum,b.getFloatTy());Value *accessMin=resMin;
-    if(opcode!=OpCode::SampleLevel){unsigned at=opcode==OpCode::SampleGrad?16:opcode==OpCode::SampleBias?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
-    b.CreateCondBr(b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),(minmaxFiltering ? b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0)) : b.getFalse())),reduce,normal);
+    if(ClampOperand(opcode)){unsigned at=opcode==OpCode::SampleGrad?16:(opcode==OpCode::SampleBias||opcode==OpCode::SampleCmp)?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
+    auto *viewDims=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
+    auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(viewDims,3),b.getInt32(1)),b.getFloatTy());
+    auto *empty=b.CreateFCmpOGT(accessMin,gather?f(0):last);
+    Value *precision = b.getFalse();
+    if (preciseClamp) { auto *scaled=b.CreateFMul(accessMin,f(16)); precision=b.CreateAnd(b.CreateFCmpOGT(accessMin,f(0)),b.CreateFCmpONE(scaled,unary(OpCode::Round_ni,scaled))); }
+    b.CreateCondBr(b.CreateOr(precision,b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),minmaxFiltering?b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0)):b.getFalse())),reduce,normal);
     SinkFootprint(footprint,reduce);
     b.SetInsertPoint(reduce);
-    auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
-    auto *empty=b.CreateFCmpOGT(accessMin,last);
     lod=b.CreateFAdd(lod,b.CreateBitCast(bias,b.getFloatTy()));
     lod=min(max(max(max(min(lod,b.CreateBitCast(maximum,b.getFloatTy())),b.CreateBitCast(minimum,b.getFloatTy())),accessMin),f(0)),last);
-    auto *mipLinear=b.CreateICmpNE(b.CreateAnd(state,b.getInt32(1)),b.getInt32(0));
-    auto *linear=b.CreateICmpNE(b.CreateAnd(state,b.CreateSelect(b.CreateFCmpOGT(lod,f(0)),b.getInt32(16),b.getInt32(4))),b.getInt32(0));
+    if(gather)lod=f(0);
+    Value *mipLinear=gather?b.getFalse():b.CreateICmpNE(b.CreateAnd(state,b.getInt32(1)),b.getInt32(0));
+    Value *linear=gather?b.getTrue():b.CreateICmpNE(b.CreateAnd(state,b.CreateSelect(b.CreateFCmpOGT(lod,f(0)),b.getInt32(16),b.getInt32(4))),b.getInt32(0));
     auto *isMin=b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0x100));
     auto *base=unary(OpCode::Round_ni,lod);auto *mf=b.CreateSelect(mipLinear,b.CreateFSub(lod,base),f(0));
     auto *mip0=b.CreateFPToUI(b.CreateSelect(mipLinear,base,unary(OpCode::Round_ni,b.CreateFAdd(lod,f(.5)))),b.getInt32Ty());
@@ -474,7 +604,7 @@ public:
     auto *element=call->getType()->getStructElementType(0);
     auto combine=[&](Value *a,Value *z)->Value*{return b.CreateSelect(isMin,Call(b,OpCode::FMin,element,{a,z}),Call(b,OpCode::FMax,element,{a,z}));};
     Value *result=UndefValue::get(call->getType());
-    for(unsigned m=0;m<2;++m){
+    for(unsigned m=0;m<(gather?1u:2u);++m){
       auto *level=m?b.CreateAdd(mip0,b.CreateZExt(more,b.getInt32Ty())):mip0;
       auto *size=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,level});auto *n=b.CreateUIToFP(b.CreateExtractValue(size,0),b.getFloatTy());
       Value *start[2],*fraction[2];for(unsigned a=0;a<2;++a){auto *coord=b.CreateFSub(b.CreateFMul(uv[a],n),b.CreateSelect(linear,f(.5),f(0)));start[a]=unary(OpCode::Round_ni,coord);fraction[a]=b.CreateSelect(linear,b.CreateFSub(coord,start[a]),f(0));}
@@ -486,7 +616,7 @@ public:
           auto *index=min(max(unary(OpCode::Round_ni,coord),f(0)),b.CreateFSub(n,f(1)));indices[a]=b.CreateFPToUI(index,b.getInt32Ty());st[a]=b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index,f(.5)),f(2)),n),f(1));}
         Value *center[3];direction(sampleFace,st[0],st[1],center);
         Value *layer=kind==ResourceKind::TextureCubeArray?call->getArgOperand(6):UndefValue::get(b.getFloatTy());
-        Value *value=nativeColor?static_cast<Value*>(UndefValue::get(call->getType())):Call(b,OpCode::SampleLevel,element,{texture,point,center[0],center[1],center[2],layer,
+        Value *value=(gather||nativeColor)?static_cast<Value*>(UndefValue::get(call->getType())):Call(b,OpCode::SampleLevel,element,{texture,point,center[0],center[1],center[2],layer,
           UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),b.CreateUIToFP(level,b.getFloatTy())});
         Value *slice=sampleFace;
         if(kind==ResourceKind::TextureCubeArray){auto *lastCube=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,2),b.getInt32(1)),b.getFloatTy());auto *cube=b.CreateFPToUI(min(max(unary(OpCode::Round_ne,layer),f(0)),lastCube),b.getInt32Ty());slice=b.CreateAdd(slice,b.CreateMul(cube,b.getInt32(6)));}
@@ -500,14 +630,15 @@ public:
           sign[a]=b.CreateSelect(b.CreateFCmpOLT(index[a],f(0)),f(-1),f(1));
           st[a]=b.CreateSelect(outside[a],sign[a],b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index[a],f(.5)),f(2)),n),f(1)));
           weight=b.CreateFMul(weight,b.CreateSelect(highTap,fraction[a],b.CreateFSub(f(1),fraction[a])));}
-        auto *active=b.CreateFCmpOGT(weight,f(0));auto *corner=b.CreateAnd(outside[0],outside[1]);
+        Value *active=gather?b.getTrue():b.CreateFCmpOGT(weight,f(0));auto *corner=b.CreateAnd(outside[0],outside[1]);
         Value *edge[3],*nx[3],*ny[3];direction(face,st[0],st[1],edge);
         for(unsigned a=0;a<3;++a){nx[a]=b.CreateFMul(sign[0],basisValue(face,1,a));ny[a]=b.CreateFMul(sign[1],basisValue(face,2,a));}
         auto *fx=faceOf(nx),*fy=faceOf(ny);auto *selected=b.CreateSelect(corner,face,b.CreateSelect(outside[0],fx,b.CreateSelect(outside[1],fy,face)));
         auto *v=sample(selected,edge),*x=sample(fx,edge),*y=sample(fy,edge);
         for(unsigned c=0;c<4;++c){
-          if(nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
+          if(gather||nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
           Value *value=b.CreateExtractValue(v,c),*xc=b.CreateExtractValue(x,c),*yc=b.CreateExtractValue(y,c);
+          if(comparison){value=Compare(b,state,call->getArgOperand(10),b.CreateExtractValue(v,0));xc=Compare(b,state,call->getArgOperand(10),b.CreateExtractValue(x,0));yc=Compare(b,state,call->getArgOperand(10),b.CreateExtractValue(y,0));}
           auto *cornerValue=b.CreateSelect(ordinary,b.CreateFDiv(b.CreateFAdd(value,b.CreateFAdd(xc,yc)),f(3)),combine(value,combine(xc,yc)));
           value=b.CreateSelect(corner,cornerValue,value);
           auto *weighted=b.CreateFMul(value,weight);
@@ -522,12 +653,17 @@ public:
         taps.End(b,result);
       }
     }
-    for(unsigned c=0;c<4;++c){auto *selector=b.CreateAnd(b.CreateLShr(mapping,b.getInt32(c*3)),b.getInt32(7));auto *defaultValue=b.CreateSelect(b.CreateICmpEQ(selector,b.getInt32(5)),f(1),f(0));result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
+    for(unsigned c=0;c<4;++c){auto *selector=b.CreateAnd(b.CreateLShr(mapping,b.getInt32(c*3)),b.getInt32(7));Value *one=element->isIntegerTy()?static_cast<Value*>(ConstantInt::get(element,1)):ConstantFP::get(element,1);auto *defaultValue=b.CreateSelect(b.CreateICmpEQ(selector,b.getInt32(5)),one,Constant::getNullValue(element));result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
     auto *reducedExit=b.GetInsertBlock();
     b.CreateBr(after);
     b.SetInsertPoint(reducedExit->getTerminator());
     IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
-    for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());phi->addIncoming(c==4?normalResult.getInt32(1):normalResult.CreateExtractValue(call,c),normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reducedExit);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
+    for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());
+      Value *normalValue=normalResult.getInt32(1);
+      if(c<4){auto *selector=normalResult.CreateAnd(normalResult.CreateLShr(mapping,normalResult.getInt32(c*3)),normalResult.getInt32(7));
+        auto *defaultValue=normalResult.CreateSelect(normalResult.CreateICmpEQ(selector,normalResult.getInt32(5)),ConstantFP::get(type,1),Constant::getNullValue(type));
+        normalValue=normalResult.CreateSelect(empty,defaultValue,normalResult.CreateExtractValue(call,c));}
+      phi->addIncoming(normalValue,normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reducedExit);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
     for(auto *user:originalUsers)user->replaceUsesOfWith(call,assembled);
   }
 
@@ -535,23 +671,24 @@ public:
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Unclamped ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
-    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     std::set<Value *> policySeen;
     const bool minmaxFiltering = bindingPolicy ?
         (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, policySeen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
     if(kind==ResourceKind::TextureCube || kind==ResourceKind::TextureCubeArray){RewriteCubeSample(call,kind);return;}
+    std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     const auto opcode = Opcode(call);
-    const bool implicit = opcode == OpCode::Sample || opcode == OpCode::SampleBias;
+    const bool implicit = Implicit(opcode),gather=Gather(opcode),comparison=Comparison(opcode);
     auto *texture = call->getArgOperand(1), *sampler = call->getArgOperand(2);
     auto *state = Word(sampler, 2), *minimum = Word(sampler, 5), *maximum = Word(sampler, 3);
     auto *bias = Word(sampler, 4);
     auto *resourceMinimum = Word(texture, 4);
-    const bool nativeColor = !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
+    const bool preciseClamp = NeedsClampPrecision(call);
+    const bool nativeColor = !preciseClamp && !minmaxFiltering && isa<ConstantInt>(resourceMinimum) && cast<ConstantInt>(resourceMinimum)->isZero();
     auto *borderMapping = Word(texture, 5);
     auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
     auto *footprintAnchor = call->getPrevNode();
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
-    Value *sourceLod = call->getArgOperand(10);
+    Value *sourceLod = (gather||comparison)?ConstantFP::get(Type::getFloatTy(call->getContext()),0):call->getArgOperand(10);
     Value *anisoSteps = nullptr, *anisoDirection[2] = {};
     if (opcode == OpCode::SampleGrad || implicit) {
       IRBuilder<> b(call);
@@ -620,7 +757,7 @@ public:
     auto *empty = BasicBlock::Create(call->getContext(), "scorpi.sample.empty", fn, after);
     before->getTerminator()->eraseFromParent();
     // Keep native implicit derivatives in the original control-flow context.
-    if (!implicit&&!nativeColor) { call->removeFromParent(); normal->getInstList().push_back(call); }
+    if (!implicit&&!gather&&!nativeColor) { call->removeFromParent(); normal->getInstList().push_back(call); }
     IRBuilder<> nb(normal); nb.CreateBr(after);
     IRBuilder<> pre(before);
     // A null SRV must not enter footprint math (dimensions are zero, which
@@ -631,15 +768,15 @@ public:
     auto *dims = Call(pre, OpCode::GetDimensions, pre.getInt32Ty(), {texture, pre.getInt32(0)});
     auto *lastMip = pre.CreateUIToFP(pre.CreateSub(pre.CreateExtractValue(dims,3),pre.getInt32(1)),pre.getFloatTy());
     Value *accessMinimum = pre.CreateBitCast(resourceMinimum,pre.getFloatTy());
-    if (opcode != OpCode::SampleLevel) {
-      const unsigned clamp = opcode == OpCode::SampleGrad ? 16 : opcode == OpCode::SampleBias ? 11 : 10;
+    if (ClampOperand(opcode)) {
+      const unsigned clamp = opcode == OpCode::SampleGrad ? 16 : (opcode == OpCode::SampleBias||opcode==OpCode::SampleCmp) ? 11 : 10;
       if (!isa<UndefValue>(call->getArgOperand(clamp)))
         accessMinimum = Call(pre,OpCode::FMax,pre.getFloatTy(),{accessMinimum,call->getArgOperand(clamp)});
     }
     // Unlike sampler clamps, resource/instruction clamps can empty the view.
     // Even a fractional clamp past its last mip is out of bounds. Use a real
     // out-of-bounds load to retain the view's missing-component defaults.
-    pre.CreateCondBr(pre.CreateFCmpOGT(accessMinimum,lastMip),empty,bounded);
+    pre.CreateCondBr(pre.CreateFCmpOGT(accessMinimum,gather?ConstantFP::get(pre.getFloatTy(),0):lastMip),empty,bounded);
     auto *elementType = call->getType()->getStructElementType(0);
     IRBuilder<> out(empty);
     auto *emptyResult = Call(out,OpCode::TextureLoad,elementType,
@@ -647,14 +784,20 @@ public:
          out.getInt32(0),out.getInt32(0),out.getInt32(0)});
     out.CreateBr(after);
     pre.SetInsertPoint(bounded);
-    auto *ordinary = !minmaxFiltering ? pre.getTrue() : pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
+    Value *ordinary = (!minmaxFiltering||gather||comparison)?pre.getTrue():pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
     // The converter ignores resource MinLOD for SampleLevel. Use the same
     // footprint machinery with weighted taps for clamped sampling.
     // Unclamped ordinary sampling, including its native precision, is intact.
     auto *clampedOrdinary = pre.CreateAnd(ordinary,pre.CreateOr(pre.CreateICmpNE(Word(texture,0),pre.getInt32(0)),
         pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
-    pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
-        (minmaxFiltering ? pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0)) : pre.getFalse())),reduce,normal);
+    Value *precision = pre.getFalse();
+    if (preciseClamp) {
+      auto *scaled = pre.CreateFMul(accessMinimum,ConstantFP::get(pre.getFloatTy(),16));
+      precision = pre.CreateAnd(pre.CreateFCmpOGT(accessMinimum,ConstantFP::get(pre.getFloatTy(),0)),
+          pre.CreateFCmpONE(scaled,Call(pre,OpCode::Round_ni,pre.getFloatTy(),{scaled})));
+    }
+    pre.CreateCondBr(pre.CreateOr(precision,pre.CreateOr(clampedOrdinary,
+        minmaxFiltering?pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0)):pre.getFalse())),reduce,normal);
     SinkFootprint(footprint, reduce);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
@@ -669,8 +812,9 @@ public:
       auto *nearest=unary(OpCode::Round_ne,lod);
       lod=b.CreateSelect(b.CreateFCmpOLT(unary(OpCode::FAbs,b.CreateFSub(lod,nearest)),f(1e-5)),nearest,lod);
     }
-    auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
-    auto *linear = b.CreateICmpNE(b.CreateAnd(state,
+    if(gather)lod=f(0);
+    Value *mipLinear = gather?b.getFalse():b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
+    Value *linear = gather?b.getTrue():b.CreateICmpNE(b.CreateAnd(state,
         b.CreateSelect(b.CreateFCmpOGT(lod, f(0)), b.getInt32(0x10), b.getInt32(4))), b.getInt32(0));
     auto *isMin = b.CreateICmpEQ(b.CreateAnd(state, b.getInt32(0x180)), b.getInt32(0x100));
     auto *base = unary(OpCode::Round_ni, lod);
@@ -702,7 +846,7 @@ public:
     auto combine = [&](Value *a, Value *z) -> Value * {
       return b.CreateSelect(isMin, Call(b, OpCode::FMin, elementType, {a,z}), Call(b, OpCode::FMax, elementType, {a,z}));
     };
-    for (unsigned mip = 0; mip < 2; ++mip) {
+    for (unsigned mip = 0; mip < (gather?1u:2u); ++mip) {
       auto *level = mip == 0 ? mip0 : b.CreateAdd(mip0, b.CreateZExt(useMip1, b.getInt32Ty()));
       auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, level});
       Value *length[3], *start[3], *upper[3], *fraction[3];
@@ -730,7 +874,7 @@ public:
         for (unsigned axis = 0; axis < axes; ++axis) {
           auto *high = b.CreateICmpNE(b.CreateAnd(tap,b.getInt32(1u << axis)),b.getInt32(0));
           weight = b.CreateFMul(weight,b.CreateSelect(high,fraction[axis],b.CreateFSub(f(1),fraction[axis])));
-          active = b.CreateAnd(active, b.CreateOr(b.CreateNot(high),upper[axis]));
+          if (!gather) active = b.CreateAnd(active, b.CreateOr(b.CreateNot(high),upper[axis]));
           auto *index = b.CreateAdd(start[axis],b.CreateZExt(high,b.getInt32Ty()));
           auto *n = length[axis];
           auto *last = b.CreateSub(n,b.getInt32(1));
@@ -758,11 +902,11 @@ public:
           layer = b.CreateSelect(b.CreateICmpSLT(layer,b.getInt32(0)),b.getInt32(0),layer);
           coords[2] = b.CreateSelect(b.CreateICmpSGT(layer,last),last,layer);
         }
-        Value *loaded = nativeColor ? static_cast<Value *>(UndefValue::get(call->getType())) : Call(b,OpCode::TextureLoad,elementType,
+        Value *loaded = (gather || nativeColor) ? static_cast<Value *>(UndefValue::get(call->getType())) : Call(b,OpCode::TextureLoad,elementType,
             {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),b.getInt32(0)});
         auto *border = b.CreateAnd(b.CreateLShr(state,b.getInt32(18)),b.getInt32(3));
         for (unsigned c = 0; c < 4; ++c) {
-          if(nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
+          if(gather||nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
           auto *selector = b.CreateAnd(b.CreateLShr(borderMapping,b.getInt32(c*3)),b.getInt32(7));
           auto *colorOne = b.CreateOr(b.CreateICmpEQ(border,b.getInt32(2)),
               b.CreateAnd(b.CreateICmpEQ(border,b.getInt32(1)),b.CreateICmpEQ(selector,b.getInt32(3))));
@@ -771,6 +915,7 @@ public:
           auto *borderValue = b.CreateSelect(isOne,
               ConstantFP::get(elementType,1),ConstantFP::get(elementType,0));
           auto *value = b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,c));
+          if(comparison)value=Compare(b,state,call->getArgOperand(10),b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,0)));
           auto *weighted = b.CreateFMul(value,b.CreateFPCast(weight,elementType));
           auto *first=b.CreateSelect(ordinary,weighted,value);
           auto *old=b.CreateExtractValue(result,c);
@@ -822,18 +967,20 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
+  std::vector<CallInst *> bufferLoads;
   std::vector<CallInst *> feedbackChecks;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
     if(op==OpCode::CheckAccessFullyMapped)feedbackChecks.push_back(call);
-    if (op == OpCode::TextureLoad && !isa<UndefValue>(call->getArgOperand(2))) {
+    if (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad) bufferLoads.push_back(call);
+    if (op == OpCode::TextureLoad) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1),dm,seen);
       if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D)
         textureLoads.push_back(call);
     }
-    if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || op == OpCode::Sample || op == OpCode::SampleBias) {
+    if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || Implicit(op) || Gather(op) || Comparison(op)) {
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
       if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D || kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray)
@@ -880,8 +1027,11 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
           !(requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_TYPED_PREFIX | SCORPI_SAMPLING_TYPED_RGB32));
     }), calls.end());
   if (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY)
-    calls.erase(std::remove_if(calls.begin(), calls.end(), [](CallInst *call) {
-      return Opcode(call) != OpCode::GetDimensions;
+    calls.erase(std::remove_if(calls.begin(), calls.end(), [&](CallInst *call) {
+      return Opcode(call) != OpCode::GetDimensions &&
+          !(requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX) &&
+          !((options & SCORPI_SHADER_GUARD_TYPED_PREFIX) &&
+            (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_PREFIX));
     }), calls.end());
   if (options & (SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_BINDING_POLICY)) {
     // A clamp belongs to one instruction, not the entire shader. Ordinary
@@ -904,7 +1054,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
     if (calls.empty() && samples.empty() && textureLoads.empty() && feedbackChecks.empty()) return false;
   }
-  if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
+  if (calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)
     throw std::runtime_error("typed-buffer metadata root binding missing");
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
@@ -917,19 +1067,44 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         if(extract->getNumIndices()!=1 || *extract->idx_begin()!=4)return false;
         auto *source=dyn_cast<CallInst>(extract->getAggregateOperand());
         if(std::find(textureLoads.begin(),textureLoads.end(),source)!=textureLoads.end())return true;
+        if(std::find(bufferLoads.begin(),bufferLoads.end(),source)!=bufferLoads.end())return true;
         for(auto &sample:samples)if(sample.first==source)return true;
       }
       if(auto *phi=dyn_cast<PHINode>(v)){for(auto &value:phi->incoming_values())if(!supported(value))return false;return true;}
       if(auto *select=dyn_cast<SelectInst>(v))return supported(select->getTrueValue())&&supported(select->getFalseValue());
+      if(auto *binary=dyn_cast<BinaryOperator>(v))if(binary->getOpcode()==Instruction::Or)return supported(binary->getOperand(0))&&supported(binary->getOperand(1));
+      if(auto *constant=dyn_cast<ConstantInt>(v))return constant->isZero();
       return false;
     };
-    if(supported(check->getArgOperand(1))){IRBuilder<> b(check);check->replaceAllUsesWith(b.CreateICmpNE(check->getArgOperand(1),b.getInt32(0)));check->eraseFromParent();}
+    if(supported(check->getArgOperand(1))){
+      // DXC ORs the opaque statuses of the loads forming a structured result.
+      // For our mapped=true ABI this is an AND, including across PHIs/selects.
+      std::map<Value*,Value*> converted;
+      std::function<Value*(Value*)> mapped=[&](Value *v)->Value*{
+        if(converted.count(v))return converted[v];
+        if(isa<ConstantInt>(v))return ConstantInt::getTrue(v->getContext());
+        if(auto *phi=dyn_cast<PHINode>(v)){
+          auto *p=PHINode::Create(Type::getInt1Ty(v->getContext()),phi->getNumIncomingValues(),"scorpi.mapped",phi);converted[v]=p;
+          for(unsigned i=0;i<phi->getNumIncomingValues();++i)p->addIncoming(mapped(phi->getIncomingValue(i)),phi->getIncomingBlock(i));return p;
+        }
+        IRBuilder<> b(cast<Instruction>(v)->getNextNode());Value *result;
+        if(auto *select=dyn_cast<SelectInst>(v))result=b.CreateSelect(select->getCondition(),mapped(select->getTrueValue()),mapped(select->getFalseValue()));
+        else if(auto *binary=dyn_cast<BinaryOperator>(v))result=b.CreateAnd(mapped(binary->getOperand(0)),mapped(binary->getOperand(1)));
+        else result=b.CreateICmpNE(v,b.getInt32(0));
+        return converted[v]=result;
+      };
+      check->replaceAllUsesWith(mapped(check->getArgOperand(1)));check->eraseFromParent();
+    }
   }
   Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
+  for (auto *call : bufferLoads) lowering.RewriteBufferStatus(call);
   for (auto *call : calls) lowering.Rewrite(call,
       (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY) &&
       (!(options & SCORPI_SHADER_BINDING_POLICY) ||
-       (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_RGB32)));
+       (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_RGB32)),
+      (options & SCORPI_SHADER_BINDING_POLICY) &&
+          (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX),
+      options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY);
   for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
   for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
   if (!samples.empty()) {

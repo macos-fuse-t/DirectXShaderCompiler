@@ -215,6 +215,7 @@ ScorpiPromoteTexture1D(const void *code, size_t size, void **binary,
 typedef struct ScorpiTypedBufferBinding {
   uint32_t resource_class, space, base_register, count;
   uint32_t root_offset, table_offset;
+  uint32_t feedback_offset;
 } ScorpiTypedBufferBinding;
 // Reflection only: declared reachable SRV/sampler register ranges. No rewriting.
 // Set bindings=nullptr to query the count; count is input capacity on fill.
@@ -246,6 +247,8 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
 #define SCORPI_SAMPLING_REDUCTION 4u
 #define SCORPI_SAMPLING_TYPED_PREFIX 8u
 #define SCORPI_SAMPLING_TYPED_RGB32 16u
+#define SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX 32u
+#define SCORPI_SHADER_GUARD_TYPED_PREFIX 32u
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
 // The native compiler handles typed addressing. Only repair GetDimensions

@@ -79,6 +79,16 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 assert 'icmp ult' not in ir, 'custom typed addressing survived dimensions-only mode'
                 assert ('udiv' in ir)==bool(flags&16), 'RGB32 correction leaked to ordinary prefix'
             print('PASS',model,resource,'native addressing; dimensions-only correction')
+            for requested in (False, True):
+                policy=(Requirement*1)(Requirement(cls,0,0,1,8|32))
+                status=specialize(code,len(code),view,1,99,16,4|8|16|32,policy,1 if requested else 0,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and bool(output.value)==requested,error.value
+                if requested:
+                    (folder/'guard.dxil').write_bytes(C.string_at(output,size.value));lib.ScorpiFreeDxilBinary(output)
+                    ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'guard.dxil')],text=True)
+                    assert 'icmp ult' in ir, 'prefixed index overflow guard missing'
+            print('PASS',model,resource,'extended prefix and overflow guard are binding-selected')
         # A special binding must not require metadata for unrelated accesses in
         # the same stage. Constant array indices use only their actual register;
         # dynamic indexing conservatively unions only that declared array.
@@ -240,7 +250,7 @@ float4 main(float4 p:SV_Position):SV_Target {
         # A clamp on t0 must not expand independent ordinary accesses to t1.
         # Deliberately supply metadata only for t0: t1 stays entirely native.
         for cube in (False, True):
-            for clamp in ('0.75', 'p.z'):
+            for clamp in ('0.75', '1.2', 'p.z'):
                 texture = 'TextureCube' if cube else 'Texture2D'
                 coord = 'float3(p.xy, 1)' if cube else 'p.xy'
                 source = (f'{texture}<float4> t:register(t0);\n'
@@ -261,8 +271,11 @@ float4 main(float4 p:SV_Position):SV_Target {
                 lib.ScorpiFreeDxilBinary(output)
                 ir = subprocess.check_output([dxc, '-dumpbin', str(folder / 'mixed-clamp.dxil')], text=True)
                 assert not re.search(r'and i32 [^\n]*, (256|384)\b', ir)
-                assert 'scorpi.tap.loop' not in ir, 'native instruction clamp acquired a software filter'
-                assert not re.search(r'call.*@dx.op.unary.f32\(i32 (23|24)', ir), 'software footprint algebra survived native proof'
+                if clamp == '0.75':
+                    assert 'scorpi.tap.loop' not in ir, 'exact native clamp acquired a software filter'
+                    assert not re.search(r'call.*@dx.op.unary.f32\(i32 (23|24)', ir), 'software footprint algebra survived native proof'
+                else:
+                    assert 'scorpi.tap.loop' in ir, 'fractional clamp precision fallback missing'
                 body = ir.split('define void @main()', 1)[1].split('\n}', 1)[0]
                 print('PASS', model, texture, clamp, 'clamp does not expand independent sample; IR lines', len(body.splitlines()))
 
