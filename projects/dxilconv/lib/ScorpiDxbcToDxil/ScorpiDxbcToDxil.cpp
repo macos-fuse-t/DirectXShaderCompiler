@@ -766,9 +766,21 @@ extern "C" int ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t s
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,
     uint32_t metadata_space, uint32_t self_offset, uint32_t options,
     void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  return ScorpiLowerTypedBufferViewsWithSamplingPolicy(code, size, bindings, binding_count,
+      metadata_space, self_offset, options, nullptr, 0, binary, binary_size, error, error_size);
+}
+
+extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, size_t size,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    uint32_t metadata_space, uint32_t self_offset, uint32_t options,
+    const ScorpiSamplingRequirement *policy, size_t policy_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
-      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING)))
+      (!policy && policy_count) ||
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {
@@ -786,7 +798,7 @@ extern "C" int ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t s
     if (!parsed) throw std::runtime_error("invalid typed-buffer shader bitcode");
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) throw std::runtime_error("missing typed-buffer shader module");
-    if (!ScorpiLowerTypedBuffers(*dm, bindings, binding_count, metadata_space, self_offset, options))
+    if (!ScorpiLowerTypedBuffers(*dm, bindings, binding_count, metadata_space, self_offset, options, policy, policy_count))
       return SCORPI_DXBC_TO_DXIL_OK;
     if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid typed-buffer lowering IR");
     hlsl::DxilModule::ClearDxilMetadata(*parsed.get());

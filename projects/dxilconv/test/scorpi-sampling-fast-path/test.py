@@ -27,12 +27,50 @@ lower.argtypes = [C.c_void_p, C.c_size_t, C.POINTER(Binding), C.c_size_t,
                   C.POINTER(C.c_size_t), C.c_char_p, C.c_size_t]
 native = lib.ScorpiLowerTypedBufferViewsWithOptions
 native.argtypes = lower.argtypes[:6] + [C.c_uint32] + lower.argtypes[6:]
+class Requirement(C.Structure):
+    _fields_ = [(name, C.c_uint32) for name in
+                ('resource_class', 'space', 'base_register', 'count', 'requirements')]
+specialize = lib.ScorpiLowerTypedBufferViewsWithSamplingPolicy
+specialize.argtypes = lower.argtypes[:6] + [C.c_uint32, C.POINTER(Requirement), C.c_size_t] + lower.argtypes[6:]
 lib.ScorpiFreeDxilBinary.argtypes = [C.c_void_p]
 bindings = (Binding * 2)(Binding(*(0, 0, 0, 1, 0, 0, 32)[:len(fields)]),
                          Binding(*(3, 0, 0, 1, 8, 0, 36)[:len(fields)]))
 with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
     folder = Path(folder)
     for model in ('6_0', '6_6'):
+        # A special binding must not require metadata for unrelated accesses in
+        # the same stage. Constant array indices use only their actual register;
+        # dynamic indexing conservatively unions only that declared array.
+        for cube in (False, True):
+            texture = 'TextureCube' if cube else 'Texture2D'
+            coord = 'float3(p.xy,1)' if cube else 'p.xy'
+            for index in ('2', '4', '(uint)p.x & 7'):
+                source = (f'{texture}<float4> t[8]:register(t0); SamplerState s[8]:register(s0);\n'
+                          f'{texture}<float4> ordinary:register(t16); SamplerState normal:register(s16);\n'
+                          'float4 main(float4 p:SV_Position):SV_Target {\n'
+                          f'uint i={index}; return t[i].SampleLevel(s[i],{coord},0) + '
+                          f'ordinary.SampleLevel(normal,{coord},0); }}\n')
+                (folder / 'input.hlsl').write_text(source)
+                subprocess.run([dxc, '-T', 'ps_' + model, '-E', 'main', '-Fo',
+                                str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
+                code = (folder / 'input.dxil').read_bytes()
+                arrays = (Binding * 2)(Binding(*(0,0,0,8,0,0,32)[:len(fields)]),
+                                       Binding(*(3,0,0,8,8,0,36)[:len(fields)]))
+                for cls, flags in ((3,4), (0,1), (0,2)):
+                    policy = (Requirement * 1)(Requirement(cls,0,4,1,flags))
+                    output, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(4096)
+                    status = specialize(code, len(code), arrays, len(arrays), 99,16,4,
+                                        policy,len(policy),C.byref(output),C.byref(size),error,len(error))
+                    assert status == 0, error.value
+                    assert bool(output.value) == (index != '2'), (model,cube,index,flags)
+                    if output.value:
+                        (folder / 'binding-policy.dxil').write_bytes(C.string_at(output,size.value))
+                        lib.ScorpiFreeDxilBinary(output)
+                        ir = subprocess.check_output([dxc,'-dumpbin',str(folder / 'binding-policy.dxil')],text=True)
+                        assert 'scorpi.tap.loop' in ir
+                        if cls == 0:
+                            assert not re.search(r'and i32 [^\n]*, (256|384)\b',ir), 'resource requirement enabled reduction'
+                    print('PASS', model, texture, 'binding policy', flags, 'index', index, 'unrelated accesses unchanged')
         for cube in (False, True):
             operations = ['Sample', 'SampleLevel', 'SampleGrad', 'SampleBias']
             if '--comparison-gather' in sys.argv:

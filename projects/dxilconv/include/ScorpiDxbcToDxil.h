@@ -238,6 +238,21 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
 // No reachable bound sampler uses reduction filtering. Do not emit min/max
 // reduction even when another requirement (clamps/residency) needs lowering.
 #define SCORPI_SHADER_NO_MINMAX_FILTERING 2u
+// Exhaustive semantic exceptions for the immutable descriptor snapshot. An
+// absent register is ordinary; unknown handle provenance stays conservative.
+#define SCORPI_SHADER_BINDING_POLICY 4u
+#define SCORPI_SAMPLING_SPARSE 1u
+#define SCORPI_SAMPLING_RESOURCE_MIN_LOD 2u
+#define SCORPI_SAMPLING_REDUCTION 4u
+typedef struct ScorpiSamplingRequirement {
+  uint32_t resource_class, space, base_register, count, requirements;
+} ScorpiSamplingRequirement;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, size_t size,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    uint32_t metadata_space, uint32_t self_offset, uint32_t options,
+    const ScorpiSamplingRequirement *policy, size_t policy_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t size,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,

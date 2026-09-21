@@ -120,6 +120,55 @@ public:
   }
 };
 
+// Resolve the union of semantic requirements reachable by this handle. A
+// dynamic array index affects its declared range, never an unrelated range.
+// PHI cycles contribute no new binding; unknown producers are conservative.
+uint32_t SamplingRequirements(DxilModule &dm, Value *handle,
+    const ScorpiSamplingRequirement *policy, size_t count, std::set<Value *> &seen) {
+  if (!seen.insert(handle).second) return 0;
+  if (auto *phi = dyn_cast<PHINode>(handle)) {
+    uint32_t result = 0;
+    for (auto &v : phi->incoming_values()) result |= SamplingRequirements(dm, v, policy, count, seen);
+    return result;
+  }
+  if (auto *s = dyn_cast<SelectInst>(handle))
+    return SamplingRequirements(dm, s->getTrueValue(), policy, count, seen) |
+        SamplingRequirements(dm, s->getFalseValue(), policy, count, seen);
+  auto *call = dyn_cast<CallInst>(handle);
+  if (!call) return 7;
+  if (Opcode(call) == OpCode::AnnotateHandle)
+    return SamplingRequirements(dm, call->getArgOperand(1), policy, count, seen);
+  uint32_t cls, space;
+  uint64_t first, end;
+  Value *index;
+  if (Opcode(call) == OpCode::CreateHandle) {
+    cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+    auto id = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
+    if (cls != unsigned(ResourceClass::SRV) && cls != unsigned(ResourceClass::Sampler)) return 7;
+    const DxilResourceBase &r = cls == unsigned(ResourceClass::Sampler) ?
+        static_cast<const DxilResourceBase &>(dm.GetSampler(id)) : dm.GetSRV(id);
+    space = r.GetSpaceID(); first = r.GetLowerBound(); end = first + r.GetRangeSize();
+    index = call->getArgOperand(3);
+  } else if (Opcode(call) == OpCode::CreateHandleFromBinding) {
+    auto r = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
+    cls = r.resourceClass; space = r.spaceID; first = r.rangeLowerBound;
+    end = uint64_t(r.rangeUpperBound) + 1; index = call->getArgOperand(2);
+  } else return 7;
+  if (auto *constant = dyn_cast<ConstantInt>(index)) {
+    auto reg = constant->getZExtValue();
+    if (reg < first || reg >= end) return 7;
+    first = reg; end = reg + 1;
+  }
+  uint32_t result = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const auto &r = policy[i];
+    if (r.resource_class == cls && r.space == space &&
+        uint64_t(r.base_register) < end && first < uint64_t(r.base_register) + r.count)
+      result |= r.requirements;
+  }
+  return result;
+}
+
 class Lowering {
   DxilModule &dm;
   const ScorpiTypedBufferBinding *bindings;
@@ -127,6 +176,9 @@ class Lowering {
   uint32_t space, selfOffset, resourceID;
   bool minmaxFiltering;
   bool nativeTextures;
+  bool bindingPolicy;
+  const ScorpiSamplingRequirement *policy;
+  size_t policyCount;
   std::map<Function *, Value *> metadataHandles;
   std::map<Function *, Value *> pointHandles;
   uint32_t pointID = UINT32_MAX;
@@ -183,9 +235,11 @@ class Lowering {
   }
 public:
   Lowering(DxilModule &module, const ScorpiTypedBufferBinding *ranges,
-      size_t n, uint32_t s, uint32_t self, uint32_t options) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self),
+      size_t n, uint32_t s, uint32_t self, uint32_t options,
+      const ScorpiSamplingRequirement *p, size_t pn) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self),
       minmaxFiltering(!(options & (SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_NATIVE_TEXTURES))),
-      nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES) {
+      nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES),
+      bindingPolicy(options & SCORPI_SHADER_BINDING_POLICY), policy(p), policyCount(pn) {
     auto &ctx = dm.GetModule()->getContext();
     auto resource = std::make_unique<DxilResource>();
     resource->SetID(dm.GetSRVs().size()); resource->SetRW(false);
@@ -236,8 +290,12 @@ public:
     // retained for instruction clamps or status consumers: otherwise their
     // dead software filter bodies survive into the Metal compiler. Do not
     // apply this to UAVs (not covered by the native SRV binding policy).
-    if (nativeTextures && cls == unsigned(ResourceClass::SRV) && (word == 0 || word == 4))
-      return words[key] = ConstantInt::get(Type::getInt32Ty(call->getContext()), 0);
+    if (cls == unsigned(ResourceClass::SRV) && (word == 0 || word == 4)) {
+      std::set<Value *> seen;
+      const uint32_t needed = word == 0 ? SCORPI_SAMPLING_SPARSE : SCORPI_SAMPLING_RESOURCE_MIN_LOD;
+      if (bindingPolicy ? !(SamplingRequirements(dm, handle, policy, policyCount, seen) & needed) : nativeTextures)
+        return words[key] = ConstantInt::get(Type::getInt32Ty(call->getContext()), 0);
+    }
     const ScorpiTypedBufferBinding *range = nullptr;
     for (size_t i = 0; i < count; ++i) {
       const auto &r = bindings[i];
@@ -322,6 +380,9 @@ public:
   }
 
   void RewriteCubeSample(CallInst *call,ResourceKind kind) {
+    std::set<Value *> seen;
+    const bool minmaxFiltering = bindingPolicy ?
+        (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, seen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
     const auto opcode=Opcode(call);
     const bool implicit=opcode==OpCode::Sample || opcode==OpCode::SampleBias;
     auto *texture=call->getArgOperand(1),*sampler=call->getArgOperand(2);
@@ -461,6 +522,9 @@ public:
   // zero-weight exclusion and mip clamp is independent of native sampler
   // reduction support. Unclamped ordinary sampling keeps the original instruction.
   void RewriteSample(CallInst *call, ResourceKind kind) {
+    std::set<Value *> policySeen;
+    const bool minmaxFiltering = bindingPolicy ?
+        (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, policySeen) & SCORPI_SAMPLING_REDUCTION) != 0 : this->minmaxFiltering;
     if(kind==ResourceKind::TextureCube || kind==ResourceKind::TextureCubeArray){RewriteCubeSample(call,kind);return;}
     const auto opcode = Opcode(call);
     const bool implicit = opcode == OpCode::Sample || opcode == OpCode::SampleBias;
@@ -738,7 +802,8 @@ public:
 }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
-    size_t count, uint32_t space, uint32_t selfOffset, uint32_t options) {
+    size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
+    const ScorpiSamplingRequirement *policy, size_t policyCount) {
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -790,15 +855,27 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     }
     return false;
   };
-  if (options & SCORPI_SHADER_NATIVE_TEXTURES) {
+  auto requirements = [&](Value *handle) {
+    std::set<Value *> seen;
+    return SamplingRequirements(dm, handle, policy, policyCount, seen);
+  };
+  if (options & (SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_BINDING_POLICY)) {
     // A clamp belongs to one instruction, not the entire shader. Ordinary
     // accesses remain untouched even when another sample needs emulation.
     samples.erase(std::remove_if(samples.begin(), samples.end(),
         [&](const std::pair<CallInst *, ResourceKind> &sample) {
-          return !instructionClamp(sample) && !feedbackUsed(sample.first);
+          auto *call = sample.first;
+          if ((options & SCORPI_SHADER_BINDING_POLICY) &&
+              ((requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_SPARSE | SCORPI_SAMPLING_RESOURCE_MIN_LOD)) ||
+               (requirements(call->getArgOperand(2)) & SCORPI_SAMPLING_REDUCTION))) return false;
+          return !instructionClamp(sample) && !feedbackUsed(call);
         }), samples.end());
     textureLoads.erase(std::remove_if(textureLoads.begin(), textureLoads.end(),
-        [&](CallInst *call) { return !feedbackUsed(call); }), textureLoads.end());
+        [&](CallInst *call) {
+          if ((options & SCORPI_SHADER_BINDING_POLICY) &&
+              (requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_SPARSE | SCORPI_SAMPLING_RESOURCE_MIN_LOD))) return false;
+          return !feedbackUsed(call);
+        }), textureLoads.end());
     if (calls.empty() && samples.empty() && textureLoads.empty() && feedbackChecks.empty()) return false;
   }
   if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
@@ -822,7 +899,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     };
     if(supported(check->getArgOperand(1))){IRBuilder<> b(check);check->replaceAllUsesWith(b.CreateICmpNE(check->getArgOperand(1),b.getInt32(0)));check->eraseFromParent();}
   }
-  Lowering lowering(dm, bindings, count, space, selfOffset, options);
+  Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
   for (auto *call : calls) lowering.Rewrite(call);
   for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
   for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
