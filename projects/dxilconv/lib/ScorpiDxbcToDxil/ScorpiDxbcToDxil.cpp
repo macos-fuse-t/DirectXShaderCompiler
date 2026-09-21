@@ -782,7 +782,7 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
       (!policy && policy_count) ||
-      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS)))
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_TYPED_DIMENSIONS_ONLY)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {

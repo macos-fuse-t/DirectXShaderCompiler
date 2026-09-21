@@ -314,7 +314,7 @@ public:
     return words[key] = Load(b, metadata, offset);
   }
 
-  void Rewrite(CallInst *call) {
+  void Rewrite(CallInst *call, bool mayBeRGB32) {
     auto *handle = call->getArgOperand(1);
     auto *word = Word(handle, 5);
     IRBuilder<> b(call);
@@ -322,7 +322,14 @@ public:
     if (Opcode(call) == OpCode::GetDimensions) {
       b.SetInsertPoint(call->getNextNode());
       auto *width = cast<Instruction>(b.CreateExtractValue(call, 0));
-      auto *fixed = cast<Instruction>(b.CreateInsertValue(call, b.CreateSub(width, prefix), 0));
+      // RGB32 is represented by three scalar texture-buffer texels. The
+      // private native addressing switch does not fix GetDimensions.
+      Value *length = b.CreateSub(width, prefix);
+      if (mayBeRGB32) {
+        auto *rgb32 = b.CreateICmpNE(b.CreateAnd(word, b.getInt32(1u << 30)), b.getInt32(0));
+        length = b.CreateUDiv(length, b.CreateSelect(rgb32, b.getInt32(3), b.getInt32(1)));
+      }
+      auto *fixed = cast<Instruction>(b.CreateInsertValue(call, length, 0));
       call->replaceAllUsesWith(fixed);
       width->setOperand(0, call); fixed->setOperand(0, call);
       return;
@@ -870,7 +877,11 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   if (options & (SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_BINDING_POLICY))
     calls.erase(std::remove_if(calls.begin(), calls.end(), [&](CallInst *call) {
       return !(options & SCORPI_SHADER_BINDING_POLICY) ||
-          !(requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_PREFIX);
+          !(requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_TYPED_PREFIX | SCORPI_SAMPLING_TYPED_RGB32));
+    }), calls.end());
+  if (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY)
+    calls.erase(std::remove_if(calls.begin(), calls.end(), [](CallInst *call) {
+      return Opcode(call) != OpCode::GetDimensions;
     }), calls.end());
   if (options & (SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_BINDING_POLICY)) {
     // A clamp belongs to one instruction, not the entire shader. Ordinary
@@ -915,7 +926,10 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     if(supported(check->getArgOperand(1))){IRBuilder<> b(check);check->replaceAllUsesWith(b.CreateICmpNE(check->getArgOperand(1),b.getInt32(0)));check->eraseFromParent();}
   }
   Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
-  for (auto *call : calls) lowering.Rewrite(call);
+  for (auto *call : calls) lowering.Rewrite(call,
+      (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY) &&
+      (!(options & SCORPI_SHADER_BINDING_POLICY) ||
+       (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_RGB32)));
   for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
   for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
   if (!samples.empty()) {

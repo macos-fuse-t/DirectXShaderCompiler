@@ -56,6 +56,29 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 assert status==0 and bool(output.value)==prefix,error.value
                 if output.value:lib.ScorpiFreeDxilBinary(output)
             print('PASS',model,resource,'aligned accesses untouched beside prefixed view')
+            # Apple handles addressing: a special view without GetDimensions
+            # must leave the entire shader byte-for-byte untouched, even with
+            # another (ordinary) view's dimensions query in the same stage.
+            for flags in (8,16,24):
+                policy=(Requirement*1)(Requirement(cls,0,0,1,flags))
+                status=specialize(code,len(code),view,1,99,16,4|8|16,policy,1,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and not output.value, (model,resource,flags,error.value)
+            (folder/'input.hlsl').write_text(source.replace('aligned.GetDimensions','prefixed.GetDimensions'))
+            subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'input.dxil'),str(folder/'input.hlsl')],check=True)
+            code=(folder/'input.dxil').read_bytes()
+            for flags in (8,16,24):
+                policy=(Requirement*1)(Requirement(cls,0,0,1,flags))
+                status=specialize(code,len(code),view,1,99,16,4|8|16,policy,1,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and output.value,error.value
+                (folder/'dimensions.dxil').write_bytes(C.string_at(output,size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'dimensions.dxil')],text=True)
+                assert len(re.findall(r'call .*@dx.op.getDimensions',ir))==1
+                assert 'icmp ult' not in ir, 'custom typed addressing survived dimensions-only mode'
+                assert ('udiv' in ir)==bool(flags&16), 'RGB32 correction leaked to ordinary prefix'
+            print('PASS',model,resource,'native addressing; dimensions-only correction')
         # A special binding must not require metadata for unrelated accesses in
         # the same stage. Constant array indices use only their actual register;
         # dynamic indexing conservatively unions only that declared array.
