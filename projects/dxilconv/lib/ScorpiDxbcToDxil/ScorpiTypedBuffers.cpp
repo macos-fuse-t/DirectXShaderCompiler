@@ -423,7 +423,7 @@ public:
     return b.CreateOr(b.CreateNot(sparse),b.CreateOr(b.CreateNot(valid),mapped));
   }
 
-  void ReplaceStatus(CallInst *call, Value *mapped) {
+  static void ReplaceStatus(CallInst *call, Value *mapped) {
     IRBuilder<> b(call);
     std::vector<ExtractValueInst*> statuses;
     for(auto *user:call->users())if(auto *extract=dyn_cast<ExtractValueInst>(user))
@@ -1021,6 +1021,8 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     std::set<Value *> seen;
     return SamplingRequirements(dm, handle, policy, policyCount, seen);
   };
+  bufferLoads.erase(std::remove_if(bufferLoads.begin(), bufferLoads.end(),
+      [&](CallInst *call) { return !feedbackUsed(call); }), bufferLoads.end());
   if (options & (SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_BINDING_POLICY))
     calls.erase(std::remove_if(calls.begin(), calls.end(), [&](CallInst *call) {
       return !(options & SCORPI_SHADER_BINDING_POLICY) ||
@@ -1052,11 +1054,8 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
               (requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_SPARSE | SCORPI_SAMPLING_RESOURCE_MIN_LOD))) return false;
           return !feedbackUsed(call);
         }), textureLoads.end());
-    if (calls.empty() && samples.empty() && textureLoads.empty() && feedbackChecks.empty()) return false;
   }
   if (calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty()) return false;
-  if (!bindings || !count || space == UINT32_MAX)
-    throw std::runtime_error("typed-buffer metadata root binding missing");
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
@@ -1096,18 +1095,31 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
       check->replaceAllUsesWith(mapped(check->getArgOperand(1)));check->eraseFromParent();
     }
   }
-  Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
-  for (auto *call : bufferLoads) lowering.RewriteBufferStatus(call);
-  for (auto *call : calls) lowering.Rewrite(call,
-      (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY) &&
-      (!(options & SCORPI_SHADER_BINDING_POLICY) ||
-       (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_RGB32)),
-      (options & SCORPI_SHADER_BINDING_POLICY) &&
-          (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX),
-      options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY);
-  for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
-  for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
-  if (!samples.empty()) {
+  // Fully backed buffers (including NULL views and OOB accesses) have no
+  // missing tiles. Fold only their status; preserve native data/OOB handling.
+  // Keep unknown handles and dynamically indexed sparse ranges conservative.
+  if (options & SCORPI_SHADER_BINDING_POLICY)
+    bufferLoads.erase(std::remove_if(bufferLoads.begin(), bufferLoads.end(), [&](CallInst *call) {
+      if (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_SPARSE) return false;
+      Lowering::ReplaceStatus(call, ConstantInt::getTrue(call->getContext()));
+      return true;
+    }), bufferLoads.end());
+  if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty()) {
+    if (!bindings || !count || space == UINT32_MAX)
+      throw std::runtime_error("typed-buffer metadata root binding missing");
+    Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
+    for (auto *call : bufferLoads) lowering.RewriteBufferStatus(call);
+    for (auto *call : calls) lowering.Rewrite(call,
+        (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY) &&
+        (!(options & SCORPI_SHADER_BINDING_POLICY) ||
+         (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_RGB32)),
+        (options & SCORPI_SHADER_BINDING_POLICY) &&
+            (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX),
+        options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY);
+    for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
+    for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
+  }
+  if (!samples.empty() || !feedbackChecks.empty()) {
     // Canonicalize aggregate sample-result PHIs and dead descriptor arithmetic
     // before IR conversion. Conditional multi-sample shaders otherwise produce
     // AIR rejected by the Metal compiler's bitcode reader.

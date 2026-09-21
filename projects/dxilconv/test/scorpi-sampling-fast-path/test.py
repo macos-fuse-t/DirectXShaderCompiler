@@ -38,6 +38,81 @@ bindings = (Binding * 2)(Binding(*(0, 0, 0, 1, 0, 0, 32)[:len(fields)]),
 with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
     folder = Path(folder)
     for model in ('6_0', '6_6'):
+        # Dense feedback must need no metadata binding at all. Keep sparse
+        # table/root paths, including multi-load structured status aggregation.
+        for cls in (0, 1):
+            for kind in ('ByteAddressBuffer', 'StructuredBuffer<Big>', 'Buffer<uint4>'):
+                resource = ('RW' if cls else '') + kind
+                typed = kind.startswith('Buffer')
+                structured = kind.startswith('Structured')
+                load = 'Load' if typed or structured else 'Load4'
+                value = 'Big' if structured else 'uint4'
+                total = 'dot(v.a,1)+dot(v.b,1)+v.c' if structured else 'dot(v,1)'
+                source = ('struct Big { uint4 a,b; uint c; };\n'
+                          f'{resource} input:register({"u" if cls else "t"}0);\n'
+                          'RWByteAddressBuffer result:register(u5);\n'
+                          '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                          f'uint status; {value} v=input.{load}(id.x,status);\n'
+                          f'result.Store(0,{total});result.Store(4,CheckAccessFullyMapped(status)); }}')
+                (folder/'feedback.hlsl').write_text(source)
+                subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'feedback.dxil'),str(folder/'feedback.hlsl')],check=True)
+                code=(folder/'feedback.dxil').read_bytes()
+                for sparse in (False, True):
+                    for root in ((False,) if typed else (False, True)):
+                        view=(Binding*1)(Binding(cls,0,0,1,0,0xffffffff if root else 0,32))
+                        policy=(Requirement*1)(Requirement(cls,0,0,1,1))
+                        output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
+                        status=specialize(code,len(code),view if sparse else None,1 if sparse else 0,
+                                          99 if sparse else 0xffffffff,16,4|8,
+                                          policy,1 if sparse else 0,C.byref(output),C.byref(size),error,len(error))
+                        assert status==0 and output.value,(model,resource,sparse,root,error.value)
+                        (folder/'feedback-lowered.dxil').write_bytes(C.string_at(output,size.value));lib.ScorpiFreeDxilBinary(output)
+                        ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'feedback-lowered.dxil')],text=True)
+                        assert ('ScorpiTypedBufferMetadata' in ir)==sparse,(model,resource,sparse,root)
+                        if not sparse:
+                            assert not re.search(r'call .*@dx.op.checkAccessFullyMapped',ir), ir
+                            assert not re.search(r'extractvalue .*?, 4\b',ir), ir
+                            assert 'i64' not in ir.split('define void @main()',1)[1].split('\n}',1)[0], ir
+                print('PASS',model,resource,'dense feedback has zero metadata/page checks; sparse table/root retained')
+        for index in ('0', '1', 'id.x & 3'):
+            source = ('ByteAddressBuffer input[4]:register(t0);\n'
+                      'RWByteAddressBuffer result:register(u5);\n'
+                      '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                      f'uint status; uint v=input[{index}].Load(id.y,status);\n'
+                      'result.Store(0,v);result.Store(4,CheckAccessFullyMapped(status)); }')
+            (folder/'feedback-array.hlsl').write_text(source)
+            subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'feedback-array.dxil'),str(folder/'feedback-array.hlsl')],check=True)
+            code=(folder/'feedback-array.dxil').read_bytes()
+            view=(Binding*1)(Binding(0,0,0,4,0,0,32))
+            policy=(Requirement*1)(Requirement(0,0,1,1,1))
+            output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
+            status=specialize(code,len(code),view,1,99,16,4|8,policy,1,
+                              C.byref(output),C.byref(size),error,len(error))
+            assert status==0 and output.value,error.value
+            (folder/'feedback-array-lowered.dxil').write_bytes(C.string_at(output,size.value));lib.ScorpiFreeDxilBinary(output)
+            ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'feedback-array-lowered.dxil')],text=True)
+            assert ('ScorpiTypedBufferMetadata' in ir)==(index!='0'),(model,index)
+            print('PASS',model,'feedback array index',index,'only reachable sparse bindings retain checks')
+        source = ('ByteAddressBuffer dense:register(t0); ByteAddressBuffer sparse:register(t1);\n'
+                  'RWByteAddressBuffer result:register(u5);\n'
+                  '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                  'uint a,b; uint v=dense.Load(id.x,a)+sparse.Load(id.y,b);\n'
+                  'result.Store(0,v);result.Store(4,CheckAccessFullyMapped(a));\n'
+                  'result.Store(8,CheckAccessFullyMapped(b)); }')
+        for consume in (True,False):
+            text=source if consume else source.split('result.Store(4,')[0]+'}'
+            (folder/'feedback-mixed.hlsl').write_text(text)
+            subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'feedback-mixed.dxil'),str(folder/'feedback-mixed.hlsl')],check=True)
+            code=(folder/'feedback-mixed.dxil').read_bytes()
+            # No metadata for the dense input: touching it is a test failure.
+            view=(Binding*1)(Binding(0,0,1,1,0,0,32))
+            policy=(Requirement*1)(Requirement(0,0,1,1,1))
+            output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
+            status=specialize(code,len(code),view,1,99,16,4|8,policy,1,
+                              C.byref(output),C.byref(size),error,len(error))
+            assert status==0 and bool(output.value)==consume,(model,consume,error.value)
+            if output.value:lib.ScorpiFreeDxilBinary(output)
+        print('PASS',model,'mixed dense/sparse feedback; unused statuses leave shader unchanged')
         for resource, cls in (('Buffer',0), ('RWBuffer',1)):
             source = (f'{resource}<uint> aligned:register({"t" if cls==0 else "u"}1);\n'
                       f'{resource}<uint> prefixed:register({"t" if cls==0 else "u"}0);\n'
