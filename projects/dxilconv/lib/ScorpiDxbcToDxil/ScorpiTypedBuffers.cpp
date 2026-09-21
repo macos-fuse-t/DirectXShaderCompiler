@@ -60,7 +60,10 @@ ResourceKind Kind(Value *handle, DxilModule &dm, std::set<Value *> &seen) {
 // path; a regular hardware sample must not pay for its software fallback.
 std::vector<Instruction *> FootprintInstructions(Instruction *anchor, Instruction *end) {
   std::vector<Instruction *> result;
-  for (auto *i = anchor->getNextNode(); i != end; i = i->getNextNode())
+  // A sample can be the first instruction of a conditional block; its
+  // operands/handles may all dominate it from another block.
+  for (auto *i = anchor ? anchor->getNextNode() : &end->getParent()->front();
+       i != end; i = i->getNextNode())
     if (Opcode(i) != OpCode::DerivCoarseX && Opcode(i) != OpCode::DerivCoarseY)
       result.push_back(i);
   return result;
