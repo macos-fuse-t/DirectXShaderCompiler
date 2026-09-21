@@ -207,10 +207,12 @@ public:
     auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     Value *sourceLod = call->getArgOperand(10);
+    Value *anisoSteps = nullptr, *anisoDirection[2] = {};
     if (opcode == OpCode::SampleGrad || implicit) {
       IRBuilder<> b(call);
       auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture,b.getInt32(0)});
       Value *dx2 = ConstantFP::get(b.getFloatTy(),0), *dy2 = dx2;
+      Value *gradientX[3], *gradientY[3];
       for (unsigned axis=0;axis<axes;++axis) {
         auto *n = b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy());
         // Derivatives must execute before the sampler-mode branch: descriptor
@@ -219,11 +221,46 @@ public:
         auto *gy = implicit ? Call(b,OpCode::DerivCoarseY,b.getFloatTy(),{call->getArgOperand(3+axis)}) : call->getArgOperand(13+axis);
         auto *dx = b.CreateFMul(gx,n);
         auto *dy = b.CreateFMul(gy,n);
+        gradientX[axis]=dx; gradientY[axis]=dy;
         dx2 = b.CreateFAdd(dx2,b.CreateFMul(dx,dx));
         dy2 = b.CreateFAdd(dy2,b.CreateFMul(dy,dy));
       }
       auto *rho2 = Call(b,OpCode::FMax,b.getFloatTy(),{dx2,dy2});
       sourceLod = b.CreateFMul(Call(b,OpCode::Log,b.getFloatTy(),{rho2}),ConstantFP::get(b.getFloatTy(),.5));
+      if (axes == 2) {
+        auto f = [&](double v) { return ConstantFP::get(b.getFloatTy(),v); };
+        auto min = [&](Value *a,Value *z) -> Value * { return Call(b,OpCode::FMin,b.getFloatTy(),{a,z}); };
+        auto max = [&](Value *a,Value *z) -> Value * { return Call(b,OpCode::FMax,b.getFloatTy(),{a,z}); };
+        auto sqrt = [&](Value *v) -> Value * { return Call(b,OpCode::Sqrt,b.getFloatTy(),{v}); };
+        // Principal axes of J*J^T, not merely the longer screen derivative:
+        // skewed footprints need orthogonalization before choosing mip/taps.
+        Value *g[4]={gradientX[0],gradientX[1],gradientY[0],gradientY[1]};
+        for(auto &v:g)v=min(max(v,f(-65536)),f(65536));
+        auto *xx=b.CreateFAdd(b.CreateFMul(g[0],g[0]),b.CreateFMul(g[2],g[2]));
+        auto *yy=b.CreateFAdd(b.CreateFMul(g[1],g[1]),b.CreateFMul(g[3],g[3]));
+        auto *xy=b.CreateFAdd(b.CreateFMul(g[0],g[1]),b.CreateFMul(g[2],g[3]));
+        auto *difference=b.CreateFSub(xx,yy);
+        auto *delta=sqrt(b.CreateFAdd(b.CreateFMul(difference,difference),b.CreateFMul(f(4),b.CreateFMul(xy,xy))));
+        auto *major2=max(b.CreateFMul(b.CreateFAdd(b.CreateFAdd(xx,yy),delta),f(.5)),f(1e-30));
+        auto *major=sqrt(major2);
+        auto *limit=b.CreateUIToFP(b.CreateAdd(b.CreateAnd(b.CreateLShr(state,b.getInt32(20)),b.getInt32(15)),b.getInt32(1)),b.getFloatTy());
+        auto *minor=max(sqrt(max(b.CreateFMul(b.CreateFSub(b.CreateFAdd(xx,yy),delta),f(.5)),f(0))),b.CreateFDiv(major,limit));
+        auto *enabled=b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x40)),b.getInt32(0));
+        auto *ratio=min(limit,max(f(1),b.CreateFDiv(major,max(minor,f(1)))));
+        // sqrt/log approximations must not turn an exact 4:1 footprint into
+        // five probes. This tolerance is much finer than D3D's 8-bit weights.
+        anisoSteps=b.CreateFPToUI(b.CreateSelect(enabled,Call(b,OpCode::Round_pi,b.getFloatTy(),{max(f(1),b.CreateFSub(ratio,f(1e-5)))}),f(1)),b.getInt32Ty());
+        sourceLod=b.CreateSelect(enabled,Call(b,OpCode::Log,b.getFloatTy(),{minor}),sourceLod);
+        Value *vx=b.CreateFSub(major2,yy), *vy=xy;
+        auto *norm=sqrt(b.CreateFAdd(b.CreateFMul(vx,vx),b.CreateFMul(vy,vy)));
+        auto *nonzero=b.CreateFCmpOGT(norm,f(1e-15));
+        vx=b.CreateSelect(nonzero,b.CreateFDiv(vx,max(norm,f(1e-15))),f(0));
+        vy=b.CreateSelect(nonzero,b.CreateFDiv(vy,max(norm,f(1e-15))),f(1));
+        Value *direction[2]={vx,vy};
+        for(unsigned axis=0;axis<2;++axis)
+          anisoDirection[axis]=b.CreateFDiv(b.CreateFMul(direction[axis],major),
+              max(b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy()),f(1)));
+      }
       if (opcode == OpCode::SampleBias) sourceLod = b.CreateFAdd(sourceLod,call->getArgOperand(10));
     }
     auto *before = call->getParent();
@@ -266,11 +303,10 @@ public:
     pre.SetInsertPoint(bounded);
     auto *ordinary = pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
     // The converter ignores resource MinLOD for SampleLevel. Use the same
-    // footprint machinery with weighted taps for clamped isotropic sampling.
+    // footprint machinery with weighted taps for clamped sampling.
     // Unclamped ordinary sampling, including its native precision, is intact.
-    auto *clampedOrdinary = pre.CreateAnd(ordinary,pre.CreateAnd(
-        pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x40)),pre.getInt32(0)),
-        pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
+    auto *clampedOrdinary = pre.CreateAnd(ordinary,
+        pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0)));
     pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
         pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0))),reduce,normal);
     IRBuilder<> b(reduce);
@@ -282,6 +318,10 @@ public:
     // D3D gives MinLOD precedence even when it exceeds MaxLOD.
     lod = max(min(lod, b.CreateBitCast(maximum, b.getFloatTy())), b.CreateBitCast(minimum, b.getFloatTy()));
     lod = min(max(max(lod, accessMinimum), f(0)), lastMip);
+    if(anisoSteps) {
+      auto *nearest=unary(OpCode::Round_ne,lod);
+      lod=b.CreateSelect(b.CreateFCmpOLT(unary(OpCode::FAbs,b.CreateFSub(lod,nearest)),f(1e-5)),nearest,lod);
+    }
     auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
     auto *linear = b.CreateICmpNE(b.CreateAnd(state,
         b.CreateSelect(b.CreateFCmpOGT(lod, f(0)), b.getInt32(0x10), b.getInt32(4))), b.getInt32(0));
@@ -292,6 +332,26 @@ public:
     auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
     const bool array = kind == ResourceKind::Texture2DArray;
     Value *result = UndefValue::get(call->getType());
+    PHINode *iteration=nullptr, *accumulators[5]={};
+    BasicBlock *loopHeader=nullptr, *loopExit=nullptr;
+    Value *loopResult=nullptr, *anisoPosition=nullptr;
+    if (anisoSteps) {
+      loopHeader=BasicBlock::Create(call->getContext(),"scorpi.aniso.loop",fn,after);
+      auto *body=BasicBlock::Create(call->getContext(),"scorpi.aniso.tap",fn,after);
+      loopExit=BasicBlock::Create(call->getContext(),"scorpi.aniso.end",fn,after);
+      b.CreateBr(loopHeader);b.SetInsertPoint(loopHeader);
+      iteration=b.CreatePHI(b.getInt32Ty(),2,"scorpi.aniso.index");iteration->addIncoming(b.getInt32(0),reduce);
+      for(unsigned c=0;c<5;++c) {
+        auto *type=call->getType()->getStructElementType(c);
+        accumulators[c]=b.CreatePHI(type,2,"scorpi.aniso.value");
+        accumulators[c]->addIncoming(Constant::getNullValue(type),reduce);
+      }
+      for(unsigned c=0;c<5;++c)result=b.CreateInsertValue(result,accumulators[c],c);
+      loopResult=result;
+      b.CreateCondBr(b.CreateICmpULT(iteration,anisoSteps),body,loopExit);b.SetInsertPoint(body);
+      anisoPosition=b.CreateFSub(b.CreateFDiv(b.CreateFAdd(b.CreateUIToFP(iteration,b.getFloatTy()),f(.5)),
+          b.CreateUIToFP(anisoSteps,b.getFloatTy())),f(.5));
+    }
     auto combine = [&](Value *a, Value *z) -> Value * {
       return b.CreateSelect(isMin, Call(b, OpCode::FMin, elementType, {a,z}), Call(b, OpCode::FMax, elementType, {a,z}));
     };
@@ -301,7 +361,9 @@ public:
       Value *length[3], *start[3], *upper[3], *fraction[3];
       for (unsigned axis = 0; axis < axes; ++axis) {
         length[axis] = b.CreateExtractValue(size, axis);
-        auto *coord = b.CreateFMul(call->getArgOperand(3+axis), b.CreateUIToFP(length[axis], b.getFloatTy()));
+        Value *normalized=call->getArgOperand(3+axis);
+        if(anisoPosition)normalized=b.CreateFAdd(normalized,b.CreateFMul(anisoPosition,anisoDirection[axis]));
+        auto *coord = b.CreateFMul(normalized, b.CreateUIToFP(length[axis], b.getFloatTy()));
         coord = b.CreateFSub(coord, b.CreateSelect(linear, f(.5), f(0)));
         auto *floor = unary(OpCode::Round_ni, coord);
         fraction[axis] = b.CreateSelect(linear,b.CreateFSub(coord,floor),f(0));
@@ -313,6 +375,7 @@ public:
       for (unsigned tap = 0; tap < (1u << axes); ++tap) {
         Value *active = mip == 0 ? b.getTrue() : useMip1;
         Value *weight = mip == 0 ? b.CreateFSub(f(1),mipFraction) : mipFraction;
+        if(anisoSteps)weight=b.CreateFDiv(weight,b.CreateUIToFP(anisoSteps,b.getFloatTy()));
         Value *outside = b.getFalse();
         Value *coords[3] = {UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty())};
         for (unsigned axis = 0; axis < axes; ++axis) {
@@ -362,7 +425,15 @@ public:
           if (mip || tap) {
             auto *old = b.CreateExtractValue(result,c);
             value = b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);
-          } else value = b.CreateSelect(ordinary,weighted,value);
+          } else {
+            auto *first=b.CreateSelect(ordinary,weighted,value);
+            if(iteration) {
+              auto *old=b.CreateExtractValue(result,c);
+              first=b.CreateSelect(b.CreateICmpEQ(iteration,b.getInt32(0)),first,
+                  b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)));
+            }
+            value=first;
+          }
           result = b.CreateInsertValue(result,value,c);
         }
         // Non-sparse resources are fully mapped. Sparse residency reduction is
@@ -370,18 +441,25 @@ public:
         result = b.CreateInsertValue(result,b.CreateExtractValue(loaded,4),4);
       }
     }
+    if(iteration) {
+      auto *body=b.GetInsertBlock();
+      iteration->addIncoming(b.CreateAdd(iteration,b.getInt32(1)),body);
+      for(unsigned c=0;c<5;++c)accumulators[c]->addIncoming(b.CreateExtractValue(result,c),body);
+      b.CreateBr(loopHeader);b.SetInsertPoint(loopExit);result=loopResult;
+    }
+    auto *reducedExit=b.GetInsertBlock();
     b.CreateBr(after);
     // Keep PHIs scalar. The converter's AIR serializer cannot reliably encode
     // an aggregate sample-result PHI with a zero/undef constant incoming edge.
     std::vector<User *> users(call->user_begin(),call->user_end());
-    IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reduce->getTerminator()), outResult(empty->getTerminator());
+    IRBuilder<> nativeResult(normal->getTerminator()), reducedResult(reducedExit->getTerminator()), outResult(empty->getTerminator());
     IRBuilder<> merged(&*after->begin());
     Value *assembled = UndefValue::get(call->getType());
     for (unsigned c=0;c<5;++c) {
       auto *type = call->getType()->getStructElementType(c);
       auto *phi = PHINode::Create(type,4,"scorpi.sample.component",&*after->begin());
       phi->addIncoming(nativeResult.CreateExtractValue(call,c),normal);
-      phi->addIncoming(reducedResult.CreateExtractValue(result,c),reduce);
+      phi->addIncoming(reducedResult.CreateExtractValue(result,c),reducedExit);
       phi->addIncoming(Constant::getNullValue(type),missing);
       phi->addIncoming(outResult.CreateExtractValue(emptyResult,c),empty);
       assembled = merged.CreateInsertValue(assembled,phi,c);
