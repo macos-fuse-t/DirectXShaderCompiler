@@ -55,6 +55,23 @@ ResourceKind Kind(Value *handle, DxilModule &dm, std::set<Value *> &seen) {
   return result;
 }
 
+// Only derivatives need quad-uniform execution before the mode branch. Keep
+// dimensions, cube projection and anisotropic footprint algebra off the native
+// path; a regular hardware sample must not pay for its software fallback.
+std::vector<Instruction *> FootprintInstructions(Instruction *anchor, Instruction *end) {
+  std::vector<Instruction *> result;
+  for (auto *i = anchor->getNextNode(); i != end; i = i->getNextNode())
+    if (Opcode(i) != OpCode::DerivCoarseX && Opcode(i) != OpCode::DerivCoarseY)
+      result.push_back(i);
+  return result;
+}
+void SinkFootprint(const std::vector<Instruction *> &instructions, BasicBlock *destination) {
+  for (auto *i : instructions) {
+    i->removeFromParent();
+    destination->getInstList().push_back(i);
+  }
+}
+
 class Lowering {
   DxilModule &dm;
   const ScorpiTypedBufferBinding *bindings;
@@ -253,6 +270,7 @@ public:
     auto *resourceMinimum=Word(texture,4),*mapping=Word(texture,5);
     auto *low=Word(texture,2),*high=Word(texture,3);
     auto *fn=call->getParent()->getParent();auto *point=PointSampler(fn);
+    auto *footprintAnchor=call->getPrevNode();
     IRBuilder<> b(call);
     auto f=[&](double n){return ConstantFP::get(b.getFloatTy(),n);};
     auto unary=[&](OpCode op,Value *v){return Call(b,op,b.getFloatTy(),{v});};
@@ -293,6 +311,7 @@ public:
       lod=b.CreateFMul(unary(OpCode::Log,max(max(length[0],length[1]),f(1e-30))),f(.5));
       if(opcode==OpCode::SampleBias)lod=b.CreateFAdd(lod,call->getArgOperand(10));
     }
+    const auto footprint=FootprintInstructions(footprintAnchor,call);
     auto *before=call->getParent();auto *after=before->splitBasicBlock(call->getNextNode(),"scorpi.cube.end");
     auto *normal=BasicBlock::Create(call->getContext(),"scorpi.cube.native",fn,after);
     auto *reduce=BasicBlock::Create(call->getContext(),"scorpi.cube.reduce",fn,after);
@@ -308,6 +327,7 @@ public:
     auto *resMin=b.CreateBitCast(resourceMinimum,b.getFloatTy());Value *accessMin=resMin;
     if(opcode!=OpCode::SampleLevel){unsigned at=opcode==OpCode::SampleGrad?16:opcode==OpCode::SampleBias?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
     b.CreateCondBr(b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0))),reduce,normal);
+    SinkFootprint(footprint,reduce);
     b.SetInsertPoint(reduce);
     auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
     auto *empty=b.CreateFCmpOGT(accessMin,last);
@@ -386,6 +406,7 @@ public:
     auto *resourceMinimum = Word(texture, 4);
     auto *borderMapping = Word(texture, 5);
     auto *textureLow = Word(texture, 2), *textureHigh = Word(texture, 3);
+    auto *footprintAnchor = call->getPrevNode();
     const unsigned axes = kind == ResourceKind::Texture3D ? 3 : 2;
     Value *sourceLod = call->getArgOperand(10);
     Value *anisoSteps = nullptr, *anisoDirection[2] = {};
@@ -444,6 +465,7 @@ public:
       }
       if (opcode == OpCode::SampleBias) sourceLod = b.CreateFAdd(sourceLod,call->getArgOperand(10));
     }
+    const auto footprint = FootprintInstructions(footprintAnchor, call);
     auto *before = call->getParent();
     auto *fn = before->getParent();
     auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.sample.end");
@@ -490,6 +512,7 @@ public:
         pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
     pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
         pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0))),reduce,normal);
+    SinkFootprint(footprint, reduce);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
     auto unary = [&](OpCode op, Value *v) -> Value * { return Call(b, op, b.getFloatTy(), {v}); };
