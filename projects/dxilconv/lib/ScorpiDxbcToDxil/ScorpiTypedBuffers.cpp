@@ -10,6 +10,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/Scalar.h"
+#include <algorithm>
 #include <map>
 #include <functional>
 #include <set>
@@ -125,6 +126,7 @@ class Lowering {
   size_t count;
   uint32_t space, selfOffset, resourceID;
   bool minmaxFiltering;
+  bool nativeTextures;
   std::map<Function *, Value *> metadataHandles;
   std::map<Function *, Value *> pointHandles;
   uint32_t pointID = UINT32_MAX;
@@ -182,7 +184,8 @@ class Lowering {
 public:
   Lowering(DxilModule &module, const ScorpiTypedBufferBinding *ranges,
       size_t n, uint32_t s, uint32_t self, uint32_t options) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self),
-      minmaxFiltering(!(options & SCORPI_SHADER_NO_MINMAX_FILTERING)) {
+      minmaxFiltering(!(options & (SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_NATIVE_TEXTURES))),
+      nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES) {
     auto &ctx = dm.GetModule()->getContext();
     auto resource = std::make_unique<DxilResource>();
     resource->SetID(dm.GetSRVs().size()); resource->SetRW(false);
@@ -228,6 +231,13 @@ public:
       cls = binding.resourceClass; resourceSpace = binding.spaceID; lower = binding.rangeLowerBound;
       index = call->getArgOperand(2);
     } else throw std::runtime_error("unsupported typed-buffer binding (direct heaps require a separate ABI)");
+    // The selected native variant proves that all reachable SRV textures are
+    // non-sparse and have zero resource MinLOD. Carry that proof into accesses
+    // retained for instruction clamps or status consumers: otherwise their
+    // dead software filter bodies survive into the Metal compiler. Do not
+    // apply this to UAVs (not covered by the native SRV binding policy).
+    if (nativeTextures && cls == unsigned(ResourceClass::SRV) && (word == 0 || word == 4))
+      return words[key] = ConstantInt::get(Type::getInt32Ty(call->getContext()), 0);
     const ScorpiTypedBufferBinding *range = nullptr;
     for (size_t i = 0; i < count; ++i) {
       const auto &r = bindings[i];
@@ -757,22 +767,39 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   // Do not even generate fallback IR for proven ordinary bindings. A branch
   // around software sampling still bloats Metal compilation and register use.
   // Keep typed-buffer addressing adaptation independent of texture emulation.
-  bool instructionClamp = false;
-  for (const auto &sample : samples) {
+  auto instructionClamp = [](const std::pair<CallInst *, ResourceKind> &sample) {
     auto *call = sample.first;
     const auto op = Opcode(call);
     if (op != OpCode::Sample && op != OpCode::SampleBias &&
-        op != OpCode::SampleGrad && op != OpCode::SampleCmp) continue;
+        op != OpCode::SampleGrad && op != OpCode::SampleCmp) return false;
     const unsigned index = op == OpCode::SampleGrad ? 16 :
         (op == OpCode::SampleBias || op == OpCode::SampleCmp) ? 11 : 10;
     auto *clamp = call->getArgOperand(index);
     auto *constant = dyn_cast<ConstantFP>(clamp);
-    instructionClamp |= !isa<UndefValue>(clamp) && (!constant || !constant->isZero());
-  }
-  if ((options & SCORPI_SHADER_NATIVE_TEXTURES) && feedbackChecks.empty() && !instructionClamp) {
-    samples.clear();
-    textureLoads.clear();
-    if (calls.empty()) return false;
+    return !isa<UndefValue>(clamp) && (!constant || !constant->isZero());
+  };
+  auto feedbackUsed = [&](CallInst *call) {
+    if (feedbackChecks.empty()) return false;
+    for (auto *user : call->users()) {
+      auto *extract = dyn_cast<ExtractValueInst>(user);
+      // Aggregate users may propagate the status through PHIs or calls. Keep
+      // those conservative, but scalar color components need no feedback IR.
+      if (!extract) return true;
+      if (extract->getNumIndices() == 1 && *extract->idx_begin() == 4 &&
+          !extract->use_empty()) return true;
+    }
+    return false;
+  };
+  if (options & SCORPI_SHADER_NATIVE_TEXTURES) {
+    // A clamp belongs to one instruction, not the entire shader. Ordinary
+    // accesses remain untouched even when another sample needs emulation.
+    samples.erase(std::remove_if(samples.begin(), samples.end(),
+        [&](const std::pair<CallInst *, ResourceKind> &sample) {
+          return !instructionClamp(sample) && !feedbackUsed(sample.first);
+        }), samples.end());
+    textureLoads.erase(std::remove_if(textureLoads.begin(), textureLoads.end(),
+        [&](CallInst *call) { return !feedbackUsed(call); }), textureLoads.end());
+    if (calls.empty() && samples.empty() && textureLoads.empty() && feedbackChecks.empty()) return false;
   }
   if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)

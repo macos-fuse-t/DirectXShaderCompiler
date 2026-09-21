@@ -115,8 +115,12 @@ float4 main(float4 p:SV_Position):SV_Target {
         status = native(code, len(code), bindings, len(bindings), 99, 16, 1,
                         C.byref(output), C.byref(size), error, len(error))
         assert status == 0 and output.value and size.value, error.value
+        (folder / 'native-feedback.dxil').write_bytes(C.string_at(output, size.value))
+        native_ir = subprocess.check_output([dxc, '-dumpbin', str(folder / 'native-feedback.dxil')], text=True)
+        assert 'scorpi.tap.loop' not in native_ir, 'fully resident native sample acquired a software filter'
+        native_body = native_ir.split('define void @main()', 1)[1].split('\n}', 1)[0]
         lib.ScorpiFreeDxilBinary(output)
-        print('PASS', model, 'residency consumer retains compatibility lowering')
+        print('PASS', model, 'resident feedback uses native sampling, IR lines', len(native_body.splitlines()))
         # Explicit/dynamic instruction clamps need the bounded emulation path,
         # even with ordinary descriptors and no residency-status consumer.
         source = '''Texture2D<float4> t:register(t0); SamplerState s:register(s0);
@@ -132,3 +136,49 @@ float4 main(float4 p:SV_Position):SV_Target {
         assert status == 0 and output.value and size.value, error.value
         lib.ScorpiFreeDxilBinary(output)
         print('PASS', model, 'instruction clamp retains compatibility lowering')
+
+        # A clamp on t0 must not expand independent ordinary accesses to t1.
+        # Deliberately supply metadata only for t0: t1 stays entirely native.
+        for cube in (False, True):
+            for clamp in ('0.75', 'p.z'):
+                texture = 'TextureCube' if cube else 'Texture2D'
+                coord = 'float3(p.xy, 1)' if cube else 'p.xy'
+                source = (f'{texture}<float4> t:register(t0);\n'
+                          f'{texture}<float4> ordinary:register(t1);\n'
+                          'SamplerState s:register(s0);\n'
+                          'float4 main(float4 p:SV_Position):SV_Target {\n'
+                          f'float4 a=t.Sample(s,{coord},' +
+                          ('' if cube else 'int2(0,0),') + f'{clamp});\n'
+                          f'return a + ordinary.SampleLevel(s,{coord},0); }}\n')
+                (folder / 'input.hlsl').write_text(source)
+                subprocess.run([dxc, '-T', 'ps_' + model, '-E', 'main', '-Fo',
+                                str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
+                code = (folder / 'input.dxil').read_bytes()
+                status = native(code, len(code), bindings, len(bindings), 99, 16, 3,
+                                C.byref(output), C.byref(size), error, len(error))
+                assert status == 0 and output.value, error.value
+                (folder / 'mixed-clamp.dxil').write_bytes(C.string_at(output, size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                ir = subprocess.check_output([dxc, '-dumpbin', str(folder / 'mixed-clamp.dxil')], text=True)
+                assert not re.search(r'and i32 [^\n]*, (256|384)\b', ir)
+                assert 'scorpi.tap.loop' not in ir, 'native instruction clamp acquired a software filter'
+                assert not re.search(r'call.*@dx.op.unary.f32\(i32 (23|24)', ir), 'software footprint algebra survived native proof'
+                body = ir.split('define void @main()', 1)[1].split('\n}', 1)[0]
+                print('PASS', model, texture, clamp, 'clamp does not expand independent sample; IR lines', len(body.splitlines()))
+
+        # Likewise, consuming t0 residency must not expand t1 sampling/loads.
+        for operation in ('SampleLevel(s,p.xy,0)', 'Load(int3(p.xy,0))'):
+            source = '''Texture2D<float4> t:register(t0);
+Texture2D<float4> ordinary:register(t1); SamplerState s:register(s0);
+float4 main(float4 p:SV_Position):SV_Target {
+ uint status; float4 v=t.SampleLevel(s,p.xy,0,int2(0,0),status);
+ return (CheckAccessFullyMapped(status) ? v : 0) + ordinary.''' + operation + '; }'
+            (folder / 'input.hlsl').write_text(source)
+            subprocess.run([dxc, '-T', 'ps_' + model, '-E', 'main', '-Fo',
+                            str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
+            code = (folder / 'input.dxil').read_bytes()
+            status = native(code, len(code), bindings, len(bindings), 99, 16, 3,
+                            C.byref(output), C.byref(size), error, len(error))
+            assert status == 0 and output.value, error.value
+            lib.ScorpiFreeDxilBinary(output)
+            print('PASS', model, operation, 'residency consumer does not expand independent access')
