@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise production lowering; ordinary sampling retains a native branch."""
+"""Exercise production lowering and binding-proven, unmodified native sampling."""
 import ctypes as C
 from pathlib import Path
 import re
@@ -25,6 +25,8 @@ lower = lib.ScorpiLowerTypedBufferViews
 lower.argtypes = [C.c_void_p, C.c_size_t, C.POINTER(Binding), C.c_size_t,
                   C.c_uint32, C.c_uint32, C.POINTER(C.c_void_p),
                   C.POINTER(C.c_size_t), C.c_char_p, C.c_size_t]
+native = lib.ScorpiLowerTypedBufferViewsWithOptions
+native.argtypes = lower.argtypes[:6] + [C.c_uint32] + lower.argtypes[6:]
 lib.ScorpiFreeDxilBinary.argtypes = [C.c_void_p]
 bindings = (Binding * 2)(Binding(*(0, 0, 0, 1, 0, 0, 32)[:len(fields)]),
                          Binding(*(3, 0, 0, 1, 8, 0, 36)[:len(fields)]))
@@ -32,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
     folder = Path(folder)
     for model in ('6_0', '6_6'):
         for cube in (False, True):
-            operations = ['Sample', 'SampleLevel', 'SampleGrad']
+            operations = ['Sample', 'SampleLevel', 'SampleGrad', 'SampleBias']
             if '--comparison-gather' in sys.argv:
                 operations += ['SampleCmp', 'SampleCmpLevelZero', 'Gather', 'GatherCmp']
             for operation in operations:
@@ -46,6 +48,8 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                     # the instruction immediately follows the branch label.
                     coord = 'float3(.3,.4,1)' if cube else 'float2(.3,.4)'
                     extra = ', 0'
+                if operation == 'SampleBias':
+                    extra = ', .25'
                 branch = '[branch] if(p.x > 0) ' if operation == 'SampleLevel' else ''
                 fallback = 'return 0;' if branch else ''
                 source = (f'Texture{"Cube" if cube else "2D"}<float> t:register(t0);\n'
@@ -56,6 +60,11 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                                 str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
                 code = (folder / 'input.dxil').read_bytes()
                 output, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(4096)
+                # Pure texture shaders must be a true no-op: no metadata root,
+                # new branches, software loops, or even serialized replacement.
+                status = native(code, len(code), None, 0, 0xffffffff, 0, 1,
+                                C.byref(output), C.byref(size), error, len(error))
+                assert status == 0 and not output.value and size.value == 0, error.value
                 status = lower(code, len(code), bindings, len(bindings), 99, 16,
                                C.byref(output), C.byref(size), error, len(error))
                 assert status == 0, error.value
@@ -81,4 +90,36 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 # queries belonging to fallback footprints must not precede it.
                 assert not re.search(r'call.*@dx.op.unary.f32\(i32 (23|24)', entry), operation
                 print('PASS', model, 'cube' if cube else '2D', operation,
-                      'IR lines', len(body.splitlines()), 'DXIL bytes', size.value)
+                      'compat IR lines', len(body.splitlines()), 'DXIL bytes', size.value,
+                      'native original bytes', len(code), 'native added instructions 0')
+
+        # A binding hint must not suppress application-visible residency status.
+        source = '''Texture2D<float4> t:register(t0); SamplerState s:register(s0);
+float4 main(float4 p:SV_Position):SV_Target {
+ uint status; float4 v=t.SampleLevel(s,p.xy,0,int2(0,0),status);
+ return CheckAccessFullyMapped(status) ? v : 0;
+}'''
+        (folder / 'input.hlsl').write_text(source)
+        subprocess.run([dxc, '-T', 'ps_' + model, '-E', 'main', '-Fo',
+                        str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
+        code = (folder / 'input.dxil').read_bytes()
+        status = native(code, len(code), bindings, len(bindings), 99, 16, 1,
+                        C.byref(output), C.byref(size), error, len(error))
+        assert status == 0 and output.value and size.value, error.value
+        lib.ScorpiFreeDxilBinary(output)
+        print('PASS', model, 'residency consumer retains compatibility lowering')
+        # Explicit/dynamic instruction clamps need the bounded emulation path,
+        # even with ordinary descriptors and no residency-status consumer.
+        source = '''Texture2D<float4> t:register(t0); SamplerState s:register(s0);
+float4 main(float4 p:SV_Position):SV_Target {
+ return t.Sample(s,p.xy,int2(0,0),p.z);
+}'''
+        (folder / 'input.hlsl').write_text(source)
+        subprocess.run([dxc, '-T', 'ps_' + model, '-E', 'main', '-Fo',
+                        str(folder / 'input.dxil'), str(folder / 'input.hlsl')], check=True)
+        code = (folder / 'input.dxil').read_bytes()
+        status = native(code, len(code), bindings, len(bindings), 99, 16, 1,
+                        C.byref(output), C.byref(size), error, len(error))
+        assert status == 0 and output.value and size.value, error.value
+        lib.ScorpiFreeDxilBinary(output)
+        print('PASS', model, 'instruction clamp retains compatibility lowering')

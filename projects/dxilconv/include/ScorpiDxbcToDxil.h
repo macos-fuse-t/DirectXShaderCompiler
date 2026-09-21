@@ -222,6 +222,16 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
     uint32_t metadata_space, uint32_t self_offset,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 
+// The caller has proved all sampled bindings are ordinary, fully backed views
+// with no resource MinLOD. Keep native texture operations unchanged. Shaders
+// consuming residency status still use the compatibility path.
+#define SCORPI_SHADER_NATIVE_TEXTURES 1u
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t size,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    uint32_t metadata_space, uint32_t self_offset, uint32_t options,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
 // One output-signature row and its location in the capture payload. This is
 // logical shader metadata, independent of any backend's stream-output encoding.
 typedef struct ScorpiGeometryCaptureElement {

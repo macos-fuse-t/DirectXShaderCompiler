@@ -726,7 +726,7 @@ public:
 }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
-    size_t count, uint32_t space, uint32_t selfOffset) {
+    size_t count, uint32_t space, uint32_t selfOffset, uint32_t options) {
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -751,6 +751,26 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         op != OpCode::AtomicBinOp && op != OpCode::AtomicCompareExchange) continue;
     std::set<Value *> seen;
     if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::TypedBuffer) calls.push_back(call);
+  }
+  // Do not even generate fallback IR for proven ordinary bindings. A branch
+  // around software sampling still bloats Metal compilation and register use.
+  // Keep typed-buffer addressing adaptation independent of texture emulation.
+  bool instructionClamp = false;
+  for (const auto &sample : samples) {
+    auto *call = sample.first;
+    const auto op = Opcode(call);
+    if (op != OpCode::Sample && op != OpCode::SampleBias &&
+        op != OpCode::SampleGrad && op != OpCode::SampleCmp) continue;
+    const unsigned index = op == OpCode::SampleGrad ? 16 :
+        (op == OpCode::SampleBias || op == OpCode::SampleCmp) ? 11 : 10;
+    auto *clamp = call->getArgOperand(index);
+    auto *constant = dyn_cast<ConstantFP>(clamp);
+    instructionClamp |= !isa<UndefValue>(clamp) && (!constant || !constant->isZero());
+  }
+  if ((options & SCORPI_SHADER_NATIVE_TEXTURES) && feedbackChecks.empty() && !instructionClamp) {
+    samples.clear();
+    textureLoads.clear();
+    if (calls.empty()) return false;
   }
   if (calls.empty() && samples.empty() && textureLoads.empty()) return false;
   if (!bindings || !count || space == UINT32_MAX)
