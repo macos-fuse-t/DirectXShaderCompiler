@@ -69,9 +69,16 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 # Both paths survive optimization. In particular a comparison
                 # or gather must not unconditionally enter software filtering.
                 assert prefix + '.native' in body, (model, cube, operation)
-                assert prefix + '.reduce' in body, (model, cube, operation)
+                # Gather without a feedback consumer may eliminate the entire
+                # software status loop; it must still retain its native sample.
+                if not operation.startswith('Gather'):
+                    assert prefix + '.reduce' in body, (model, cube, operation)
+                    assert 'scorpi.tap.loop' in body, (model, cube, operation)
+                    assert 'llvm.loop.unroll.disable' in ir
+                    assert len(body.splitlines()) < (2600 if cube else 1400), (model, cube, operation)
                 entry = re.split(r'^[-a-zA-Z0-9_.]+:', body, flags=re.M)[0]
                 # Derivative ops 83/84 stay quad-uniform; sqrt/log and dimension
                 # queries belonging to fallback footprints must not precede it.
                 assert not re.search(r'call.*@dx.op.unary.f32\(i32 (23|24)', entry), operation
-                print('PASS', model, 'cube' if cube else '2D', operation)
+                print('PASS', model, 'cube' if cube else '2D', operation,
+                      'IR lines', len(body.splitlines()), 'DXIL bytes', size.value)

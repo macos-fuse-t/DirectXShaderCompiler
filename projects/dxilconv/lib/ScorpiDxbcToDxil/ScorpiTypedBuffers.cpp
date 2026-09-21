@@ -75,6 +75,50 @@ void SinkFootprint(const std::vector<Instruction *> &instructions, BasicBlock *d
   }
 }
 
+// Keep a single copy of the expensive addressing/residency/seam machinery per
+// mip. Emitting it once per tap balloons ordinary shaders even when runtime
+// descriptors select the native path. Scalar PHIs also avoid AIR aggregate-PHI
+// serialization limitations. The loop preserves the original accumulation order.
+class SampleTapLoop {
+  BasicBlock *body, *exit;
+  PHINode *values[5];
+  unsigned count;
+public:
+  PHINode *index;
+  SampleTapLoop(IRBuilder<> &b, Value *&result, unsigned taps, BasicBlock *after)
+      : count(taps) {
+    auto *before = b.GetInsertBlock();
+    body = BasicBlock::Create(before->getContext(), "scorpi.tap.loop", before->getParent(), after);
+    exit = BasicBlock::Create(before->getContext(), "scorpi.tap.end", before->getParent(), after);
+    Value *initial[5];
+    for (unsigned c = 0; c < 5; ++c)
+      initial[c] = isa<UndefValue>(result) ?
+          (c == 4 ? static_cast<Value *>(b.getInt32(1)) : Constant::getNullValue(result->getType()->getStructElementType(c))) :
+          b.CreateExtractValue(result, c);
+    b.CreateBr(body); b.SetInsertPoint(body);
+    index = b.CreatePHI(b.getInt32Ty(), 2, "scorpi.tap.index");
+    index->addIncoming(b.getInt32(0), before);
+    for (unsigned c = 0; c < 5; ++c) {
+      values[c] = b.CreatePHI(initial[c]->getType(), 2, "scorpi.tap.value");
+      values[c]->addIncoming(initial[c], before);
+    }
+    for (unsigned c = 0; c < 5; ++c) result = b.CreateInsertValue(result, values[c], c);
+  }
+  void End(IRBuilder<> &b, Value *result) {
+    auto *latch = b.GetInsertBlock();
+    auto *next = b.CreateAdd(index, b.getInt32(1));
+    index->addIncoming(next, latch);
+    for (unsigned c = 0; c < 5; ++c) values[c]->addIncoming(b.CreateExtractValue(result, c), latch);
+    auto *branch = b.CreateCondBr(b.CreateICmpULT(next, b.getInt32(count)), body, exit);
+    auto &context = branch->getContext();
+    auto *disable = MDNode::get(context, MDString::get(context, "llvm.loop.unroll.disable"));
+    auto *loop = MDNode::get(context, {nullptr, disable});
+    loop->replaceOperandWith(0, loop);
+    branch->setMetadata("llvm.loop", loop);
+    b.SetInsertPoint(exit);
+  }
+};
+
 class Lowering {
   DxilModule &dm;
   const ScorpiTypedBufferBinding *bindings;
@@ -363,12 +407,14 @@ public:
         if(kind==ResourceKind::TextureCubeArray){auto *lastCube=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,2),b.getInt32(1)),b.getFloatTy());auto *cube=b.CreateFPToUI(min(max(unary(OpCode::Round_ne,layer),f(0)),lastCube),b.getInt32Ty());slice=b.CreateAdd(slice,b.CreateMul(cube,b.getInt32(6)));}
         return b.CreateInsertValue(value,b.CreateZExt(TextureResident(b,texture,level,indices[0],indices[1],slice),b.getInt32Ty()),4);
       };
-      for(unsigned tap=0;tap<4;++tap){
+      {
+        SampleTapLoop taps(b,result,4,after);
+        auto *tap=taps.index;
         Value *index[2],*outside[2],*st[2],*sign[2];Value *weight=m?static_cast<Value*>(mf):b.CreateFSub(f(1),mf);
-        for(unsigned a=0;a<2;++a){bool highTap=tap&(1u<<a);index[a]=b.CreateFAdd(start[a],f(highTap?1:0));outside[a]=b.CreateOr(b.CreateFCmpOLT(index[a],f(0)),b.CreateFCmpOGE(index[a],n));
+        for(unsigned a=0;a<2;++a){auto *highTap=b.CreateICmpNE(b.CreateAnd(tap,b.getInt32(1u<<a)),b.getInt32(0));index[a]=b.CreateFAdd(start[a],b.CreateSelect(highTap,f(1),f(0)));outside[a]=b.CreateOr(b.CreateFCmpOLT(index[a],f(0)),b.CreateFCmpOGE(index[a],n));
           sign[a]=b.CreateSelect(b.CreateFCmpOLT(index[a],f(0)),f(-1),f(1));
           st[a]=b.CreateSelect(outside[a],sign[a],b.CreateFSub(b.CreateFDiv(b.CreateFMul(b.CreateFAdd(index[a],f(.5)),f(2)),n),f(1)));
-          weight=b.CreateFMul(weight,highTap?fraction[a]:b.CreateFSub(f(1),fraction[a]));}
+          weight=b.CreateFMul(weight,b.CreateSelect(highTap,fraction[a],b.CreateFSub(f(1),fraction[a])));}
         auto *active=b.CreateFCmpOGT(weight,f(0));auto *corner=b.CreateAnd(outside[0],outside[1]);
         Value *edge[3],*nx[3],*ny[3];direction(face,st[0],st[1],edge);
         for(unsigned a=0;a<3;++a){nx[a]=b.CreateFMul(sign[0],basisValue(face,1,a));ny[a]=b.CreateFMul(sign[1],basisValue(face,2,a));}
@@ -379,20 +425,23 @@ public:
           auto *cornerValue=b.CreateSelect(ordinary,b.CreateFDiv(b.CreateFAdd(value,b.CreateFAdd(xc,yc)),f(3)),combine(value,combine(xc,yc)));
           value=b.CreateSelect(corner,cornerValue,value);
           auto *weighted=b.CreateFMul(value,weight);
-          if(m||tap){auto *old=b.CreateExtractValue(result,c);value=b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);}
-          else value=b.CreateSelect(ordinary,weighted,value);
+          auto *first=b.CreateSelect(ordinary,weighted,value);
+          auto *old=b.CreateExtractValue(result,c);value=b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);
+          if(!m)value=b.CreateSelect(b.CreateICmpEQ(tap,b.getInt32(0)),first,value);
           result=b.CreateInsertValue(result,value,c);
         }
         auto *resident=b.CreateAnd(b.CreateExtractValue(v,4),b.CreateSelect(corner,b.CreateAnd(b.CreateExtractValue(x,4),b.CreateExtractValue(y,4)),b.getInt32(1)));
-        auto *old=(m||tap)?b.CreateExtractValue(result,4):static_cast<Value*>(b.getInt32(1));
+        auto *old=b.CreateExtractValue(result,4);
         result=b.CreateInsertValue(result,b.CreateAnd(old,b.CreateSelect(active,resident,b.getInt32(1))),4);
+        taps.End(b,result);
       }
     }
     for(unsigned c=0;c<4;++c){auto *selector=b.CreateAnd(b.CreateLShr(mapping,b.getInt32(c*3)),b.getInt32(7));auto *defaultValue=b.CreateSelect(b.CreateICmpEQ(selector,b.getInt32(5)),f(1),f(0));result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
+    auto *reducedExit=b.GetInsertBlock();
     b.CreateBr(after);
-    b.SetInsertPoint(reduce->getTerminator());
+    b.SetInsertPoint(reducedExit->getTerminator());
     std::vector<User*> users(call->user_begin(),call->user_end());IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
-    for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());phi->addIncoming(c==4?normalResult.getInt32(1):normalResult.CreateExtractValue(call,c),normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reduce);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
+    for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());phi->addIncoming(c==4?normalResult.getInt32(1):normalResult.CreateExtractValue(call,c),normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reducedExit);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
     for(auto *user:users)user->replaceUsesOfWith(call,assembled);
   }
 
@@ -579,17 +628,19 @@ public:
           start[axis] = b.CreateAdd(start[axis], call->getArgOperand(7+axis));
         upper[axis] = b.CreateAnd(linear, b.CreateFCmpONE(coord, floor));
       }
-      for (unsigned tap = 0; tap < (1u << axes); ++tap) {
+      {
+        SampleTapLoop taps(b,result,1u << axes,after);
+        auto *tap=taps.index;
         Value *active = mip == 0 ? b.getTrue() : useMip1;
         Value *weight = mip == 0 ? b.CreateFSub(f(1),mipFraction) : mipFraction;
         if(anisoSteps)weight=b.CreateFDiv(weight,b.CreateUIToFP(anisoSteps,b.getFloatTy()));
         Value *outside = b.getFalse();
         Value *coords[3] = {UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty()),UndefValue::get(b.getInt32Ty())};
         for (unsigned axis = 0; axis < axes; ++axis) {
-          const bool high = (tap & (1u << axis)) != 0;
-          weight = b.CreateFMul(weight,high ? fraction[axis] : b.CreateFSub(f(1),fraction[axis]));
-          if (high) active = b.CreateAnd(active, upper[axis]);
-          auto *index = high ? b.CreateAdd(start[axis], b.getInt32(1)) : start[axis];
+          auto *high = b.CreateICmpNE(b.CreateAnd(tap,b.getInt32(1u << axis)),b.getInt32(0));
+          weight = b.CreateFMul(weight,b.CreateSelect(high,fraction[axis],b.CreateFSub(f(1),fraction[axis])));
+          active = b.CreateAnd(active, b.CreateOr(b.CreateNot(high),upper[axis]));
+          auto *index = b.CreateAdd(start[axis],b.CreateZExt(high,b.getInt32Ty()));
           auto *n = length[axis];
           auto *last = b.CreateSub(n,b.getInt32(1));
           auto clamp = [&](Value *v) -> Value * {
@@ -629,24 +680,21 @@ public:
               ConstantFP::get(elementType,1),ConstantFP::get(elementType,0));
           auto *value = b.CreateSelect(outside,borderValue,b.CreateExtractValue(loaded,c));
           auto *weighted = b.CreateFMul(value,b.CreateFPCast(weight,elementType));
-          if (mip || tap) {
-            auto *old = b.CreateExtractValue(result,c);
-            value = b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);
-          } else {
-            auto *first=b.CreateSelect(ordinary,weighted,value);
-            if(iteration) {
-              auto *old=b.CreateExtractValue(result,c);
-              first=b.CreateSelect(b.CreateICmpEQ(iteration,b.getInt32(0)),first,
-                  b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)));
-            }
-            value=first;
+          auto *first=b.CreateSelect(ordinary,weighted,value);
+          auto *old=b.CreateExtractValue(result,c);
+          value=b.CreateSelect(active,b.CreateSelect(ordinary,b.CreateFAdd(old,weighted),combine(old,value)),old);
+          if (!mip) {
+            Value *initial=b.CreateICmpEQ(tap,b.getInt32(0));
+            if(iteration) initial=b.CreateAnd(initial,b.CreateICmpEQ(iteration,b.getInt32(0)));
+            value=b.CreateSelect(initial,first,value);
           }
           result = b.CreateInsertValue(result,value,c);
         }
         auto *resident=TextureResident(b,texture,level,coords[0],coords[1],array?coords[2]:b.getInt32(0));
         auto *contributes=b.CreateAnd(active,b.CreateNot(outside));
-        Value *old=(iteration || mip || tap)?b.CreateExtractValue(result,4):static_cast<Value*>(b.getInt32(1));
+        Value *old=b.CreateExtractValue(result,4);
         result=b.CreateInsertValue(result,b.CreateAnd(old,b.CreateZExt(b.CreateOr(b.CreateNot(contributes),resident),b.getInt32Ty())),4);
+        taps.End(b,result);
       }
     }
     if(iteration) {
