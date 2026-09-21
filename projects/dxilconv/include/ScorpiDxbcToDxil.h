@@ -216,6 +216,15 @@ typedef struct ScorpiTypedBufferBinding {
   uint32_t resource_class, space, base_register, count;
   uint32_t root_offset, table_offset;
 } ScorpiTypedBufferBinding;
+// Reflection only: declared reachable SRV/sampler register ranges. No rewriting.
+// Set bindings=nullptr to query the count; count is input capacity on fill.
+typedef struct ScorpiSamplingBinding {
+  uint32_t resource_class, space, base_register, count;
+} ScorpiSamplingBinding;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectSamplingBindings(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiSamplingBinding *bindings, size_t *count);
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerTypedBufferViews(const void *code, size_t size,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,
@@ -226,6 +235,9 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
 // with no resource MinLOD. Keep native texture operations unchanged. Shaders
 // consuming residency status still use the compatibility path.
 #define SCORPI_SHADER_NATIVE_TEXTURES 1u
+// No reachable bound sampler uses reduction filtering. Do not emit min/max
+// reduction even when another requirement (clamps/residency) needs lowering.
+#define SCORPI_SHADER_NO_MINMAX_FILTERING 2u
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t size,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,

@@ -62,9 +62,18 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 output, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(4096)
                 # Pure texture shaders must be a true no-op: no metadata root,
                 # new branches, software loops, or even serialized replacement.
-                status = native(code, len(code), None, 0, 0xffffffff, 0, 1,
-                                C.byref(output), C.byref(size), error, len(error))
-                assert status == 0 and not output.value and size.value == 0, error.value
+                for policy in (1, 3):
+                    status = native(code, len(code), None, 0, 0xffffffff, 0, policy,
+                                    C.byref(output), C.byref(size), error, len(error))
+                    assert status == 0 and not output.value and size.value == 0, error.value
+                if operation == 'SampleLevel':
+                    status = native(code, len(code), bindings, len(bindings), 99, 16, 2,
+                                    C.byref(output), C.byref(size), error, len(error))
+                    assert status == 0 and output.value, error.value
+                    (folder / 'no-minmax.dxil').write_bytes(C.string_at(output, size.value))
+                    lib.ScorpiFreeDxilBinary(output)
+                    no_minmax = subprocess.check_output([dxc, '-dumpbin', str(folder / 'no-minmax.dxil')], text=True)
+                    assert not re.search(r'and i32 [^\n]*, (256|384)\b', no_minmax), 'min/max discriminator survived opt-out'
                 status = lower(code, len(code), bindings, len(bindings), 99, 16,
                                C.byref(output), C.byref(size), error, len(error))
                 assert status == 0, error.value

@@ -731,13 +731,44 @@ extern "C" int ScorpiLowerTypedBufferViews(const void *code, size_t size,
       metadata_space, self_offset, 0, binary, binary_size, error, error_size);
 }
 
+extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, ScorpiSamplingBinding *bindings, size_t *count) {
+  if (!code || !size || !count) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "sampling-reflection", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    std::vector<ScorpiSamplingBinding> ranges;
+    for (const auto &r : dm->GetSRVs())
+      ranges.push_back({0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+    for (const auto &r : dm->GetSamplers())
+      ranges.push_back({3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+    const auto capacity = *count;
+    *count = ranges.size();
+    if (bindings) {
+      if (capacity < ranges.size()) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+      std::copy(ranges.begin(), ranges.end(), bindings);
+    }
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
 extern "C" int ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t size,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,
     uint32_t metadata_space, uint32_t self_offset, uint32_t options,
     void **binary, size_t *binary_size, char *error, size_t error_size) {
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
-      (options & ~SCORPI_SHADER_NATIVE_TEXTURES))
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {

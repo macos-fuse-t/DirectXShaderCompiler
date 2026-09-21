@@ -124,6 +124,7 @@ class Lowering {
   const ScorpiTypedBufferBinding *bindings;
   size_t count;
   uint32_t space, selfOffset, resourceID;
+  bool minmaxFiltering;
   std::map<Function *, Value *> metadataHandles;
   std::map<Function *, Value *> pointHandles;
   uint32_t pointID = UINT32_MAX;
@@ -180,7 +181,8 @@ class Lowering {
   }
 public:
   Lowering(DxilModule &module, const ScorpiTypedBufferBinding *ranges,
-      size_t n, uint32_t s, uint32_t self) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self) {
+      size_t n, uint32_t s, uint32_t self, uint32_t options) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self),
+      minmaxFiltering(!(options & SCORPI_SHADER_NO_MINMAX_FILTERING)) {
     auto &ctx = dm.GetModule()->getContext();
     auto resource = std::make_unique<DxilResource>();
     resource->SetID(dm.GetSRVs().size()); resource->SetRW(false);
@@ -370,10 +372,10 @@ public:
     b.SetInsertPoint(missing);b.CreateBr(after);
     b.SetInsertPoint(normal);b.CreateBr(after);
     b.SetInsertPoint(present);
-    auto *ordinary=b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0));
+    auto *ordinary=!minmaxFiltering ? b.getTrue() : b.CreateICmpEQ(b.CreateAnd(state,b.getInt32(0x180)),b.getInt32(0));
     auto *resMin=b.CreateBitCast(resourceMinimum,b.getFloatTy());Value *accessMin=resMin;
     if(opcode!=OpCode::SampleLevel){unsigned at=opcode==OpCode::SampleGrad?16:opcode==OpCode::SampleBias?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
-    b.CreateCondBr(b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0))),reduce,normal);
+    b.CreateCondBr(b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),(minmaxFiltering ? b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0)) : b.getFalse())),reduce,normal);
     SinkFootprint(footprint,reduce);
     b.SetInsertPoint(reduce);
     auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
@@ -556,14 +558,14 @@ public:
          out.getInt32(0),out.getInt32(0),out.getInt32(0)});
     out.CreateBr(after);
     pre.SetInsertPoint(bounded);
-    auto *ordinary = pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
+    auto *ordinary = !minmaxFiltering ? pre.getTrue() : pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
     // The converter ignores resource MinLOD for SampleLevel. Use the same
     // footprint machinery with weighted taps for clamped sampling.
     // Unclamped ordinary sampling, including its native precision, is intact.
     auto *clampedOrdinary = pre.CreateAnd(ordinary,pre.CreateOr(pre.CreateICmpNE(Word(texture,0),pre.getInt32(0)),
         pre.CreateFCmpOGT(pre.CreateBitCast(resourceMinimum,pre.getFloatTy()),ConstantFP::get(pre.getFloatTy(),0))));
     pre.CreateCondBr(pre.CreateOr(clampedOrdinary,
-        pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0))),reduce,normal);
+        (minmaxFiltering ? pre.CreateICmpNE(pre.CreateAnd(state,pre.getInt32(0x100)),pre.getInt32(0)) : pre.getFalse())),reduce,normal);
     SinkFootprint(footprint, reduce);
     IRBuilder<> b(reduce);
     auto f = [&](double n) { return ConstantFP::get(b.getFloatTy(), n); };
@@ -793,7 +795,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     };
     if(supported(check->getArgOperand(1))){IRBuilder<> b(check);check->replaceAllUsesWith(b.CreateICmpNE(check->getArgOperand(1),b.getInt32(0)));check->eraseFromParent();}
   }
-  Lowering lowering(dm, bindings, count, space, selfOffset);
+  Lowering lowering(dm, bindings, count, space, selfOffset, options);
   for (auto *call : calls) lowering.Rewrite(call);
   for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
   for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
