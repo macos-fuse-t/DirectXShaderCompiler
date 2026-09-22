@@ -226,6 +226,15 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectSamplingBindings(const void *code, size_t size,
     const void *metadata, size_t metadata_size,
     ScorpiSamplingBinding *bindings, size_t *count);
+// Read-only input signature reflection, including raw DXIL programs without
+// an ISG1 container part. No optimization, rewriting or serialization occurs.
+typedef struct ScorpiVertexInput {
+  uint32_t register_index, semantic_index;
+  char name[64];
+} ScorpiVertexInput;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectVertexInputs(const void *code, size_t size,
+    ScorpiVertexInput *inputs, size_t *count, char *error, size_t error_size);
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerTypedBufferViews(const void *code, size_t size,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,

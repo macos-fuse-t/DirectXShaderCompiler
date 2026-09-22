@@ -731,6 +731,57 @@ extern "C" int ScorpiLowerTypedBufferViews(const void *code, size_t size,
       metadata_space, self_offset, 0, binary, binary_size, error, error_size);
 }
 
+extern "C" int ScorpiInspectVertexInputs(const void *code, size_t size,
+    ScorpiVertexInput *inputs, size_t *count, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!code || !size || !count) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  try {
+    EnsureDxcStaticRuntimeInitialized();
+    DxcMallocScope malloc_scope;
+    auto normalized = NormalizeExistingDxil(code, size);
+    if (normalized.empty()) throw std::runtime_error("expected DXIL program or container");
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing DXIL program");
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "vertex-input-reflection", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid DXIL bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm || !dm->GetShaderModel()->IsVS()) throw std::runtime_error("expected vertex shader");
+    std::vector<ScorpiVertexInput> reflected;
+    for (const auto &element : dm->GetInputSignature().GetElements()) {
+      if (element->GetStartRow() < 0) continue; // hardware-generated input
+      const auto &indices = element->GetSemanticIndexVec();
+      for (unsigned row = 0; row < element->GetRows(); ++row) {
+        if (row >= indices.size()) throw std::runtime_error("missing input semantic index");
+        ScorpiVertexInput input{};
+        input.register_index = element->GetStartRow() + row;
+        input.semantic_index = indices[row];
+        const char *name = element->GetName();
+        if (!name || std::strlen(name) >= sizeof(input.name))
+          throw std::runtime_error("input semantic name too long");
+        std::strcpy(input.name, name);
+        reflected.push_back(input);
+      }
+    }
+    const size_t capacity = *count;
+    *count = reflected.size();
+    if (inputs) {
+      if (capacity < reflected.size()) throw std::runtime_error("input reflection capacity exceeded");
+      std::copy(reflected.begin(), reflected.end(), inputs);
+    }
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what());
+    return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+  } catch (...) {
+    SetError(error, error_size, "unexpected vertex reflection exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
     const void *metadata, size_t metadata_size, ScorpiSamplingBinding *bindings, size_t *count) {
   if (!code || !size || !count) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
