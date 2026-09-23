@@ -264,7 +264,8 @@ bool PrepareMsaa8TextureLoads(hlsl::DxilModule &dm, std::string &error,
 bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                                     uint32_t registerSpace,
                                     uint32_t sampleCount, uint32_t sampleMask,
-                                    std::string &error, bool generated, bool attachments, bool alphaToCoverage) {
+                                    std::string &error, bool generated, bool attachments, bool alphaToCoverage,
+                                    uint32_t *requirements) {
   using namespace llvm;
   using namespace hlsl;
   auto fail = [&](const char *why) {
@@ -306,8 +307,16 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   auto *entry = dm.GetEntryFunction();
   std::vector<CallInst *> originalCalls;
   bool sampleFrequency = false;
-  for (const auto &e : dm.GetInputSignature().GetElements())
+  // No UAVs (including reads) or bindless heaps: batching groups may reorder
+  // otherwise observable effects. Ordinary attachment blending stays ordered
+  // independently within each physical sample group.
+  bool nativeCoverage = attachments && requirements && dm.GetUAVs().empty() &&
+      !dm.m_ShaderFlags.GetResourceDescriptorHeapIndexing();
+  for (const auto &e : dm.GetInputSignature().GetElements()) {
     sampleFrequency |= e->GetInterpolationMode()->IsAnySample();
+    nativeCoverage &= !e->GetInterpolationMode()->IsAnyCentroid() &&
+        e->GetKind() != DXIL::SemanticKind::Coverage;
+  }
   for (auto &block : *entry)
     for (auto &inst : block) {
       auto *call = dyn_cast<CallInst>(&inst);
@@ -327,6 +336,8 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
         return fail("raster replay encountered a nonconstant DXIL opcode");
       auto op = static_cast<OpCode>(opcode->getZExtValue());
       sampleFrequency |= op == OpCode::SampleIndex;
+      nativeCoverage &= op != OpCode::Coverage && op != OpCode::InnerCoverage &&
+          op != OpCode::EvalCentroid && !IsWrite(op);
       originalCalls.push_back(call);
     }
 
@@ -442,7 +453,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     positionID = dm.GetInputSignature().AppendElement(std::move(position));
     ++nextRow;
   }
-  if (generated) {
+  if (generated || nativeCoverage) {
     if (rasterPrimitiveID == UINT32_MAX) {
       auto element = std::make_unique<DxilSignatureElement>(DXIL::SigPointKind::PSIn);
       element->Initialize("SV_PrimitiveID", CompType::getU32(), DXIL::InterpolationMode::Constant,
@@ -452,11 +463,13 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     }
     auto *rasterID = opCall(OpCode::LoadInput, i32,
         {b.getInt32(rasterPrimitiveID), b.getInt32(0), b.getInt8(0), UndefValue::get(i32)});
-    baseElement = b.CreateAdd(baseElement, b.CreateMul(rasterID, b.CreateMul(width, height)));
-    auto *record = b.CreateAdd(b.CreateExtractValue(origin, 3), b.CreateMul(rasterID, b.getInt32(16)));
-    auto *loadedID = opCall(OpCode::BufferLoad, i32,
-        {handle(DXIL::ResourceClass::UAV, captureID), b.CreateAdd(record, b.getInt32(12)), UndefValue::get(i32)});
-    primitiveID = b.CreateExtractValue(loadedID, 0);
+    if (generated) {
+      baseElement = b.CreateAdd(baseElement, b.CreateMul(rasterID, b.CreateMul(width, height)));
+      auto *record = b.CreateAdd(b.CreateExtractValue(origin, 3), b.CreateMul(rasterID, b.getInt32(16)));
+      auto *loadedID = opCall(OpCode::BufferLoad, i32,
+          {handle(DXIL::ResourceClass::UAV, captureID), b.CreateAdd(record, b.getInt32(12)), UndefValue::get(i32)});
+      primitiveID = b.CreateExtractValue(loadedID, 0);
+    } else primitiveID = b.CreateAdd(primitiveID, rasterID);
   }
   auto coordinate = [&](unsigned component) {
     return b.CreateFPToSI(opCall(OpCode::LoadInput, f32,
@@ -473,10 +486,12 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   // Helper lanes outside the viewport read a safe element and remain inactive.
   auto *address = b.CreateMul(b.CreateSelect(inBounds, element, baseElement),
                               b.getInt32(4));
-  auto *loaded = opCall(OpCode::BufferLoad, i32,
-                        {coverageHandle, address, UndefValue::get(i32)});
-  auto *coverage =
-      b.CreateSelect(inBounds, b.CreateExtractValue(loaded, 0), b.getInt32(0));
+  Value *coverage = b.getInt32(255);
+  if (!nativeCoverage) {
+    auto *loaded = opCall(OpCode::BufferLoad, i32,
+                          {coverageHandle, address, UndefValue::get(i32)});
+    coverage = b.CreateSelect(inBounds, b.CreateExtractValue(loaded, 0), b.getInt32(0));
+  }
   auto *maskedCoverage = b.CreateAnd(coverage, b.getInt32(sampleMask));
   // Attachment queries use native visibility slots. Pure pixel-frequency
   // shaders must stay pixel-frequency (in particular SV_Position stays at
@@ -705,6 +720,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   }
   if (verifyModule(*module))
     return fail("raster replay produced invalid LLVM IR");
+  if (requirements) *requirements = nativeCoverage ? 0 : SCORPI_MSAA8_REPLAY_COVERAGE;
   return true;
 }
 } // namespace scorpi
