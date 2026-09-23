@@ -592,7 +592,7 @@ extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
 static int CreateRasterReplayShader(
     const void *code, size_t size, uint32_t register_space,
     uint32_t sample_count, uint32_t sample_mask, void **binary,
-    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false) {
+    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false, bool attachments = false) {
   SetError(error_message, error_message_size, "");
   if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr;
@@ -615,7 +615,7 @@ static int CreateRasterReplayShader(
     std::string error;
     if (!dxil || !(geometry_link ? scorpi::LowerGeometryPrimitiveId(*dxil, error)
         : vertex ? scorpi::PrepareRasterReplayVertexShader(*dxil, register_space, error)
-        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated)))
+        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated, attachments)))
       throw std::runtime_error(error.empty() ? "missing DXIL module" : error);
     // The replay transforms change signatures. Serialized ViewID state still
     // describes the source signature and cannot be reused for the new PSV.
@@ -663,6 +663,13 @@ extern "C" int ScorpiCreateRasterReplayVertexShader(
     size_t *binary_size, char *error, size_t error_size) {
   return CreateRasterReplayShader(code, size, space, 0, 0, binary,
       binary_size, error, error_size, true);
+}
+
+extern "C" int ScorpiCreateMsaa8PixelShader(
+    const void *code, size_t size, uint32_t space, uint32_t mask, int generated,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return CreateRasterReplayShader(code, size, space, 8, mask, binary,
+      binary_size, error, error_size, false, generated != 0, false, true);
 }
 
 extern "C" int ScorpiCreateGeneratedRasterReplayPixelShader(
@@ -887,8 +894,14 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
 
 extern "C" int ScorpiPromoteTexture1D(const void *code, size_t size,
     void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return ScorpiLowerTextureLayouts(code,size,0,nullptr,0,binary,binary_size,error,error_size);
+}
+
+extern "C" int ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
+    const ScorpiSamplingRequirement *policy, size_t policy_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
   SetError(error, error_size, "");
-  if (!binary || !binary_size || !code || !size)
+  if (!binary || !binary_size || !code || !size || (policy_count && !policy))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {
@@ -912,6 +925,10 @@ extern "C" int ScorpiPromoteTexture1D(const void *code, size_t size,
           kind == TextureKind::Texture1DArray ? TextureKind::Texture2DArray : kind;
     };
     bool changed = false;
+    if (split_msaa8) {
+      std::string message;
+      if (!scorpi::PrepareMsaa8TextureLoads(*dm,message,changed,policy,policy_count)) throw std::runtime_error(message);
+    }
     for (const auto &resource : dm->GetSRVs()) changed |= promoted(resource->GetKind()) != resource->GetKind();
     for (const auto &resource : dm->GetUAVs()) changed |= promoted(resource->GetKind()) != resource->GetKind();
     if (!changed) return SCORPI_DXBC_TO_DXIL_OK;

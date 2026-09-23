@@ -241,6 +241,16 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
     uint32_t metadata_space, uint32_t self_offset,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 
+// Only for attachment-backed logical 8x rasterization on 4x hardware.
+struct ScorpiSamplingRequirement;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateMsaa8PixelShader(const void *code, size_t size, uint32_t space,
+    uint32_t mask, int generated, void **binary, size_t *binary_size, char *error, size_t error_size);
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
+    const struct ScorpiSamplingRequirement *policy, size_t policy_count,
+    void **binary, size_t *binary_size, char *error_message, size_t error_message_size);
+
 // The caller has proved all sampled bindings are ordinary, fully backed views
 // with no resource MinLOD. Keep native texture operations unchanged. Shaders
 // consuming residency status still use the compatibility path.
@@ -257,6 +267,7 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
 #define SCORPI_SAMPLING_TYPED_PREFIX 8u
 #define SCORPI_SAMPLING_TYPED_RGB32 16u
 #define SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX 32u
+#define SCORPI_SAMPLING_MSAA8 64u
 #define SCORPI_SHADER_GUARD_TYPED_PREFIX 32u
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u

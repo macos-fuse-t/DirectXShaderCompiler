@@ -14,6 +14,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include <algorithm>
+#include <functional>
 #include <vector>
 
 namespace scorpi {
@@ -59,10 +61,210 @@ void PredicateWrite(CallInst *call, Value *active) {
 }
 } // namespace
 
+bool PrepareMsaa8TextureLoads(hlsl::DxilModule &dm, std::string &error,
+                              bool &changed,
+                              const ScorpiSamplingRequirement *policy,
+                              size_t policy_count) {
+  using namespace llvm;
+  using namespace hlsl;
+  using Kind = DXIL::ResourceKind;
+  auto ms = [](Kind k) {
+    return k == Kind::Texture2DMS || k == Kind::Texture2DMSArray;
+  };
+  changed = false;
+  // Unspecified sample counts are specialized from the immutable binding
+  // snapshot, not from unrelated eight-sample resources elsewhere in a heap.
+  for (auto &r : dm.GetSRVs())
+    if (ms(r->GetKind()) && r->GetSampleCount() != 8) {
+      uint64_t selected = 0;
+      for (size_t i = 0; i < policy_count; ++i) {
+        const auto &p = policy[i];
+        if (p.resource_class || p.space != r->GetSpaceID() ||
+            !(p.requirements & SCORPI_SAMPLING_MSAA8))
+          continue;
+        const uint64_t lo =
+            std::max<uint64_t>(p.base_register, r->GetLowerBound());
+        const uint64_t hi = std::min<uint64_t>(
+            uint64_t(p.base_register) + p.count,
+            uint64_t(r->GetLowerBound()) + r->GetRangeSize());
+        if (hi > lo)
+          selected += hi - lo;
+      }
+      if (!selected)
+        continue;
+      if (r->GetSampleCount() != 0 || selected != r->GetRangeSize()) {
+        error = "8x texture binding has a conflicting sample count or mixed "
+                "descriptor-array layout";
+        return false;
+      }
+      r->SetSampleCount(8);
+    }
+  for (const auto &r : dm.GetSRVs())
+    changed |= ms(r->GetKind()) && r->GetSampleCount() == 8;
+  if (!changed)
+    return true;
+  struct Info {
+    Kind kind = Kind::Invalid;
+    unsigned samples = 0;
+  };
+  std::function<Info(Value *, unsigned)> info = [&](Value *v,
+                                                    unsigned depth) -> Info {
+    if (depth > 16)
+      return {};
+    if (auto *c = dyn_cast<CallInst>(v)) {
+      if (!c->getCalledFunction() ||
+          !c->getCalledFunction()->getName().startswith("dx.op."))
+        return {};
+      auto *constant = dyn_cast<ConstantInt>(c->getArgOperand(0));
+      if (!constant)
+        return {};
+      auto op = OpCode(constant->getZExtValue());
+      if (op == OpCode::AnnotateHandle) {
+        auto p = resource_helper::loadPropsFromConstant(
+            *cast<Constant>(c->getArgOperand(2)));
+        if (ms(p.getResourceKind()) && !p.Typed.SampleCount) {
+          auto binding = info(c->getArgOperand(1), depth + 1);
+          if (binding.samples == 8)
+            return binding;
+        }
+        return {p.getResourceKind(), p.Typed.SampleCount};
+      }
+      if (op == OpCode::CreateHandleFromBinding) {
+        auto binding = resource_helper::loadBindingFromConstant(
+            *cast<Constant>(c->getArgOperand(1)));
+        if (binding.resourceClass == unsigned(DXIL::ResourceClass::SRV))
+          for (const auto &r : dm.GetSRVs())
+            if (r->GetSpaceID() == binding.spaceID &&
+                r->GetLowerBound() == binding.rangeLowerBound)
+              return {r->GetKind(), r->GetSampleCount()};
+      }
+      if (op == OpCode::CreateHandle &&
+          cast<ConstantInt>(c->getArgOperand(1))->getZExtValue() ==
+              unsigned(DXIL::ResourceClass::SRV)) {
+        auto id = cast<ConstantInt>(c->getArgOperand(2))->getZExtValue();
+        if (id < dm.GetSRVs().size())
+          return {dm.GetSRV(id).GetKind(), dm.GetSRV(id).GetSampleCount()};
+      }
+    }
+    if (auto *s = dyn_cast<SelectInst>(v)) {
+      auto a = info(s->getTrueValue(), depth + 1),
+           b = info(s->getFalseValue(), depth + 1);
+      if (a.kind == b.kind && a.samples == b.samples)
+        return a;
+      if (a.samples == 8 || b.samples == 8 || a.samples == UINT32_MAX ||
+          b.samples == UINT32_MAX)
+        return {Kind::Invalid, UINT32_MAX};
+    }
+    if (auto *p = dyn_cast<PHINode>(v)) {
+      Info result;
+      bool first = true;
+      for (auto &incoming : p->incoming_values()) {
+        auto next = info(incoming, depth + 1);
+        if (!first &&
+            (result.kind != next.kind || result.samples != next.samples))
+          return {Kind::Invalid, UINT32_MAX};
+        result = next;
+        first = false;
+      }
+      return result;
+    }
+    return {};
+  };
+  std::vector<CallInst *> calls, annotations;
+  for (auto &f : *dm.GetModule())
+    for (auto &block : f)
+      for (auto &inst : block)
+        if (auto *c = dyn_cast<CallInst>(&inst))
+          if (c->getCalledFunction() &&
+              c->getCalledFunction()->getName().startswith("dx.op."))
+            calls.push_back(c);
+  for (auto *call : calls) {
+    auto *opcode = dyn_cast<ConstantInt>(call->getArgOperand(0));
+    if (!opcode)
+      continue;
+    auto op = OpCode(opcode->getZExtValue());
+    if (op == OpCode::AnnotateHandle) {
+      annotations.push_back(call);
+      continue;
+    }
+    if (call->getNumArgOperands() < 2)
+      continue;
+    auto resource = info(call->getArgOperand(1), 0);
+    if (resource.samples == UINT32_MAX) {
+      error = "mixed native/split multisample handle selection";
+      return false;
+    }
+    if (!ms(resource.kind) || resource.samples != 8)
+      continue;
+    IRBuilder<> b(call);
+    if (op == OpCode::TextureLoad) {
+      auto sample = call->getArgOperand(2);
+      Value *layer = resource.kind == Kind::Texture2DMSArray
+                         ? call->getArgOperand(5)
+                         : b.getInt32(0);
+      call->setArgOperand(5, b.CreateAdd(b.CreateMul(layer, b.getInt32(2)),
+                                         b.CreateLShr(sample, b.getInt32(2))));
+      call->setArgOperand(2, b.CreateAnd(sample, b.getInt32(3)));
+      auto *valid = b.CreateAnd(b.CreateICmpULT(sample, b.getInt32(8)),
+                                b.CreateICmpULT(layer, b.getInt32(1024)));
+      call->setArgOperand(
+          3, b.CreateSelect(valid, call->getArgOperand(3), b.getInt32(-1)));
+    } else if (op == OpCode::GetDimensions) {
+      auto *native = cast<CallInst>(call->clone());
+      native->insertBefore(call);
+      auto *dims = b.CreateInsertValue(UndefValue::get(call->getType()),
+                                       b.getInt32(8), 3);
+      Value *result = dims;
+      for (unsigned i = 0; i < 3; ++i) {
+        Value *v = b.CreateExtractValue(native, i);
+        if (i == 2 && resource.kind == Kind::Texture2DMSArray)
+          v = b.CreateLShr(v, b.getInt32(1));
+        result = b.CreateInsertValue(result, v, i);
+      }
+      call->replaceAllUsesWith(result);
+      call->eraseFromParent();
+    } else if (op == OpCode::Texture2DMSGetSamplePosition) {
+      static const int8_t xy[8][2] = {{1, -3}, {-1, 3},  {5, 1}, {-3, -5},
+                                      {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+      Value *result = UndefValue::get(call->getType());
+      for (unsigned axis = 0; axis < 2; ++axis) {
+        Value *v = ConstantFP::get(b.getFloatTy(), 0);
+        for (unsigned s = 0; s < 8; ++s)
+          v = b.CreateSelect(
+              b.CreateICmpEQ(call->getArgOperand(2), b.getInt32(s)),
+              ConstantFP::get(b.getFloatTy(), xy[s][axis] / 16.f), v);
+        result = b.CreateInsertValue(result, v, axis);
+      }
+      call->replaceAllUsesWith(result);
+      call->eraseFromParent();
+    } else {
+      error = "unsupported operation on split 8x texture";
+      return false;
+    }
+  }
+  for (auto *call : annotations) {
+    auto p = resource_helper::loadPropsFromConstant(
+        *cast<Constant>(call->getArgOperand(2)));
+    if (ms(p.getResourceKind()) && info(call, 0).samples == 8) {
+      p.setResourceKind(Kind::Texture2DMSArray);
+      p.Typed.SampleCount = 4;
+      call->setArgOperand(2, resource_helper::getAsConstant(
+                                 p, dm.GetOP()->GetResourcePropertiesType(),
+                                 *dm.GetShaderModel()));
+    }
+  }
+  for (auto &r : dm.GetSRVs())
+    if (ms(r->GetKind()) && r->GetSampleCount() == 8) {
+      r->SetKind(Kind::Texture2DMSArray);
+      r->SetSampleCount(4);
+    }
+  return true;
+}
+
 bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                                     uint32_t registerSpace,
                                     uint32_t sampleCount, uint32_t sampleMask,
-                                    std::string &error, bool generated) {
+                                    std::string &error, bool generated, bool attachments) {
   using namespace llvm;
   using namespace hlsl;
   auto fail = [&](const char *why) {
@@ -74,6 +276,8 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   if (sampleCount != 1 && sampleCount != 4 && sampleCount != 8 && sampleCount != 16)
     return fail("raster replay requires 1, 4, 8 or 16 logical samples");
   sampleMask &= (1u << sampleCount) - 1u;
+  if (attachments && dm.m_ShaderFlags.GetForceEarlyDepthStencil() && sampleMask != 255)
+    return fail("8x early-depth/stencil with partial OM sample mask requires pre-test masking");
   for (const auto &r : dm.GetCBuffers())
     if (r->GetSpaceID() == registerSpace && r->GetLowerBound() == 0)
       return fail("raster replay cbuffer binding collides with application");
@@ -117,6 +321,13 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     }
 
   auto &ctx = entry->getContext();
+  // Pixel-frequency UAV values cannot be independently recomputed for each
+  // physical sample group. Until result broadcast is available, reject those
+  // attachment shaders rather than duplicate effects or shade with dummy values.
+  if (attachments && !sampleFrequency)
+    for (auto *call : originalCalls)
+      if (IsWrite(static_cast<OpCode>(cast<ConstantInt>(call->getArgOperand(0))->getZExtValue())))
+        return fail("8x attachment replay requires pixel-frequency UAV result broadcast");
   auto *module = dm.GetModule();
   auto *ops = dm.GetOP();
   auto *i32 = Type::getInt32Ty(ctx);
@@ -255,7 +466,11 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   auto *coverage =
       b.CreateSelect(inBounds, b.CreateExtractValue(loaded, 0), b.getInt32(0));
   auto *maskedCoverage = b.CreateAnd(coverage, b.getInt32(sampleMask));
-  auto *nativeSample = opCall(OpCode::SampleIndex, i32, {});
+  // Attachment queries use native visibility slots. Pure pixel-frequency
+  // shaders must stay pixel-frequency (in particular SV_Position stays at
+  // the pixel center); only sample-frequency shaders require SampleIndex.
+  Value *nativeSample = b.getInt32(0);
+  if (!attachments || sampleFrequency) nativeSample = opCall(OpCode::SampleIndex, i32, {});
   auto *sample = b.CreateAdd(nativeSample, sampleBase);
   auto *bit = b.CreateShl(b.getInt32(1), sample);
   auto *active =
@@ -343,7 +558,19 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
             primitiveLoad = e->GetKind() == DXIL::SemanticKind::PrimitiveID;
           }
     }
-    if (op == OpCode::EvalSampleIndex || op == OpCode::EvalCentroid ||
+    if (attachments && op == OpCode::RenderTargetGetSampleCount) {
+      call->replaceAllUsesWith(b.getInt32(sampleCount));
+      call->eraseFromParent();
+    } else if (attachments && op == OpCode::RenderTargetGetSamplePosition) {
+      IRBuilder<> at(call);
+      Value *position = UndefValue::get(call->getType());
+      for (unsigned axis=0; axis<2; ++axis)
+        position = at.CreateInsertValue(position,
+            at.CreateFMul(at.CreateSIToFP(offsetAtSample(at,call->getArgOperand(1),axis),f32),
+                ConstantFP::get(f32,1.0/16)),axis);
+      call->replaceAllUsesWith(position);
+      call->eraseFromParent();
+    } else if (op == OpCode::EvalSampleIndex || op == OpCode::EvalCentroid ||
         centroidLoad) {
       IRBuilder<> at(call);
       auto *ox = op == OpCode::EvalSampleIndex
@@ -383,18 +610,18 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       // This variant is used only with no color or depth/stencil attachments.
       // Outputs are discarded, but computations leading to them (including
       // UAV side effects) remain subject to the normal replay predicates.
-      call->eraseFromParent();
+      if (!attachments) call->eraseFromParent();
     } else if (IsWrite(op)) {
       IRBuilder<> at(call);
       PredicateWrite(call, at.CreateLoad(alive));
     }
   }
-  if (earlyDepth) {
+  if (!attachments && earlyDepth) {
     // Insert before original shader work, so neither discard nor output
     // coverage can reduce a FORCE_EARLY_DEPTH_STENCIL query.
     IRBuilder<> at(queryStart);
     recordVisibility(at, active, at.getInt32(UINT32_MAX));
-  } else {
+  } else if (!attachments) {
     std::vector<ReturnInst *> returns;
     for (auto &block : *entry)
       if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) returns.push_back(ret);
@@ -403,7 +630,32 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       recordVisibility(at, at.CreateLoad(alive), at.CreateLoad(outputCoverage));
     }
   }
-  dm.GetOutputSignature().ClearElements();
+  if (attachments) {
+    // Hardware coverage is local to one four-sample group. Keep target/depth
+    // outputs, and translate the logical eight-bit mask only at the OM boundary.
+    unsigned coverageID = UINT32_MAX;
+    for (const auto &e : dm.GetOutputSignature().GetElements())
+      if (e->GetKind() == DXIL::SemanticKind::Coverage) coverageID = e->GetID();
+    if (coverageID == UINT32_MAX) {
+      auto e = std::make_unique<DxilSignatureElement>(DXIL::SigPointKind::PSOut);
+      e->Initialize("SV_Coverage", CompType::getU32(), DXIL::InterpolationMode::Undefined, 1, 1);
+      e->AppendSemanticIndex(0); e->SetKind(DXIL::SemanticKind::Coverage);
+      coverageID = dm.GetOutputSignature().AppendElement(std::move(e));
+    }
+    std::vector<CallInst *> oldCoverage;
+    for (auto &block : *entry) for (auto &inst : block)
+      if (auto *call = dyn_cast<CallInst>(&inst))
+        if (call->getCalledFunction() && call->getCalledFunction()->getName().startswith("dx.op.storeOutput"))
+          if (auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1)))
+            if (id->getZExtValue() == coverageID) oldCoverage.push_back(call);
+    for (auto *call : oldCoverage) call->eraseFromParent();
+    for (auto &block : *entry) if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) {
+      IRBuilder<> at(ret);
+      auto *mask = at.CreateLShr(at.CreateAnd(at.CreateLoad(outputCoverage), maskedCoverage), sampleBase);
+      at.CreateCall(ops->GetOpFunc(OpCode::StoreOutput, i32),
+          {at.getInt32(unsigned(OpCode::StoreOutput)),at.getInt32(coverageID),at.getInt32(0),at.getInt8(0),mask});
+    }
+  } else dm.GetOutputSignature().ClearElements();
   DominatorTree dominators;
   dominators.recalculate(*entry);
   PromoteMemToReg({alive, outputCoverage}, dominators);
