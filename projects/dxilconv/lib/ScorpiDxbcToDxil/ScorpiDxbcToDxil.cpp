@@ -592,7 +592,7 @@ extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
 static int CreateRasterReplayShader(
     const void *code, size_t size, uint32_t register_space,
     uint32_t sample_count, uint32_t sample_mask, void **binary,
-    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false, bool attachments = false) {
+    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false, bool attachments = false, bool alpha_to_coverage = false) {
   SetError(error_message, error_message_size, "");
   if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr;
@@ -615,7 +615,7 @@ static int CreateRasterReplayShader(
     std::string error;
     if (!dxil || !(geometry_link ? scorpi::LowerGeometryPrimitiveId(*dxil, error)
         : vertex ? scorpi::PrepareRasterReplayVertexShader(*dxil, register_space, error)
-        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated, attachments)))
+        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated, attachments, alpha_to_coverage)))
       throw std::runtime_error(error.empty() ? "missing DXIL module" : error);
     // The replay transforms change signatures. Serialized ViewID state still
     // describes the source signature and cannot be reused for the new PSV.
@@ -670,6 +670,16 @@ extern "C" int ScorpiCreateMsaa8PixelShader(
     void **binary, size_t *binary_size, char *error, size_t error_size) {
   return CreateRasterReplayShader(code, size, space, 8, mask, binary,
       binary_size, error, error_size, false, generated != 0, false, true);
+}
+
+extern "C" int ScorpiCreateMsaa8PixelShaderEx(
+    const void *code, size_t size, uint32_t space, uint32_t mask, int generated,
+    uint32_t options, void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (options & ~SCORPI_MSAA8_ALPHA_TO_COVERAGE)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  return CreateRasterReplayShader(code, size, space, 8, mask, binary,
+      binary_size, error, error_size, false, generated != 0, false, true,
+      (options & SCORPI_MSAA8_ALPHA_TO_COVERAGE) != 0);
 }
 
 extern "C" int ScorpiCreateGeneratedRasterReplayPixelShader(

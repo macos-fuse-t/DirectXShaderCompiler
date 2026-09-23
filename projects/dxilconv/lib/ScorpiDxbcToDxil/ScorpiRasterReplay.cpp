@@ -264,7 +264,7 @@ bool PrepareMsaa8TextureLoads(hlsl::DxilModule &dm, std::string &error,
 bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                                     uint32_t registerSpace,
                                     uint32_t sampleCount, uint32_t sampleMask,
-                                    std::string &error, bool generated, bool attachments) {
+                                    std::string &error, bool generated, bool attachments, bool alphaToCoverage) {
   using namespace llvm;
   using namespace hlsl;
   auto fail = [&](const char *why) {
@@ -276,6 +276,16 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   if (sampleCount != 1 && sampleCount != 4 && sampleCount != 8 && sampleCount != 16)
     return fail("raster replay requires 1, 4, 8 or 16 logical samples");
   sampleMask &= (1u << sampleCount) - 1u;
+  unsigned alphaID = UINT32_MAX, alphaRow = 0;
+  for (const auto &e : dm.GetOutputSignature().GetElements()) {
+    if (e->GetKind() == DXIL::SemanticKind::Coverage) alphaToCoverage = false;
+    if (e->GetKind() == DXIL::SemanticKind::Target && e->GetCols() == 4)
+      for (unsigned row = 0; row < e->GetSemanticIndexVec().size(); ++row)
+        if (e->GetSemanticIndexVec()[row] == 0) { alphaID = e->GetID(); alphaRow = row; }
+  }
+  alphaToCoverage &= attachments && alphaID != UINT32_MAX;
+  if (alphaToCoverage && dm.m_ShaderFlags.GetForceEarlyDepthStencil())
+    return fail("8x early-depth/stencil with alpha-to-coverage requires pre-test masking");
   if (attachments && dm.m_ShaderFlags.GetForceEarlyDepthStencil() && sampleMask != 255)
     return fail("8x early-depth/stencil with partial OM sample mask requires pre-test masking");
   for (const auto &r : dm.GetCBuffers())
@@ -333,6 +343,8 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   auto *i32 = Type::getInt32Ty(ctx);
   auto *f32 = Type::getFloatTy(ctx);
   IRBuilder<> b(&*entry->getEntryBlock().getFirstInsertionPt());
+  auto *alpha = alphaToCoverage ? b.CreateAlloca(f32, nullptr, "scorpi.alpha") : nullptr;
+  if (alpha) b.CreateStore(ConstantFP::get(f32, 1.0), alpha);
   auto opCall = [&](OpCode op, Type *type, std::vector<Value *> args) {
     args.insert(args.begin(), b.getInt32(static_cast<unsigned>(op)));
     return b.CreateCall(ops->GetOpFunc(op, type), args);
@@ -600,6 +612,14 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                      alive);
       // Keep the discard itself as an ordering boundary.
     } else if (op == OpCode::StoreOutput) {
+      if (alpha && call->getArgOperand(1) == b.getInt32(alphaID) &&
+          call->getArgOperand(2) == b.getInt32(alphaRow) && call->getArgOperand(3) == b.getInt8(3)) {
+        IRBuilder<> at(call);
+        auto *value = call->getArgOperand(4);
+        if (value->getType()->isHalfTy()) value = at.CreateFPExt(value, f32);
+        if (value->getType() != f32) return fail("8x alpha-to-coverage requires floating-point target alpha");
+        at.CreateStore(value, alpha);
+      }
       // SV_Coverage affects ordinary visibility even with no attachments.
       if (auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1)))
         for (const auto &e : dm.GetOutputSignature().GetElements())
@@ -651,7 +671,21 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
     for (auto *call : oldCoverage) call->eraseFromParent();
     for (auto &block : *entry) if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) {
       IRBuilder<> at(ret);
-      auto *mask = at.CreateLShr(at.CreateAnd(at.CreateLoad(outputCoverage), maskedCoverage), sampleBase);
+      Value *logicalMask = at.CreateAnd(at.CreateLoad(outputCoverage), maskedCoverage);
+      if (alpha) {
+        // Nested, spatially distributed masks over all eight logical samples.
+        // Ordered comparisons also map NaN to zero coverage. Do not quantize
+        // alpha independently in each physical four-sample group.
+        const unsigned order[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+        Value *alphaMask = at.getInt32(0);
+        auto *value = at.CreateLoad(alpha);
+        for (unsigned rank = 0; rank < 8; ++rank)
+          alphaMask = at.CreateOr(alphaMask, at.CreateSelect(
+              at.CreateFCmpOGE(value, ConstantFP::get(f32, (rank + 0.5) / 8.0)),
+              at.getInt32(1u << order[rank]), at.getInt32(0)));
+        logicalMask = at.CreateAnd(logicalMask, alphaMask);
+      }
+      auto *mask = at.CreateLShr(logicalMask, sampleBase);
       at.CreateCall(ops->GetOpFunc(OpCode::StoreOutput, i32),
           {at.getInt32(unsigned(OpCode::StoreOutput)),at.getInt32(coverageID),at.getInt32(0),at.getInt8(0),mask});
     }
@@ -659,6 +693,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   DominatorTree dominators;
   dominators.recalculate(*entry);
   PromoteMemToReg({alive, outputCoverage}, dominators);
+  if (alpha) PromoteMemToReg({alpha}, dominators);
   dm.CollectShaderFlagsForModule();
   // DXIL rejects declarations left behind after replacing an intrinsic.
   for (auto it = module->begin(); it != module->end();) {

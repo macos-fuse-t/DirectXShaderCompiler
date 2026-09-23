@@ -16,5 +16,5 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &module,
                                     uint32_t registerSpace,
                                     uint32_t sampleCount, uint32_t sampleMask,
                                     std::string &error, bool generated = false,
-                                    bool attachments = false);
+                                    bool attachments = false, bool alphaToCoverage = false);
 } // namespace scorpi

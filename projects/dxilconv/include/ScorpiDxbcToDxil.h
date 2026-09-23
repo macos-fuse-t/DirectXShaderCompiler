@@ -246,6 +246,11 @@ struct ScorpiSamplingRequirement;
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiCreateMsaa8PixelShader(const void *code, size_t size, uint32_t space,
     uint32_t mask, int generated, void **binary, size_t *binary_size, char *error, size_t error_size);
+#define SCORPI_MSAA8_ALPHA_TO_COVERAGE 1u
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateMsaa8PixelShaderEx(const void *code, size_t size, uint32_t space,
+    uint32_t mask, int generated, uint32_t options, void **binary,
+    size_t *binary_size, char *error, size_t error_size);
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
     const struct ScorpiSamplingRequirement *policy, size_t policy_count,
