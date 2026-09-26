@@ -217,7 +217,8 @@ class Lowering {
   DxilModule &dm;
   const ScorpiTypedBufferBinding *bindings;
   size_t count;
-  uint32_t space, selfOffset, resourceID;
+  uint32_t space, resourceID;
+  uint32_t pageResourceIDs[2];
   bool minmaxFiltering;
   bool nativeTextures;
   bool bindingPolicy;
@@ -280,10 +281,11 @@ class Lowering {
 public:
   Lowering(DxilModule &module, const ScorpiTypedBufferBinding *ranges,
       size_t n, uint32_t s, uint32_t self, uint32_t options,
-      const ScorpiSamplingRequirement *p, size_t pn) : dm(module), bindings(ranges), count(n), space(s), selfOffset(self),
+      const ScorpiSamplingRequirement *p, size_t pn) : dm(module), bindings(ranges), count(n), space(s),
       minmaxFiltering(!(options & (SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_NATIVE_TEXTURES))),
       nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES),
       bindingPolicy(options & SCORPI_SHADER_BINDING_POLICY), policy(p), policyCount(pn) {
+    (void)self; // ABI v2 never subtracts GPU addresses.
     auto &ctx = dm.GetModule()->getContext();
     auto resource = std::make_unique<DxilResource>();
     resource->SetID(dm.GetSRVs().size()); resource->SetRW(false);
@@ -293,14 +295,41 @@ public:
     resource->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
         {Type::getInt32Ty(ctx)}, "ScorpiTypedBufferMetadata")->getPointerTo()));
     resourceID = dm.AddSRV(std::move(resource));
+    for (unsigned i = 0; i != 2; ++i) {
+      auto pages = std::make_unique<DxilResource>();
+      pages->SetID(dm.GetSRVs().size()); pages->SetRW(false);
+      pages->SetKind(ResourceKind::RawBuffer); pages->SetSpaceID(space);
+      pages->SetLowerBound(i ? SCORPI_METADATA_SAMPLER_REGISTER : SCORPI_METADATA_RESOURCE_REGISTER);
+      pages->SetRangeSize(i ? SCORPI_METADATA_SAMPLER_PAGES : SCORPI_METADATA_RESOURCE_PAGES);
+      pages->SetGlobalName(i ? "ScorpiSamplerMetadataPages" : "ScorpiResourceMetadataPages");
+      pages->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
+          {Type::getInt32Ty(ctx)}, "ScorpiMetadataPage")->getPointerTo()));
+      pageResourceIDs[i] = dm.AddSRV(std::move(pages));
+    }
   }
 
+  Value *PageHandle(IRBuilder<> &b, Value *page, bool sampler) {
+    auto &resource = dm.GetSRV(pageResourceIDs[sampler]);
+    auto *index = b.CreateAdd(page, b.getInt32(resource.GetLowerBound()));
+    if (dm.GetShaderModel()->GetMinor() >= 6) {
+      auto binding = resource_helper::loadBindingFromResourceBase(&resource);
+      auto *value = resource_helper::getAsConstant(binding, dm.GetOP()->GetResourceBindingType(), *dm.GetShaderModel());
+      auto *raw = Call(b, OpCode::CreateHandleFromBinding, b.getVoidTy(), {value, index, b.getTrue()});
+      auto props = resource_helper::loadPropsFromResourceBase(&resource);
+      return Call(b, OpCode::AnnotateHandle, b.getVoidTy(), {raw,
+          resource_helper::getAsConstant(props, dm.GetOP()->GetResourcePropertiesType(), *dm.GetShaderModel())});
+    }
+    return Call(b, OpCode::CreateHandle, b.getVoidTy(), {b.getInt8(unsigned(ResourceClass::SRV)),
+        b.getInt32(resource.GetID()), index, b.getTrue()});
+  }
+
+  // Word 7 returns the metadata buffer handle, used for page-local feedback.
   Value *Word(Value *handle, unsigned word) {
     auto key = std::make_pair(handle, word);
     auto found = words.find(key);
     if (found != words.end()) return found->second;
     if (auto *phi = dyn_cast<PHINode>(handle)) {
-      auto *value = PHINode::Create(Type::getInt32Ty(phi->getContext()), phi->getNumIncomingValues(),
+      auto *value = PHINode::Create(word == 7 ? dm.GetOP()->GetHandleType() : Type::getInt32Ty(phi->getContext()), phi->getNumIncomingValues(),
           "scorpi.view.prefix", phi);
       words[key] = value;
       for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
@@ -349,19 +378,18 @@ public:
     if (!range) throw std::runtime_error("typed buffer not covered by a visible descriptor-table range");
     auto *metadata = MetadataHandle(call->getParent()->getParent());
     IRBuilder<> b(call->getNextNode());
-    if(word==6){
-      auto *directory=Load(b,metadata,b.getInt32(range->feedback_offset));
-      if(range->table_offset==UINT32_MAX)return words[key]=directory;
-      auto *slot=b.CreateAdd(b.CreateSub(index,b.getInt32(range->base_register)),b.getInt32(range->table_offset));
-      return words[key]=Load(b,metadata,b.CreateAdd(directory,b.CreateMul(slot,b.getInt32(4))));
+    Value *offset = b.getInt32(range->feedback_offset);
+    if (range->table_offset != UINT32_MAX) {
+      auto *base = Load(b, metadata, offset);
+      auto *slot = b.CreateAdd(base, b.CreateAdd(b.CreateSub(index, b.getInt32(range->base_register)),
+          b.getInt32(range->table_offset)));
+      metadata = PageHandle(b, b.CreateLShr(slot, b.getInt32(SCORPI_METADATA_PAGE_SHIFT)),
+          cls == unsigned(ResourceClass::Sampler));
+      offset = b.CreateMul(b.CreateAnd(slot, b.getInt32((1u << SCORPI_METADATA_PAGE_SHIFT) - 1)),
+          b.getInt32(SCORPI_METADATA_RECORD_BYTES));
     }
-    // All table entries live in the same <4GiB allocation. Low-word subtraction
-    // is deliberately modular, including when a GPU address crosses 4GiB.
-    auto *relative = b.CreateSub(Load(b, metadata, b.getInt32(range->root_offset)),
-        Load(b, metadata, b.getInt32(selfOffset)));
-    auto *slot = b.CreateAdd(b.CreateSub(index, b.getInt32(range->base_register)), b.getInt32(range->table_offset));
-    auto *offset = b.CreateAdd(relative, b.CreateAdd(b.CreateMul(slot, b.getInt32(24)), b.getInt32(word * 4)));
-    return words[key] = Load(b, metadata, offset);
+    if (word == 7) return words[key] = metadata;
+    return words[key] = Load(b, metadata, b.CreateAdd(offset, b.getInt32(word * 4)));
   }
 
   void Rewrite(CallInst *call, bool mayBeRGB32, bool extendedPrefix, bool nativeAddressing) {
@@ -403,7 +431,7 @@ public:
 
   Value *TextureResident(IRBuilder<> &b,Value *texture,Value *mip,Value *x,Value *y,Value *slice) {
     auto *offset=Word(texture,0);auto *sparse=b.CreateICmpNE(offset,b.getInt32(0));
-    auto *handle=MetadataHandle(b.GetInsertBlock()->getParent());
+    auto *handle=Word(texture,7);
     auto read=[&](Value *word)->Value*{
       auto *address=b.CreateSelect(sparse,b.CreateAdd(offset,b.CreateMul(word,b.getInt32(4))),b.getInt32(0));
       return Load(b,handle,address);
@@ -435,7 +463,7 @@ public:
     bool used=false;for(auto *u:call->users())if(auto *e=dyn_cast<ExtractValueInst>(u))used|=e->getNumIndices()==1&&*e->idx_begin()==4;
     if(!used)return;
     auto *buffer=call->getArgOperand(1);auto *offset=Word(buffer,6);IRBuilder<> b(call);
-    auto *sparse=b.CreateICmpNE(offset,b.getInt32(0));auto *metadata=MetadataHandle(call->getParent()->getParent());
+    auto *sparse=b.CreateICmpNE(offset,b.getInt32(0));auto *metadata=Word(buffer,7);
     auto read=[&](Value *word){return Load(b,metadata,b.CreateSelect(sparse,b.CreateAdd(offset,b.CreateMul(word,b.getInt32(4))),b.getInt32(0)));};
     auto word=[&](unsigned n){return read(b.getInt32(n));};
     auto u64=[&](Value *v){return b.CreateZExt(v,b.getInt64Ty());};

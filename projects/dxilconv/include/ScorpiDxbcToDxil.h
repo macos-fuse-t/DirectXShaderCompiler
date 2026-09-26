@@ -208,10 +208,18 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiPromoteTexture1D(const void *code, size_t size, void **binary,
     size_t *binary_size, char *error, size_t error_size);
 
-// Renderer-private typed-buffer view metadata. The raw SRV at t0 in space
-// metadata_space points at the immutable root-argument allocation. Each table
-// root contains a GPU address within that allocation; descriptors are 24 bytes,
-// with the texture alignment prefix in metadata bits 32..39 (byte 20).
+// Private descriptor metadata ABI v2. Native descriptor tables are independent.
+// t0: per-draw root metadata. t1..4096: resource metadata pages;
+// t4097..4112: sampler metadata pages. Each page contains 256 32-byte
+// records, followed by immutable sparse-feedback payloads addressed within it.
+#define SCORPI_DESCRIPTOR_METADATA_ABI 2
+#define SCORPI_METADATA_PAGE_SHIFT 8
+#define SCORPI_METADATA_RECORD_BYTES 32
+#define SCORPI_METADATA_RESOURCE_REGISTER 1
+#define SCORPI_METADATA_RESOURCE_PAGES 4096
+#define SCORPI_METADATA_SAMPLER_REGISTER 4097
+#define SCORPI_METADATA_SAMPLER_PAGES 16
+#define SCORPI_METADATA_PRIVATE_PARAMETERS 4
 typedef struct ScorpiTypedBufferBinding {
   uint32_t resource_class, space, base_register, count;
   uint32_t root_offset, table_offset;
