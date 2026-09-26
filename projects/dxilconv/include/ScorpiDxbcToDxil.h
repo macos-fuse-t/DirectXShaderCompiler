@@ -241,6 +241,16 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
     uint32_t metadata_space, uint32_t self_offset,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 
+// Resource i64 atomics only; null output means the shader was unchanged.
+// The caller must supply a shared, initially-zero private raw UAV at u0/space.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+// DXBC/SM5 cannot contain i64 atomics and bypasses bitcode parsing entirely.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectAtomic64(const void *code, size_t size, int *required);
+
 // Only for attachment-backed logical 8x rasterization on 4x hardware.
 struct ScorpiSamplingRequirement;
 SCORPI_DXBC_TO_DXIL_EXPORT int

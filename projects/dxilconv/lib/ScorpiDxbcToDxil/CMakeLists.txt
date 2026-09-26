@@ -3,6 +3,7 @@ set(SCORPI_DXBC_TO_DXIL_SOURCES
   ScorpiRasterReplay.cpp
   ScorpiGeometryCapture.cpp
   ScorpiTypedBuffers.cpp
+  ScorpiAtomic64.cpp
 )
 
 add_dxilconv_project_library(ScorpiDxbcToDxil

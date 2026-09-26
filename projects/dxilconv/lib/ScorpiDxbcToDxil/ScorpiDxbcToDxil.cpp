@@ -5,6 +5,7 @@
 #include "ScorpiRasterReplay.h"
 #include "ScorpiGeometryCapture.h"
 #include "ScorpiTypedBuffers.h"
+#include "ScorpiAtomic64.h"
 
 #include "DxbcConverterImpl.h"
 #include "dxc/DxilHash/DxilHash.h"
@@ -906,6 +907,87 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
     return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
   } catch (...) {
     SetError(error, error_size, "typed-buffer lowering failed");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
+extern "C" int ScorpiInspectAtomic64(const void *code, size_t size, int *required) {
+  if (!code || !size || !required) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *required = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto *container = hlsl::IsDxilContainerLike(code, size);
+    // Shader model 5 bytecode cannot express i64 atomics.  This API runs on
+    // every created shader, so do not translate DXBC merely to prove that it
+    // needs no atomic lowering.
+    if (!container) return SCORPI_DXBC_TO_DXIL_OK;
+    if (!container || !hlsl::IsValidDxilContainer(container, size)) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) return SCORPI_DXBC_TO_DXIL_OK;
+    // Ordinary shaders take a container-header check, not another LLVM parse.
+    if (auto *part = hlsl::GetDxilPartByType(container, hlsl::DFCC_FeatureInfo)) {
+      if (part->PartSize >= sizeof(hlsl::DxilShaderFeatureInfo)) {
+        hlsl::DxilShaderFeatureInfo features;
+        std::memcpy(&features, hlsl::GetDxilPartData(part), sizeof(features));
+        if (!(features.FeatureFlags & hlsl::DXIL::ShaderFeatureInfo_Int64Ops))
+          return SCORPI_DXBC_TO_DXIL_OK;
+      }
+    }
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "atomic64-inspection", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    *required = ScorpiHasAtomic64(*dm);
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
+extern "C" int ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size || !code || !size || (!bindings && binding_count))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("atomic shader has no DXIL program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "atomic64", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid atomic shader bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing atomic shader module");
+    if (!ScorpiLowerAtomic64(*dm, lock_space, bindings, binding_count)) return SCORPI_DXBC_TO_DXIL_OK;
+    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid atomic lowering IR");
+    hlsl::DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); llvm::WriteBitcodeToFile(parsed.get().get(), stream); }
+    hlsl::SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate atomic shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "atomic lowering failed");
     return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
   }
 }
