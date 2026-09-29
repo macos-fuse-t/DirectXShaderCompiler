@@ -230,10 +230,26 @@ typedef struct ScorpiTypedBufferBinding {
 typedef struct ScorpiSamplingBinding {
   uint32_t resource_class, space, base_register, count;
 } ScorpiSamplingBinding;
+// Includes declaration ranges and singleton registers used by constant
+// handles. Their requirement unions completely describe policy observations;
+// callers must preserve singletons when canonicalizing compilation keys.
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectSamplingBindings(const void *code, size_t size,
     const void *metadata, size_t metadata_size,
     ScorpiSamplingBinding *bindings, size_t *count);
+// Descriptor residency reflection, not a sampling-policy key. Constant
+// handles cover one register; dynamically indexed handles cover their full
+// declaration. This only inspects bytecode and does not rewrite the shader.
+typedef struct ScorpiDescriptorAccess {
+  uint32_t resource_class, space, base_register, count;
+  // True only when every reachable use of this SRV handle samples a texture.
+  // Unknown uses, texture loads and all UAVs are false.
+  uint32_t sample_only;
+} ScorpiDescriptorAccess;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectDescriptorAccess(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiDescriptorAccess *bindings, size_t *count);
 // Read-only input signature reflection, including raw DXIL programs without
 // an ISG1 container part. No optimization, rewriting or serialization occurs.
 typedef struct ScorpiVertexInput {

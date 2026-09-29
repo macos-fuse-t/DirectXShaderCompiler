@@ -30,6 +30,26 @@ native.argtypes = lower.argtypes[:6] + [C.c_uint32] + lower.argtypes[6:]
 class Requirement(C.Structure):
     _fields_ = [(name, C.c_uint32) for name in
                 ('resource_class', 'space', 'base_register', 'count', 'requirements')]
+class SamplingBinding(C.Structure):
+    _fields_ = [(name, C.c_uint32) for name in
+                ('resource_class', 'space', 'base_register', 'count')]
+inspect = lib.ScorpiInspectSamplingBindings
+inspect.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
+                    C.POINTER(SamplingBinding), C.POINTER(C.c_size_t)]
+class DescriptorAccess(C.Structure):
+    _fields_ = SamplingBinding._fields_ + [('sample_only', C.c_uint32)]
+inspect_access = lib.ScorpiInspectDescriptorAccess
+inspect_access.argtypes = inspect.argtypes[:4] + [
+    C.POINTER(DescriptorAccess), C.POINTER(C.c_size_t)]
+
+def access_ranges(code):
+    count = C.c_size_t()
+    assert inspect_access(code, len(code), None, 0, None, C.byref(count)) == 0
+    ranges = (DescriptorAccess * count.value)()
+    assert inspect_access(code, len(code), None, 0, ranges, C.byref(count)) == 0
+    return {(r.resource_class, r.space, r.base_register, r.count, r.sample_only)
+            for r in ranges}
+
 specialize = lib.ScorpiLowerTypedBufferViewsWithSamplingPolicy
 specialize.argtypes = lower.argtypes[:6] + [C.c_uint32, C.POINTER(Requirement), C.c_size_t] + lower.argtypes[6:]
 lib.ScorpiFreeDxilBinary.argtypes = [C.c_void_p]
@@ -38,6 +58,24 @@ bindings = (Binding * 2)(Binding(*(0, 0, 0, 1, 0, 0, 32)[:len(fields)]),
 with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
     folder = Path(folder)
     for model in ('6_0', '6_6'):
+        for index in ('0', '1', 'id.x & 3'):
+            for operation in ('SampleLevel(s, float2(id.xy), 0)', 'Load(int3(id.xy, 0))'):
+                source = ('Texture2D<float4> input[4]:register(t7,space2);\n'
+                          'SamplerState s:register(s3,space2);\n'
+                          'RWStructuredBuffer<float4> output:register(u5);\n'
+                          '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                          f'output[id.x]=input[{index}].{operation}; }}')
+                (folder/'access.hlsl').write_text(source)
+                subprocess.run([dxc, '-T', 'cs_'+model, '-E', 'main', '-Fo',
+                                str(folder/'access.dxil'), str(folder/'access.hlsl')], check=True)
+                code = (folder/'access.dxil').read_bytes()
+                reflected = access_ranges(code)
+                first, length = (7, 4) if index == 'id.x & 3' else (7 + int(index), 1)
+                assert {r for r in reflected if r[0] == 0} == {
+                    (0, 2, first, length, int(operation.startswith('Sample')))}, reflected
+                assert (1, 0, 5, 1, 0) in reflected, reflected
+                assert all(not r[4] for r in reflected if r[0] != 0), reflected
+        print('PASS', model, 'descriptor access: constant/dynamic indices, nonzero base/space, sample versus load')
         # Dense feedback must need no metadata binding at all. Keep sparse
         # table/root paths, including multi-load structured status aggregation.
         for cls in (0, 1):
@@ -83,6 +121,16 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
             (folder/'feedback-array.hlsl').write_text(source)
             subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'feedback-array.dxil'),str(folder/'feedback-array.hlsl')],check=True)
             code=(folder/'feedback-array.dxil').read_bytes()
+            count=C.c_size_t()
+            assert inspect(code,len(code),None,0,None,C.byref(count))==0
+            reflected=(SamplingBinding*count.value)()
+            assert inspect(code,len(code),None,0,reflected,C.byref(count))==0
+            observations={(r.resource_class,r.space,r.base_register,r.count) for r in reflected}
+            assert (0,0,0,4) in observations,(model,index,observations)
+            if index in ('0','1'):
+                assert (0,0,int(index),1) in observations,(model,index,observations)
+            else:
+                assert not any(r[0]==0 and r[3]==1 for r in observations),(model,index,observations)
             view=(Binding*1)(Binding(0,0,0,4,0,0,32))
             policy=(Requirement*1)(Requirement(0,0,1,1,1))
             output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
@@ -92,6 +140,18 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
             (folder/'feedback-array-lowered.dxil').write_bytes(C.string_at(output,size.value));lib.ScorpiFreeDxilBinary(output)
             ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'feedback-array-lowered.dxil')],text=True)
             assert ('ScorpiTypedBufferMetadata' in ir)==(index!='0'),(model,index)
+            if index=='id.x & 3':
+                # Relocating the exception within a dynamic array changes the
+                # descriptor policy but not any compiler-observable decision.
+                policy[0].base_register=2
+                status=specialize(code,len(code),view,1,99,16,4|8,policy,1,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and output.value,error.value
+                (folder/'feedback-array-moved.dxil').write_bytes(C.string_at(output,size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                moved=subprocess.check_output([dxc,'-dumpbin',str(folder/'feedback-array-moved.dxil')],text=True)
+                body=lambda text:text.split('define void @main()',1)[1].split('\n}',1)[0]
+                assert body(ir)==body(moved), 'dynamic-array policy movement changes code'
             print('PASS',model,'feedback array index',index,'only reachable sparse bindings retain checks')
         source = ('ByteAddressBuffer dense:register(t0); ByteAddressBuffer sparse:register(t1);\n'
                   'RWByteAddressBuffer result:register(u5);\n'

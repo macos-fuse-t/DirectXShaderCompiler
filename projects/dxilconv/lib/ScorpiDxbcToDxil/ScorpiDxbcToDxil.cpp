@@ -23,10 +23,13 @@
 #include "dxc/DXIL/DxilSignatureElement.h"
 #include "dxc/DXIL/DxilResource.h"
 #include "dxc/DXIL/DxilResourceProperties.h"
+#include "dxc/DXIL/DxilResourceBinding.h"
 #include "dxc/DXIL/DxilOperations.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -808,8 +811,47 @@ extern "C" int ScorpiInspectVertexInputs(const void *code, size_t size,
   }
 }
 
-extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
-    const void *metadata, size_t metadata_size, ScorpiSamplingBinding *bindings, size_t *count) {
+static bool SampleOnlyHandle(llvm::Value *handle) {
+  llvm::SmallPtrSet<llvm::Value *, 16> visited;
+  std::vector<llvm::Value *> pending{handle};
+  bool sampled = false;
+  while (!pending.empty()) {
+    auto *value = pending.back(); pending.pop_back();
+    if (!visited.insert(value).second) continue;
+    for (auto *user : value->users()) {
+      if (llvm::isa<llvm::PHINode>(user) || llvm::isa<llvm::SelectInst>(user)) {
+        pending.push_back(user); continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (!call || !call->getCalledFunction() ||
+          !call->getCalledFunction()->getName().startswith("dx.op.") ||
+          call->getNumArgOperands() < 2 || call->getArgOperand(1) != value) return false;
+      auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+      if (!opcode) return false;
+      using Op = hlsl::DXIL::OpCode;
+      switch (Op(opcode->getZExtValue())) {
+      case Op::AnnotateHandle: pending.push_back(call); break;
+      case Op::Sample: case Op::SampleBias: case Op::SampleLevel: case Op::SampleGrad:
+      case Op::SampleCmp: case Op::SampleCmpLevelZero: case Op::SampleCmpLevel:
+      case Op::SampleCmpBias: case Op::SampleCmpGrad:
+      case Op::TextureGather: case Op::TextureGatherCmp:
+        sampled = true; break;
+      default: return false;
+      }
+    }
+  }
+  return sampled;
+}
+
+static void SetSampleOnly(ScorpiSamplingBinding &, bool) {}
+static void SetSampleOnly(ScorpiDescriptorAccess &r, bool value) { r.sample_only = value; }
+static uint32_t SampleOnly(const ScorpiSamplingBinding &) { return 0; }
+static uint32_t SampleOnly(const ScorpiDescriptorAccess &r) { return r.sample_only; }
+
+template <typename Binding>
+static int InspectBindings(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, Binding *bindings,
+    size_t *count, bool access_only) {
   if (!code || !size || !count) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   try {
     DxcMallocScope malloc_scope;
@@ -824,13 +866,82 @@ extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
     if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
-    std::vector<ScorpiSamplingBinding> ranges;
-    for (const auto &r : dm->GetSRVs())
-      ranges.push_back({0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
-    for (const auto &r : dm->GetUAVs())
-      ranges.push_back({1, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
-    for (const auto &r : dm->GetSamplers())
-      ranges.push_back({3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+    std::vector<Binding> ranges;
+    const auto declarations = [&] {
+      for (const auto &r : dm->GetSRVs())
+        ranges.push_back({0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+      for (const auto &r : dm->GetUAVs())
+        ranges.push_back({1, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+      for (const auto &r : dm->GetSamplers())
+        ranges.push_back({3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+    };
+    if (!access_only) declarations();
+    bool unknown_handle = false;
+    // SamplingRequirements queries whole declarations for dynamic handles,
+    // but single registers for constant handles. Expose both observations so
+    // the renderer can identify equivalent policies without keying on every
+    // descriptor's position within a bindless array. Keep the declarations:
+    // texture-layout lowering also observes their union.
+    for (auto &function : *parsed.get()) for (auto &block : function)
+      for (auto &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (!call || !call->getCalledFunction() ||
+            !call->getCalledFunction()->getName().startswith("dx.op.")) continue;
+        if (call->getNumArgOperands() < 4) {
+          unknown_handle |= call->getCalledFunction()->getName().startswith("dx.op.createHandle");
+          continue;
+        }
+        auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+        if (!opcode) continue;
+        uint32_t cls = 0, space = 0;
+        uint64_t first = 0, end = 0;
+        llvm::Value *index = nullptr;
+        if (opcode->getZExtValue() == unsigned(hlsl::DXIL::OpCode::CreateHandle)) {
+          auto *type = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          auto *id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+          if (!type || !id) { unknown_handle = true; continue; }
+          cls = uint32_t(type->getZExtValue());
+          const hlsl::DxilResourceBase *resource = nullptr;
+          const auto slot = id->getZExtValue();
+          // Range IDs are metadata IDs, not necessarily vector positions.
+          if (cls == 0) for (const auto &r : dm->GetSRVs()) if (r->GetID() == slot) resource = r.get();
+          if (cls == 1) for (const auto &r : dm->GetUAVs()) if (r->GetID() == slot) resource = r.get();
+          if (cls == 3) for (const auto &r : dm->GetSamplers()) if (r->GetID() == slot) resource = r.get();
+          if (!resource) { if (cls != 2) unknown_handle = true; continue; }
+          space = resource->GetSpaceID(); first = resource->GetLowerBound();
+          end = first + resource->GetRangeSize(); index = call->getArgOperand(3);
+        } else if (opcode->getZExtValue() == unsigned(hlsl::DXIL::OpCode::CreateHandleFromBinding)) {
+          auto *binding = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(1));
+          if (!binding) { unknown_handle = true; continue; }
+          const auto r = hlsl::resource_helper::loadBindingFromConstant(*binding);
+          cls = r.resourceClass; space = r.spaceID; first = r.rangeLowerBound;
+          end = uint64_t(r.rangeUpperBound) + 1; index = call->getArgOperand(2);
+          if (!access_only && (cls == 0 || cls == 1 || cls == 3) && end > first)
+            ranges.push_back({cls, space, uint32_t(first),
+                uint32_t(std::min<uint64_t>(end - first, UINT32_MAX))});
+        } else if (call->getCalledFunction()->getName().startswith("dx.op.createHandle")) {
+          // Do not narrow declarations for an unrecognized handle producer.
+          unknown_handle = true;
+        }
+        auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(index);
+        if (!index || (cls != 0 && cls != 1 && cls != 3)) continue;
+        const auto before = ranges.size();
+        if (constant && constant->getZExtValue() >= first && constant->getZExtValue() < end)
+          ranges.push_back({cls, space, uint32_t(constant->getZExtValue()), 1});
+        else if (access_only && end > first)
+          ranges.push_back({cls, space, uint32_t(first),
+              uint32_t(std::min<uint64_t>(end - first, UINT32_MAX))});
+        if (access_only && ranges.size() != before)
+          SetSampleOnly(ranges.back(), cls == 0 && SampleOnlyHandle(call));
+      }
+    if (access_only && unknown_handle) declarations();
+    const auto identity = [](const Binding &r) {
+      return std::array<uint32_t, 5>{r.resource_class, r.space, r.base_register, r.count, SampleOnly(r)};
+    };
+    std::sort(ranges.begin(), ranges.end(), [&](const auto &a, const auto &b) { return identity(a) < identity(b); });
+    ranges.erase(std::unique(ranges.begin(), ranges.end(), [&](const auto &a, const auto &b) {
+      return identity(a) == identity(b);
+    }), ranges.end());
     const auto capacity = *count;
     *count = ranges.size();
     if (bindings) {
@@ -839,6 +950,16 @@ extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
     }
     return SCORPI_DXBC_TO_DXIL_OK;
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
+extern "C" int ScorpiInspectSamplingBindings(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, ScorpiSamplingBinding *bindings, size_t *count) {
+  return InspectBindings(code, size, metadata, metadata_size, bindings, count, false);
+}
+
+extern "C" int ScorpiInspectDescriptorAccess(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, ScorpiDescriptorAccess *bindings, size_t *count) {
+  return InspectBindings(code, size, metadata, metadata_size, bindings, count, true);
 }
 
 extern "C" int ScorpiLowerTypedBufferViewsWithOptions(const void *code, size_t size,
