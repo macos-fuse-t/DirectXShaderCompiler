@@ -76,6 +76,38 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 assert (1, 0, 5, 1, 0) in reflected, reflected
                 assert all(not r[4] for r in reflected if r[0] != 0), reflected
         print('PASS', model, 'descriptor access: constant/dynamic indices, nonzero base/space, sample versus load')
+        for structured in (False, True):
+            resource = 'RWStructuredBuffer<uint>' if structured else 'RWByteAddressBuffer'
+            accesses = ('uint a = input[0]; input[0] = a + 1; '
+                        'InterlockedAdd(input[0], 7, a); '
+                        'InterlockedCompareExchange(input[0], 8, 9, a); '
+                        'uint b = input[0];') if structured else (
+                        'uint a = input.Load(0); input.Store(0, a + 1); '
+                        'input.InterlockedAdd(0, 7, a); '
+                        'input.InterlockedCompareExchange(0, 8, 9, a); '
+                        'uint b = input.Load(0);')
+            source = (f'{resource} input:register(u0);\n'
+                      'RWByteAddressBuffer result:register(u5);\n'
+                      '[numthreads(1,1,1)] void main() { '
+                      + accesses + ' result.Store2(0,uint2(a,b)); }')
+            (folder/'null-buffer.hlsl').write_text(source)
+            subprocess.run([dxc, '-T', 'cs_'+model, '-E', 'main', '-Fo',
+                            str(folder/'null-buffer.dxil'), str(folder/'null-buffer.hlsl')], check=True)
+            code = (folder/'null-buffer.dxil').read_bytes()
+            for register in (0, 1):
+                policy = (Requirement*1)(Requirement(1,0,register,1,128))
+                output, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(4096)
+                status = specialize(code,len(code),None,0,0xffffffff,0,4|8,
+                                    policy,1,C.byref(output),C.byref(size),error,len(error))
+                assert status == 0 and bool(output.value) == (register == 0), error.value
+                if not output.value:
+                    continue
+                (folder/'null-buffer-lowered.dxil').write_bytes(C.string_at(output,size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                ir = subprocess.check_output([dxc,'-dumpbin',str(folder/'null-buffer-lowered.dxil')],text=True)
+                assert 'call %dx.types.Dimensions @dx.op.getDimensions' in ir, ir
+                assert 'br i1' in ir and 'ScorpiTypedBufferMetadata' not in ir, ir
+            print('PASS',model,resource,'null read/store/atomics guarded only for requested binding; no metadata')
         # Dense feedback must need no metadata binding at all. Keep sparse
         # table/root paths, including multi-load structured status aggregation.
         for cls in (0, 1):

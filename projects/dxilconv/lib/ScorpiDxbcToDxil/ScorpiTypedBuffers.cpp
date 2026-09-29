@@ -997,9 +997,21 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> textureLoads;
   std::vector<CallInst *> bufferLoads;
   std::vector<CallInst *> feedbackChecks;
+  std::vector<CallInst *> nullBufferAccesses;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
+    if ((options & SCORPI_SHADER_BINDING_POLICY) &&
+        (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad ||
+         op == OpCode::BufferStore || op == OpCode::RawBufferStore ||
+         op == OpCode::AtomicBinOp || op == OpCode::AtomicCompareExchange)) {
+      std::set<Value *> seen;
+      const auto kind = Kind(call->getArgOperand(1), dm, seen);
+      seen.clear();
+      if ((kind == ResourceKind::RawBuffer || kind == ResourceKind::StructuredBuffer) &&
+          (SamplingRequirements(dm, call->getArgOperand(1), policy, policyCount, seen) &
+           SCORPI_SAMPLING_NULL_BUFFER)) nullBufferAccesses.push_back(call);
+    }
     if(op==OpCode::CheckAccessFullyMapped)feedbackChecks.push_back(call);
     if (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad) bufferLoads.push_back(call);
     if (op == OpCode::TextureLoad) {
@@ -1083,7 +1095,8 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
           return !feedbackUsed(call);
         }), textureLoads.end());
   }
-  if (calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty()) return false;
+  if (calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
+      nullBufferAccesses.empty()) return false;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
@@ -1147,7 +1160,37 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
     for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
   }
-  if (!samples.empty() || !feedbackChecks.empty()) {
+  // The native converter elides constant-offset raw/structured buffer bounds
+  // checks even with BoundsCheck enabled. A null UAV can consequently write
+  // the zero-address page, corrupting later null reads. Guard only handles
+  // whose current binding policy includes null buffer views. GetDimensions
+  // reads native descriptor size; no private metadata or extra resource is
+  // needed. Non-null variants and unrelated handles remain untouched.
+  for (auto *call : nullBufferAccesses) {
+    IRBuilder<> b(call);
+    auto *dimensionOp = dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getInt32Ty());
+    auto *dimensions = b.CreateCall(dimensionOp, {b.getInt32(unsigned(OpCode::GetDimensions)),
+        call->getArgOperand(1), b.getInt32(0)});
+    auto *present = b.CreateICmpNE(b.CreateExtractValue(dimensions, 0), b.getInt32(0));
+    auto *before = call->getParent();
+    auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.null.buffer.end");
+    before->getTerminator()->eraseFromParent();
+    auto *access = BasicBlock::Create(call->getContext(), "scorpi.buffer.access",
+        before->getParent(), after);
+    call->removeFromParent();
+    access->getInstList().push_back(call);
+    BranchInst::Create(after, access);
+    BranchInst::Create(access, after, present, before);
+    if (!call->getType()->isVoidTy()) {
+      auto *result = PHINode::Create(call->getType(), 2, "scorpi.null.buffer.result", &*after->begin());
+      call->replaceAllUsesWith(result);
+      result->addIncoming(call, access);
+      // A null descriptor has no missing sparse tiles: native opaque status
+      // zero also denotes fully mapped, matching untouched native loads.
+      result->addIncoming(Constant::getNullValue(call->getType()), before);
+    }
+  }
+  if (!samples.empty() || !feedbackChecks.empty() || !nullBufferAccesses.empty()) {
     // Canonicalize aggregate sample-result PHIs and dead descriptor arithmetic
     // before IR conversion. Conditional multi-sample shaders otherwise produce
     // AIR rejected by the Metal compiler's bitcode reader.
