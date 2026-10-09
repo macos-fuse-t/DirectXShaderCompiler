@@ -74,8 +74,8 @@ bool HasTableBounds(Value *handle, DxilModule &dm,
 }
 } // namespace
 
-bool ScorpiHasAtomic64(DxilModule &dm) {
-  for (auto &fn : *dm.GetModule())
+bool ScorpiHasAtomic64(Module &module) {
+  for (auto &fn : module)
     for (auto &block : fn)
       for (auto &inst : block)
         if (auto *call = dyn_cast<CallInst>(&inst))

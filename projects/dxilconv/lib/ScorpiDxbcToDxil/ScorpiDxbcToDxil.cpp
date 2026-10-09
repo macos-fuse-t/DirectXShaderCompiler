@@ -1059,9 +1059,10 @@ extern "C" int ScorpiInspectAtomic64(const void *code, size_t size, int *require
         hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "atomic64-inspection", false);
     auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
     if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
-    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
-    if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
-    *required = ScorpiHasAtomic64(*dm);
+    // Opcode inspection needs only instructions. Loading a DxilModule also
+    // decodes resource metadata, which can be incomplete in converted DXBC
+    // and is not needed to determine whether any i64 atomics are present.
+    *required = ScorpiHasAtomic64(*parsed.get());
     return SCORPI_DXBC_TO_DXIL_OK;
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
 }
