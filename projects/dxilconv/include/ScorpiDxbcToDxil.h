@@ -208,17 +208,16 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiPromoteTexture1D(const void *code, size_t size, void **binary,
     size_t *binary_size, char *error, size_t error_size);
 
-// Private descriptor metadata ABI v2. Native descriptor tables are independent.
-// t0: per-draw root metadata. t1..4096: resource metadata pages;
-// t4097..4112: sampler metadata pages. Each page contains 256 32-byte
-// records, followed by immutable sparse-feedback payloads addressed within it.
-#define SCORPI_DESCRIPTOR_METADATA_ABI 2
-#define SCORPI_METADATA_PAGE_SHIFT 8
+// Private descriptor metadata ABI v3. Each heap slot contains a native buffer
+// descriptor for an immutable view-local payload: a 32-byte record followed by
+// sparse feedback (when needed). Copies preserve that descriptor verbatim.
+// t0 is per-draw root metadata; resource and sampler payloads use disjoint ranges.
+#define SCORPI_DESCRIPTOR_METADATA_ABI 3
 #define SCORPI_METADATA_RECORD_BYTES 32
 #define SCORPI_METADATA_RESOURCE_REGISTER 1
-#define SCORPI_METADATA_RESOURCE_PAGES 4096
-#define SCORPI_METADATA_SAMPLER_REGISTER 4097
-#define SCORPI_METADATA_SAMPLER_PAGES 16
+#define SCORPI_METADATA_RESOURCE_DESCRIPTORS 1048576
+#define SCORPI_METADATA_SAMPLER_REGISTER 1048577
+#define SCORPI_METADATA_SAMPLER_DESCRIPTORS 4096
 #define SCORPI_METADATA_PRIVATE_PARAMETERS 4
 typedef struct ScorpiTypedBufferBinding {
   uint32_t resource_class, space, base_register, count;

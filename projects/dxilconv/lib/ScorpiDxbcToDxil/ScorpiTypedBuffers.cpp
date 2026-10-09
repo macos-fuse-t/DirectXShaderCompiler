@@ -218,7 +218,7 @@ class Lowering {
   const ScorpiTypedBufferBinding *bindings;
   size_t count;
   uint32_t space, resourceID;
-  uint32_t pageResourceIDs[2];
+  uint32_t descriptorResourceIDs[2];
   bool minmaxFiltering;
   bool nativeTextures;
   bool bindingPolicy;
@@ -285,7 +285,7 @@ public:
       minmaxFiltering(!(options & (SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_NATIVE_TEXTURES))),
       nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES),
       bindingPolicy(options & SCORPI_SHADER_BINDING_POLICY), policy(p), policyCount(pn) {
-    (void)self; // ABI v2 never subtracts GPU addresses.
+    (void)self; // ABI v3 never subtracts GPU addresses.
     auto &ctx = dm.GetModule()->getContext();
     auto resource = std::make_unique<DxilResource>();
     resource->SetID(dm.GetSRVs().size()); resource->SetRW(false);
@@ -296,21 +296,21 @@ public:
         {Type::getInt32Ty(ctx)}, "ScorpiTypedBufferMetadata")->getPointerTo()));
     resourceID = dm.AddSRV(std::move(resource));
     for (unsigned i = 0; i != 2; ++i) {
-      auto pages = std::make_unique<DxilResource>();
-      pages->SetID(dm.GetSRVs().size()); pages->SetRW(false);
-      pages->SetKind(ResourceKind::RawBuffer); pages->SetSpaceID(space);
-      pages->SetLowerBound(i ? SCORPI_METADATA_SAMPLER_REGISTER : SCORPI_METADATA_RESOURCE_REGISTER);
-      pages->SetRangeSize(i ? SCORPI_METADATA_SAMPLER_PAGES : SCORPI_METADATA_RESOURCE_PAGES);
-      pages->SetGlobalName(i ? "ScorpiSamplerMetadataPages" : "ScorpiResourceMetadataPages");
-      pages->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
-          {Type::getInt32Ty(ctx)}, "ScorpiMetadataPage")->getPointerTo()));
-      pageResourceIDs[i] = dm.AddSRV(std::move(pages));
+      auto descriptors = std::make_unique<DxilResource>();
+      descriptors->SetID(dm.GetSRVs().size()); descriptors->SetRW(false);
+      descriptors->SetKind(ResourceKind::RawBuffer); descriptors->SetSpaceID(space);
+      descriptors->SetLowerBound(i ? SCORPI_METADATA_SAMPLER_REGISTER : SCORPI_METADATA_RESOURCE_REGISTER);
+      descriptors->SetRangeSize(i ? SCORPI_METADATA_SAMPLER_DESCRIPTORS : SCORPI_METADATA_RESOURCE_DESCRIPTORS);
+      descriptors->SetGlobalName(i ? "ScorpiSamplerMetadata" : "ScorpiResourceMetadata");
+      descriptors->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
+          {Type::getInt32Ty(ctx)}, "ScorpiDescriptorMetadata")->getPointerTo()));
+      descriptorResourceIDs[i] = dm.AddSRV(std::move(descriptors));
     }
   }
 
-  Value *PageHandle(IRBuilder<> &b, Value *page, bool sampler) {
-    auto &resource = dm.GetSRV(pageResourceIDs[sampler]);
-    auto *index = b.CreateAdd(page, b.getInt32(resource.GetLowerBound()));
+  Value *DescriptorMetadataHandle(IRBuilder<> &b, Value *slot, bool sampler) {
+    auto &resource = dm.GetSRV(descriptorResourceIDs[sampler]);
+    auto *index = b.CreateAdd(slot, b.getInt32(resource.GetLowerBound()));
     if (dm.GetShaderModel()->GetMinor() >= 6) {
       auto binding = resource_helper::loadBindingFromResourceBase(&resource);
       auto *value = resource_helper::getAsConstant(binding, dm.GetOP()->GetResourceBindingType(), *dm.GetShaderModel());
@@ -323,7 +323,7 @@ public:
         b.getInt32(resource.GetID()), index, b.getTrue()});
   }
 
-  // Word 7 returns the metadata buffer handle, used for page-local feedback.
+  // Word 7 returns the metadata buffer handle, used for view-local feedback.
   Value *Word(Value *handle, unsigned word) {
     auto key = std::make_pair(handle, word);
     auto found = words.find(key);
@@ -383,10 +383,8 @@ public:
       auto *base = Load(b, metadata, offset);
       auto *slot = b.CreateAdd(base, b.CreateAdd(b.CreateSub(index, b.getInt32(range->base_register)),
           b.getInt32(range->table_offset)));
-      metadata = PageHandle(b, b.CreateLShr(slot, b.getInt32(SCORPI_METADATA_PAGE_SHIFT)),
-          cls == unsigned(ResourceClass::Sampler));
-      offset = b.CreateMul(b.CreateAnd(slot, b.getInt32((1u << SCORPI_METADATA_PAGE_SHIFT) - 1)),
-          b.getInt32(SCORPI_METADATA_RECORD_BYTES));
+      metadata = DescriptorMetadataHandle(b, slot, cls == unsigned(ResourceClass::Sampler));
+      offset = b.getInt32(0);
     }
     if (word == 7) return words[key] = metadata;
     return words[key] = Load(b, metadata, b.CreateAdd(offset, b.getInt32(word * 4)));
