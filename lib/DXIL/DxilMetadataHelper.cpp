@@ -3417,55 +3417,55 @@ ConstantAsMetadata *DxilMDHelper::FloatToConstMD(float v) {
 }
 
 int32_t DxilMDHelper::ConstMDToInt32(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return (int32_t)pConst->getZExtValue();
 }
 
 unsigned DxilMDHelper::ConstMDToUint32(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return (unsigned)pConst->getZExtValue();
 }
 
 uint64_t DxilMDHelper::ConstMDToUint64(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return pConst->getZExtValue();
 }
 
 int8_t DxilMDHelper::ConstMDToInt8(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return (int8_t)pConst->getZExtValue();
 }
 
 uint8_t DxilMDHelper::ConstMDToUint8(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return (uint8_t)pConst->getZExtValue();
 }
 
 bool DxilMDHelper::ConstMDToBool(const MDOperand &MDO) {
-  ConstantInt *pConst = mdconst::extract<ConstantInt>(MDO);
+  ConstantInt *pConst = mdconst::dyn_extract_or_null<ConstantInt>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return pConst->getZExtValue() != 0;
 }
 
 float DxilMDHelper::ConstMDToFloat(const MDOperand &MDO) {
-  ConstantFP *pConst = mdconst::extract<ConstantFP>(MDO);
+  ConstantFP *pConst = mdconst::dyn_extract_or_null<ConstantFP>(MDO);
   IFTBOOL(pConst != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return pConst->getValueAPF().convertToFloat();
 }
 
 string DxilMDHelper::StringMDToString(const MDOperand &MDO) {
-  MDString *pMDString = dyn_cast<MDString>(MDO.get());
+  MDString *pMDString = dyn_cast_or_null<MDString>(MDO.get());
   IFTBOOL(pMDString != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return pMDString->getString().str();
 }
 
 StringRef DxilMDHelper::StringMDToStringRef(const MDOperand &MDO) {
-  MDString *pMDString = dyn_cast<MDString>(MDO.get());
+  MDString *pMDString = dyn_cast_or_null<MDString>(MDO.get());
   IFTBOOL(pMDString != nullptr, DXC_E_INCORRECT_DXIL_METADATA);
   return pMDString->getString();
 }
