@@ -91,6 +91,15 @@ SCORPI_DXBC_TO_DXIL_EXPORT uint32_t
 ScorpiInspectCoverageShader(const void *code, size_t size,
                            const void *metadata, size_t metadata_size);
 
+// Proves a coverage-only PS is a zero-preserving bit selection/replication.
+// Each output bit depends on at most one coverage bit, so OR/XOR reduction
+// commutes with this transform. The low four bits must preserve raw coverage
+// for the four-sample scratch pass. Returns one on success, zero otherwise.
+SCORPI_DXBC_TO_DXIL_EXPORT uint32_t
+ScorpiInspectCoverageTransform(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, uint32_t samples,
+    uint32_t output_masks[16]);
+
 typedef struct ScorpiRasterReplayParameters {
   uint32_t width, height, coverage_base_element, sample_base;
   int32_t origin_x, origin_y;

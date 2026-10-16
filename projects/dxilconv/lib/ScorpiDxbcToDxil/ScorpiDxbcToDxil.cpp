@@ -1530,3 +1530,105 @@ extern "C" uint32_t ScorpiInspectCoverageShader(
     return coverage && (components & 1) ? SCORPI_COVERAGE_MASK_PIXEL : 0;
   } catch (...) { return 0; }
 }
+
+// A symbolic bit map is stronger than evaluating a few test inputs: it proves
+// both union and parity are preserved for every coverage mask and primitive.
+extern "C" uint32_t ScorpiInspectCoverageTransform(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, uint32_t samples,
+    uint32_t output_masks[16]) {
+  if (!output_masks || (samples != 4 && samples != 8 && samples != 16)) return 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto binary = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(binary.data());
+    if (!hlsl::IsValidDxilContainer(container, binary.size())) return 0;
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) return 0;
+    llvm::LLVMContext context;
+    auto buffer = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "coverage-transform", false);
+    auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+    if (!parsed) return 0;
+    auto *dxil = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dxil || !dxil->GetShaderModel()->IsPS() || !dxil->GetUAVs().empty() ||
+        dxil->m_ShaderFlags.GetResourceDescriptorHeapIndexing()) return 0;
+    const auto &outputs = dxil->GetOutputSignature().GetElements();
+    if (outputs.size() != 1 || outputs[0]->GetKind() != hlsl::DXIL::SemanticKind::Target ||
+        outputs[0]->GetSemanticStartIndex() != 0 || outputs[0]->GetRows() != 1 ||
+        outputs[0]->GetCompType().GetKind() != hlsl::DXIL::ComponentType::U32) return 0;
+    auto *entry = dxil->GetEntryFunction();
+    if (!entry || entry->size() != 1) return 0;
+    using Bits = std::array<int, 32>; // -1 means zero; otherwise input bit index.
+    Bits zero; zero.fill(-1);
+    Bits red = zero;
+    std::vector<std::pair<llvm::Value *, Bits>> values;
+    auto find = [&](llvm::Value *value, Bits &bits) {
+      if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+        if (c->isZero()) { bits = zero; return true; }
+        return false;
+      }
+      for (const auto &known : values) if (known.first == value) { bits = known.second; return true; }
+      return false;
+    };
+    auto constant = [](llvm::Value *value, uint64_t expected) {
+      auto *c = llvm::dyn_cast<llvm::ConstantInt>(value);
+      return c && c->getZExtValue() == expected;
+    };
+    unsigned components = 0;
+    bool coverage = false;
+    for (auto &inst : entry->front()) {
+      if (llvm::isa<llvm::ReturnInst>(inst)) continue;
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        if (!call->getCalledFunction()) return 0;
+        auto name = call->getCalledFunction()->getName();
+        if (name == "dx.op.coverage.i32" && call->getNumArgOperands() == 1 &&
+            constant(call->getArgOperand(0), 91)) {
+          Bits bits = zero;
+          for (unsigned bit = 0; bit < samples; ++bit) bits[bit] = int(bit);
+          values.emplace_back(call, bits); coverage = true;
+        } else if (name == "dx.op.storeOutput.i32" && call->getNumArgOperands() == 5 &&
+            constant(call->getArgOperand(0), 5) && constant(call->getArgOperand(1), 0) &&
+            constant(call->getArgOperand(2), 0)) {
+          auto *column = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(3));
+          Bits bits;
+          if (!column || column->getZExtValue() > 3 || !find(call->getArgOperand(4), bits)) return 0;
+          unsigned index = unsigned(column->getZExtValue());
+          if (components & (1u << index)) return 0;
+          components |= 1u << index;
+          if (!index) red = bits;
+        } else return 0;
+        continue;
+      }
+      auto *op = llvm::dyn_cast<llvm::BinaryOperator>(&inst);
+      if (!op || !op->getType()->isIntegerTy(32)) return 0;
+      Bits a, b, result = zero;
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(op->getOperand(1));
+      if ((op->getOpcode() == llvm::Instruction::Shl || op->getOpcode() == llvm::Instruction::LShr) &&
+          amount && amount->getZExtValue() < 32 && find(op->getOperand(0), a)) {
+        int shift = int(amount->getZExtValue());
+        for (int bit = 0; bit < 32; ++bit) {
+          int source = bit + (op->getOpcode() == llvm::Instruction::Shl ? -shift : shift);
+          if (source >= 0 && source < 32) result[bit] = a[source];
+        }
+      } else if (op->getOpcode() == llvm::Instruction::And && amount && find(op->getOperand(0), a)) {
+        for (unsigned bit = 0; bit < 32; ++bit)
+          if (amount->getZExtValue() & (1ull << bit)) result[bit] = a[bit];
+      } else if ((op->getOpcode() == llvm::Instruction::Or || op->getOpcode() == llvm::Instruction::Xor) &&
+          find(op->getOperand(0), a) && find(op->getOperand(1), b)) {
+        for (unsigned bit = 0; bit < 32; ++bit) {
+          if (a[bit] >= 0 && b[bit] >= 0 && a[bit] != b[bit]) return 0;
+          result[bit] = op->getOpcode() == llvm::Instruction::Xor && a[bit] == b[bit] ?
+              -1 : std::max(a[bit], b[bit]);
+        }
+      } else return 0;
+      values.emplace_back(op, result);
+    }
+    if (!coverage || !(components & 1)) return 0;
+    for (int bit = 0; bit < 4; ++bit) if (red[bit] != bit) return 0;
+    uint32_t masks[16] = {};
+    for (unsigned bit = 0; bit < 32; ++bit)
+      if (red[bit] >= 0) masks[red[bit]] |= uint32_t(1) << bit;
+    std::copy(masks, masks + 16, output_masks);
+    return 1;
+  } catch (...) { return 0; }
+}
