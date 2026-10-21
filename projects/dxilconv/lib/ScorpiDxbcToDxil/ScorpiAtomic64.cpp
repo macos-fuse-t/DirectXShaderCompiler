@@ -1,5 +1,7 @@
 #include "ScorpiAtomic64.h"
 #include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilInstructions.h"
+#include <climits>
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/DXIL/DxilResource.h"
 #include "dxc/DXIL/DxilResourceBinding.h"
@@ -14,6 +16,10 @@ using namespace llvm;
 using namespace hlsl;
 using namespace hlsl::DXIL;
 namespace {
+constexpr unsigned kWordBytes = sizeof(uint32_t);
+constexpr unsigned kWordBits = kWordBytes * CHAR_BIT;
+constexpr unsigned kAtomicBytes = sizeof(uint64_t);
+constexpr unsigned kAtomicBits = kAtomicBytes * CHAR_BIT;
 OpCode Opcode(CallInst *call) {
   if (call->getCalledFunction() &&
       call->getCalledFunction()->getName().startswith("dx.op.") &&
@@ -74,37 +80,66 @@ bool HasTableBounds(Value *handle, DxilModule &dm,
 }
 } // namespace
 
-bool ScorpiHasAtomic64(Module &module) {
-  for (auto &fn : module)
-    for (auto &block : fn)
-      for (auto &inst : block)
-        if (auto *call = dyn_cast<CallInst>(&inst))
-          if (call->getType()->isIntegerTy(64) &&
-              (Opcode(call) == OpCode::AtomicBinOp ||
-               Opcode(call) == OpCode::AtomicCompareExchange))
-            return true;
-  return false;
+namespace {
+bool NativeTextureMinMax(CallInst *call, ResourceKind kind) {
+  if (!call || !call->use_empty() || Opcode(call)!=OpCode::AtomicBinOp) return false;
+  switch (kind) {
+  case ResourceKind::Texture1D: case ResourceKind::Texture1DArray:
+  case ResourceKind::Texture2D: case ResourceKind::Texture2DArray:
+  case ResourceKind::Texture3D: break;
+  default: return false;
+  }
+  const auto op=cast<ConstantInt>(DxilInst_AtomicBinOp(call).get_atomicOp())->getZExtValue();
+  return op==unsigned(AtomicBinOpCode::UMin) || op==unsigned(AtomicBinOpCode::UMax);
 }
+}
+uint32_t ScorpiClassifyAtomic64(Module &module) {
+  uint32_t required=0;
+  for (auto &fn:module) for(auto &block:fn) for(auto &inst:block) {
+    if (auto *call=dyn_cast<CallInst>(&inst)) {
+      if (!call->getType()->isIntegerTy(kAtomicBits) || (Opcode(call)!=OpCode::AtomicBinOp && Opcode(call)!=OpCode::AtomicCompareExchange)) continue;
+      auto *annotation=dyn_cast<CallInst>(call->getArgOperand(1));
+      if (!annotation || Opcode(annotation)!=OpCode::AnnotateHandle) { required|=SCORPI_ATOMIC64_BUFFER;continue; }
+      auto kind=resource_helper::loadPropsFromConstant(*cast<Constant>(DxilInst_AnnotateHandle(annotation).get_props())).getResourceKind();
+      required |= kind==ResourceKind::RawBuffer || kind==ResourceKind::StructuredBuffer ? SCORPI_ATOMIC64_BUFFER :
+          NativeTextureMinMax(call,kind) ? SCORPI_ATOMIC64_NATIVE_TEXTURE_MINMAX : SCORPI_ATOMIC64_TYPED_EMULATION;
+    } else if (auto *rmw=dyn_cast<AtomicRMWInst>(&inst)) {
+      if (rmw->getType()->isIntegerTy(kAtomicBits)) required|=SCORPI_ATOMIC64_GROUPSHARED;
+    } else if (auto *cmp=dyn_cast<AtomicCmpXchgInst>(&inst)) {
+      if (cmp->getCompareOperand()->getType()->isIntegerTy(kAtomicBits)) required|=SCORPI_ATOMIC64_GROUPSHARED;
+    }
+  }
+  return required;
+}
+bool ScorpiHasAtomic64(Module &module) { return ScorpiClassifyAtomic64(module)!=0; }
 
 bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
                          const ScorpiTypedBufferBinding *bindings,
-                         size_t binding_count) {
-  std::vector<CallInst *> calls;
-  for (auto &fn : *dm.GetModule())
-    for (auto &block : fn)
-      for (auto &inst : block) {
-        auto *call = dyn_cast<CallInst>(&inst);
-        if (call && call->getType()->isIntegerTy(64) &&
-            (Opcode(call) == OpCode::AtomicBinOp ||
-             Opcode(call) == OpCode::AtomicCompareExchange)) {
-          const auto kind = Kind(call->getArgOperand(1), dm);
-          if (kind != ResourceKind::RawBuffer &&
-              kind != ResourceKind::StructuredBuffer)
-            throw std::runtime_error(
-                "64-bit atomic emulation requires a raw or structured UAV");
-          calls.push_back(call);
-        }
+                         size_t binding_count, bool native_texture_minmax) {
+  std::vector<Instruction *> calls;
+  for (auto &fn : *dm.GetModule()) for (auto &block : fn) for (auto &inst : block) {
+    if (auto *call=dyn_cast<CallInst>(&inst)) {
+      if (call->getType()->isIntegerTy(kAtomicBits) && (Opcode(call)==OpCode::AtomicBinOp || Opcode(call)==OpCode::AtomicCompareExchange)) {
+        auto kind=Kind(call->getArgOperand(1),dm);
+        if (native_texture_minmax && NativeTextureMinMax(call,kind)) continue;
+        if (kind!=ResourceKind::RawBuffer && kind!=ResourceKind::StructuredBuffer && kind!=ResourceKind::TypedBuffer &&
+            kind!=ResourceKind::Texture1D && kind!=ResourceKind::Texture1DArray && kind!=ResourceKind::Texture2D &&
+            kind!=ResourceKind::Texture2DArray && kind!=ResourceKind::Texture3D)
+          throw std::runtime_error("64-bit atomic resource dimension unsupported");
+        calls.push_back(call);
       }
+    } else if (auto *rmw=dyn_cast<AtomicRMWInst>(&inst)) {
+      if (rmw->getType()->isIntegerTy(kAtomicBits)) {
+        if (rmw->getPointerOperand()->getType()->getPointerAddressSpace()!=kTGSMAddrSpace) throw std::runtime_error("64-bit pointer atomic is not groupshared");
+        calls.push_back(rmw);
+      }
+    } else if (auto *cmp=dyn_cast<AtomicCmpXchgInst>(&inst)) {
+      if (cmp->getCompareOperand()->getType()->isIntegerTy(kAtomicBits)) {
+        if (cmp->getPointerOperand()->getType()->getPointerAddressSpace()!=kTGSMAddrSpace) throw std::runtime_error("64-bit pointer compare exchange is not groupshared");
+        calls.push_back(cmp);
+      }
+    }
+  }
   if (calls.empty())
     return false;
   if (lock_space == UINT32_MAX)
@@ -153,13 +188,17 @@ bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
                  {entry.getInt8(unsigned(ResourceClass::UAV)),
                   entry.getInt32(lockID), entry.getInt32(0), entry.getFalse()});
     }
-    const bool compare = Opcode(original) == OpCode::AtomicCompareExchange;
-    auto *handle = original->getArgOperand(1);
-    const unsigned coord = compare ? 2 : 3;
-    auto *x = original->getArgOperand(coord);
-    auto *y = original->getArgOperand(coord + 1);
-    auto *z = original->getArgOperand(coord + 2);
-    auto *operand = original->getArgOperand(6);
+    auto *call=dyn_cast<CallInst>(original);
+    auto *sharedRmw=dyn_cast<AtomicRMWInst>(original);
+    auto *sharedCmp=dyn_cast<AtomicCmpXchgInst>(original);
+    const bool shared=!call, compare=sharedCmp || (call && Opcode(call)==OpCode::AtomicCompareExchange);
+    Value *handle=call ? call->getArgOperand(1) : nullptr;
+    const unsigned coord = compare ? DxilInst_AtomicCompareExchange::arg_offset0 : DxilInst_AtomicBinOp::arg_offset0;
+    Value *x=call ? call->getArgOperand(coord) : nullptr;
+    Value *y=call ? call->getArgOperand(coord+1) : nullptr;
+    Value *z=call ? call->getArgOperand(coord+2) : nullptr;
+    Value *operand=call ? call->getArgOperand(DxilInst_AtomicBinOp::arg_newValue) : sharedRmw ? sharedRmw->getValOperand() : sharedCmp->getNewValOperand();
+    Value *comparison=compare ? (call ? call->getArgOperand(DxilInst_AtomicCompareExchange::arg_compareValue) : sharedCmp->getCompareOperand()) : nullptr;
     auto *before = original->getParent();
     auto *after = before->splitBasicBlock(original, "atomic64.end");
     before->getTerminator()->eraseFromParent();
@@ -168,22 +207,22 @@ bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
     auto *acquired = BasicBlock::Create(ctx, "atomic64.acquired", fn, after);
     auto *latch = BasicBlock::Create(ctx, "atomic64.latch", fn, after);
     IRBuilder<> b(before);
-    const bool raw = Kind(handle, dm) == ResourceKind::RawBuffer;
-    auto *offset = raw ? x : y;
-    Value *valid = b.CreateICmpULE(offset, b.getInt32(UINT32_MAX - 4));
-    // Root UAVs carry an address, not a view length. GetDimensions is only
-    // defined for table/heap descriptors; check the full eight-byte footprint
-    // there so an OOB high word cannot leave a partial low-word update.
-    if (HasTableBounds(handle, dm, bindings, binding_count)) {
-      auto *dimensions = callOp(b, OpCode::GetDimensions, b.getInt32Ty(),
-                                {handle, b.getInt32(0)});
-      auto *count = b.CreateExtractValue(dimensions, 0);
-      auto *bytes = raw ? count : b.CreateExtractValue(dimensions, 1);
-      valid = b.CreateAnd(
-          b.CreateICmpUGE(bytes, b.getInt32(8)),
-          b.CreateICmpULE(offset, b.CreateSub(bytes, b.getInt32(8))));
-      if (!raw)
-        valid = b.CreateAnd(valid, b.CreateICmpULT(x, count));
+    const auto kind=shared ? ResourceKind::Invalid : Kind(handle,dm);
+    const bool raw=kind==ResourceKind::RawBuffer;
+    const bool structured=kind==ResourceKind::StructuredBuffer;
+    const bool typed=!shared && !raw && !structured;
+    const bool texture=typed && kind!=ResourceKind::TypedBuffer;
+    Value *valid=b.getTrue();
+    if (raw || structured) {
+      auto *offset=raw ? x : y;
+      valid=b.CreateICmpULE(offset,b.getInt32(UINT32_MAX-kWordBytes));
+      if (HasTableBounds(handle,dm,bindings,binding_count)) {
+        auto *dimensions=callOp(b,OpCode::GetDimensions,b.getInt32Ty(),{handle,b.getInt32(0)});
+        auto *count=b.CreateExtractValue(dimensions,0);
+        auto *bytes=raw ? count : b.CreateExtractValue(dimensions,1);
+        valid=b.CreateAnd(b.CreateICmpUGE(bytes,b.getInt32(kAtomicBytes)),b.CreateICmpULE(offset,b.CreateSub(bytes,b.getInt32(kAtomicBytes))));
+        if (!raw) valid=b.CreateAnd(valid,b.CreateICmpULT(x,count));
+      }
     }
     b.CreateCondBr(valid, retry, after);
     b.SetInsertPoint(retry);
@@ -203,26 +242,52 @@ bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
     // spins with the lock held while another lane waits at reconvergence.
     auto fence = [&]() {
       callOp(b, OpCode::Barrier, b.getVoidTy(),
-             {b.getInt32(unsigned(BarrierMode::UAVFenceGlobal))});
+             {b.getInt32(unsigned(BarrierMode::UAVFenceGlobal) | (shared ? unsigned(BarrierMode::TGSMFence) : 0))});
     };
     fence();
-    Value *highX = raw ? b.CreateAdd(x, b.getInt32(4)) : x;
-    Value *highY = raw ? y : b.CreateAdd(y, b.getInt32(4));
-    auto word = [&](AtomicBinOpCode op, Value *wx, Value *wy, Value *value) {
-      return callOp(b, OpCode::AtomicBinOp, b.getInt32Ty(),
-                    {handle, b.getInt32(unsigned(op)), wx, wy, z, value});
+    Value *highX=raw ? b.CreateAdd(x,b.getInt32(kWordBytes)) : x;
+    Value *highY=structured ? b.CreateAdd(y,b.getInt32(kWordBytes)) : y;
+    Value *sharedLow=nullptr,*sharedHigh=nullptr;
+    if (shared) {
+      auto *pointer=sharedRmw ? sharedRmw->getPointerOperand() : sharedCmp->getPointerOperand();
+      sharedLow=b.CreateBitCast(pointer,PointerType::get(b.getInt32Ty(),kTGSMAddrSpace));
+      sharedHigh=b.CreateGEP(sharedLow,b.getInt32(1));
+    }
+    auto word=[&](AtomicBinOpCode op,Value *wx,Value *wy,Value *value) -> Value* {
+      if (shared) return b.CreateAtomicRMW(op==AtomicBinOpCode::Or ? AtomicRMWInst::Or : AtomicRMWInst::Xchg,
+          wx,value,AtomicOrdering::SequentiallyConsistent);
+      return callOp(b,OpCode::AtomicBinOp,b.getInt32Ty(),{handle,b.getInt32(unsigned(op)),wx,wy,z,value});
     };
-    auto *low = word(AtomicBinOpCode::Or, x, y, b.getInt32(0));
-    auto *high = word(AtomicBinOpCode::Or, highX, highY, b.getInt32(0));
+    Value *low=nullptr,*high=nullptr;
+    if (typed) {
+      auto *loaded=texture ? callOp(b,OpCode::TextureLoad,b.getInt32Ty(),{handle,b.getInt32(0),x,y,z,undef,undef,undef}) :
+          callOp(b,OpCode::BufferLoad,b.getInt32Ty(),{handle,x,undef});
+      low=b.CreateExtractValue(loaded,0);high=b.CreateExtractValue(loaded,1);
+    } else {
+      low=word(AtomicBinOpCode::Or,shared ? sharedLow : x,y,b.getInt32(0));
+      high=word(AtomicBinOpCode::Or,shared ? sharedHigh : highX,highY,b.getInt32(0));
+    }
     auto *old = b.CreateOr(b.CreateZExt(low, b.getInt64Ty()),
-                           b.CreateShl(b.CreateZExt(high, b.getInt64Ty()), 32));
+                           b.CreateShl(b.CreateZExt(high, b.getInt64Ty()), kWordBits));
     Value *value = nullptr;
     if (compare) {
-      value = b.CreateSelect(b.CreateICmpEQ(old, original->getArgOperand(5)),
+      value = b.CreateSelect(b.CreateICmpEQ(old, comparison),
                              operand, old);
     } else {
-      auto operation = static_cast<AtomicBinOpCode>(
-          cast<ConstantInt>(original->getArgOperand(2))->getZExtValue());
+      AtomicBinOpCode operation=AtomicBinOpCode::Invalid;
+      if (call) operation=static_cast<AtomicBinOpCode>(cast<ConstantInt>(DxilInst_AtomicBinOp(call).get_atomicOp())->getZExtValue());
+      else switch (sharedRmw->getOperation()) {
+      case AtomicRMWInst::Add: operation=AtomicBinOpCode::Add;break;
+      case AtomicRMWInst::And: operation=AtomicBinOpCode::And;break;
+      case AtomicRMWInst::Or: operation=AtomicBinOpCode::Or;break;
+      case AtomicRMWInst::Xor: operation=AtomicBinOpCode::Xor;break;
+      case AtomicRMWInst::Min: operation=AtomicBinOpCode::IMin;break;
+      case AtomicRMWInst::Max: operation=AtomicBinOpCode::IMax;break;
+      case AtomicRMWInst::UMin: operation=AtomicBinOpCode::UMin;break;
+      case AtomicRMWInst::UMax: operation=AtomicBinOpCode::UMax;break;
+      case AtomicRMWInst::Xchg: operation=AtomicBinOpCode::Exchange;break;
+      default: throw std::runtime_error("unsupported groupshared atomic64 operation");
+      }
       switch (operation) {
       case AtomicBinOpCode::Add:
         value = b.CreateAdd(old, operand);
@@ -255,9 +320,15 @@ bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
         throw std::runtime_error("unknown 64-bit atomic operation");
       }
     }
-    word(AtomicBinOpCode::Exchange, x, y, b.CreateTrunc(value, b.getInt32Ty()));
-    word(AtomicBinOpCode::Exchange, highX, highY,
-         b.CreateTrunc(b.CreateLShr(value, 32), b.getInt32Ty()));
+    auto *newLow=b.CreateTrunc(value,b.getInt32Ty());
+    auto *newHigh=b.CreateTrunc(b.CreateLShr(value,kWordBits),b.getInt32Ty());
+    if (typed) {
+      if (texture) callOp(b,OpCode::TextureStore,b.getInt32Ty(),{handle,x,y,z,newLow,newHigh,undef,undef,b.getInt8(kCompMask_X | kCompMask_Y)});
+      else callOp(b,OpCode::BufferStore,b.getInt32Ty(),{handle,x,undef,newLow,newHigh,undef,undef,b.getInt8(kCompMask_X | kCompMask_Y)});
+    } else {
+      word(AtomicBinOpCode::Exchange,shared ? sharedLow : x,y,newLow);
+      word(AtomicBinOpCode::Exchange,shared ? sharedHigh : highX,highY,newHigh);
+    }
     fence();
     callOp(b, OpCode::AtomicBinOp, b.getInt32Ty(),
            {lockHandle, b.getInt32(unsigned(AtomicBinOpCode::Exchange)),
@@ -283,7 +354,13 @@ bool ScorpiLowerAtomic64(DxilModule &dm, uint32_t lock_space,
         PHINode::Create(b.getInt64Ty(), 2, "atomic64.bounded", original);
     bounded->addIncoming(b.getInt64(0), before);
     bounded->addIncoming(result, latch);
-    original->replaceAllUsesWith(bounded);
+    Value *replacement=bounded;
+    if (sharedCmp) {
+      IRBuilder<> resultBuilder(original);
+      replacement=resultBuilder.CreateInsertValue(UndefValue::get(original->getType()),bounded,0);
+      replacement=resultBuilder.CreateInsertValue(replacement,resultBuilder.CreateICmpEQ(bounded,comparison),1);
+    }
+    original->replaceAllUsesWith(replacement);
     original->eraseFromParent();
   }
   return true;

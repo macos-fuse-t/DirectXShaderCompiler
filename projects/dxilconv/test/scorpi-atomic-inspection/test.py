@@ -24,6 +24,15 @@ def check(code, expected):
     assert status == 0 and required.value == expected, (status, required.value, expected)
 
 
+def program_from_container(code):
+    count = struct.unpack_from('<I', code, 28)[0]
+    for offset in struct.unpack_from('<' + 'I' * count, code, 32):
+        tag, size = struct.unpack_from('<4sI', code, offset)
+        if tag == b'DXIL':
+            return code[offset + 8:offset + 8 + size]
+    raise AssertionError('missing DXIL program')
+
+
 def container(bitcode):
     program = struct.pack('<II4sIII', 0x50066, (24 + len(bitcode)) // 4,
                           b'DXIL', 0x106, 16, len(bitcode)) + bitcode
@@ -46,7 +55,11 @@ with tempfile.TemporaryDirectory(prefix='scorpi-atomic-inspection-') as tmp:
                        f'{scalar} old; {operation}\n}}')
         subprocess.run([str(build / 'bin/dxc'), '-T', 'cs_6_6', '-E', 'main',
                         '-Fo', str(tmp / 'shader.dxil'), '-Fc', str(tmp / 'shader.ll'), str(src)], check=True)
-        check((tmp / 'shader.dxil').read_bytes(), expected)
+        code = (tmp / 'shader.dxil').read_bytes()
+        check(code, expected)
+        # D3D12 shader DDIs pass this program, without the DXBC container.
+        # Inspection must select the same bindings before normalization.
+        check(program_from_container(code), expected)
         # A null range-size metadata operand reproduces the crashing loader
         # dereference. Opcode inspection has no need to interpret this field.
         ir = (tmp / 'shader.ll').read_text()
@@ -56,5 +69,7 @@ with tempfile.TemporaryDirectory(prefix='scorpi-atomic-inspection-') as tmp:
         (tmp / 'incomplete.ll').write_text(ir)
         subprocess.run([str(build / 'bin/llvm-as'), str(tmp / 'incomplete.ll'),
                         '-o', str(tmp / 'incomplete.bc')], check=True)
-        check(container((tmp / 'incomplete.bc').read_bytes()), expected)
-        print('PASS', name, 'original and incomplete resource metadata')
+        code = container((tmp / 'incomplete.bc').read_bytes())
+        check(code, expected)
+        check(program_from_container(code), expected)
+        print('PASS', name, 'container and DDI program, original and incomplete resource metadata')

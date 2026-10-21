@@ -1032,27 +1032,38 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
   }
 }
 
-extern "C" int ScorpiInspectAtomic64(const void *code, size_t size, int *required) {
+extern "C" int ScorpiInspectAtomic64Requirements(const void *code, size_t size, uint32_t *required) {
   if (!code || !size || !required) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *required = 0;
   try {
     DxcMallocScope malloc_scope;
     auto *container = hlsl::IsDxilContainerLike(code, size);
-    // Shader model 5 bytecode cannot express i64 atomics.  This API runs on
-    // every created shader, so do not translate DXBC merely to prove that it
-    // needs no atomic lowering.
-    if (!container) return SCORPI_DXBC_TO_DXIL_OK;
-    if (!container || !hlsl::IsValidDxilContainer(container, size)) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
-    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
-    if (!program) return SCORPI_DXBC_TO_DXIL_OK;
-    // Ordinary shaders take a container-header check, not another LLVM parse.
-    if (auto *part = hlsl::GetDxilPartByType(container, hlsl::DFCC_FeatureInfo)) {
-      if (part->PartSize >= sizeof(hlsl::DxilShaderFeatureInfo)) {
-        hlsl::DxilShaderFeatureInfo features;
-        std::memcpy(&features, hlsl::GetDxilPartData(part), sizeof(features));
-        if (!(features.FeatureFlags & hlsl::DXIL::ShaderFeatureInfo_Int64Ops))
-          return SCORPI_DXBC_TO_DXIL_OK;
+    const hlsl::DxilProgramHeader *program = nullptr;
+    if (container) {
+      if (!hlsl::IsValidDxilContainer(container, size)) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+      program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+      if (!program) return SCORPI_DXBC_TO_DXIL_OK;
+      // Ordinary container shaders avoid another LLVM parse.
+      if (auto *part = hlsl::GetDxilPartByType(container, hlsl::DFCC_FeatureInfo)) {
+        if (part->PartSize >= sizeof(hlsl::DxilShaderFeatureInfo)) {
+          hlsl::DxilShaderFeatureInfo features;
+          std::memcpy(&features, hlsl::GetDxilPartData(part), sizeof(features));
+          constexpr uint64_t atomicFeatures = hlsl::DXIL::ShaderFeatureInfo_Int64Ops |
+              hlsl::DXIL::ShaderFeatureInfo_AtomicInt64OnTypedResource |
+              hlsl::DXIL::ShaderFeatureInfo_AtomicInt64OnGroupShared |
+              hlsl::DXIL::ShaderFeatureInfo_AtomicInt64OnHeapResource;
+          if (!(features.FeatureFlags & atomicFeatures))
+            return SCORPI_DXBC_TO_DXIL_OK;
+        }
       }
+    } else if (IsDxilProgram(code, size)) {
+      // Windows shader DDIs supply the DXIL program without its container.
+      // Classify it before pipeline/root creation just as we do after
+      // normalization; otherwise lowering and binding disagree on the ABI.
+      program = static_cast<const hlsl::DxilProgramHeader *>(code);
+    } else {
+      // Shader model 5 token streams cannot express i64 atomics.
+      return SCORPI_DXBC_TO_DXIL_OK;
     }
     llvm::LLVMContext context;
     auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
@@ -1062,13 +1073,26 @@ extern "C" int ScorpiInspectAtomic64(const void *code, size_t size, int *require
     // Opcode inspection needs only instructions. Loading a DxilModule also
     // decodes resource metadata, which can be incomplete in converted DXBC
     // and is not needed to determine whether any i64 atomics are present.
-    *required = ScorpiHasAtomic64(*parsed.get());
+    *required = ScorpiClassifyAtomic64(*parsed.get());
     return SCORPI_DXBC_TO_DXIL_OK;
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
 }
 
+extern "C" int ScorpiInspectAtomic64(const void *code, size_t size, int *required) {
+  if (!required) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  uint32_t requirements=0;
+  const auto status=ScorpiInspectAtomic64Requirements(code,size,&requirements);
+  *required=requirements!=0;return status;
+}
+
 extern "C" int ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  return ScorpiEmulateAtomic64WithOptions(code,size,lock_space,bindings,binding_count,0,binary,binary_size,error,error_size);
+}
+
+extern "C" int ScorpiEmulateAtomic64WithOptions(const void *code, size_t size, uint32_t lock_space,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_texture_minmax,
     void **binary, size_t *binary_size, char *error, size_t error_size) {
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count))
@@ -1087,8 +1111,8 @@ extern "C" int ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t loc
     if (!parsed) throw std::runtime_error("invalid atomic shader bitcode");
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) throw std::runtime_error("missing atomic shader module");
-    if (!ScorpiLowerAtomic64(*dm, lock_space, bindings, binding_count)) return SCORPI_DXBC_TO_DXIL_OK;
-    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid atomic lowering IR");
+    if (!ScorpiLowerAtomic64(*dm, lock_space, bindings, binding_count, native_texture_minmax!=0)) return SCORPI_DXBC_TO_DXIL_OK;
+    if (llvm::verifyModule(*parsed.get(), &llvm::errs())) throw std::runtime_error("invalid atomic lowering IR");
     hlsl::DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
     CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
     IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));

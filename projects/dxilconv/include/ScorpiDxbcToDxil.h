@@ -280,6 +280,19 @@ ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
     const ScorpiTypedBufferBinding *bindings, size_t binding_count,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 // DXBC/SM5 cannot contain i64 atomics and bypasses bitcode parsing entirely.
+enum ScorpiAtomic64Requirements {
+    SCORPI_ATOMIC64_BUFFER = 1,
+    SCORPI_ATOMIC64_NATIVE_TEXTURE_MINMAX = 2,
+    SCORPI_ATOMIC64_TYPED_EMULATION = 4,
+    SCORPI_ATOMIC64_GROUPSHARED = 8,
+};
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectAtomic64Requirements(const void *code, size_t size, uint32_t *requirements);
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiEmulateAtomic64WithOptions(const void *code, size_t size, uint32_t lock_space,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_texture_minmax,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectAtomic64(const void *code, size_t size, int *required);
 
