@@ -337,7 +337,6 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 #define SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX 32u
 #define SCORPI_SAMPLING_MSAA8 64u
 #define SCORPI_SAMPLING_NULL_BUFFER 128u
-#define SCORPI_SHADER_GUARD_TYPED_PREFIX 32u
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
 // The native compiler handles typed addressing. Only repair GetDimensions

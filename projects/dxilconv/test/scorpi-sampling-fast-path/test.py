@@ -281,14 +281,14 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
             print('PASS',model,resource,'native addressing; dimensions-only correction')
             for requested in (False, True):
                 policy=(Requirement*1)(Requirement(cls,0,0,1,8|32))
-                status=specialize(code,len(code),view,1,99,16,4|8|16|32,policy,1 if requested else 0,
+                status=specialize(code,len(code),view,1,99,16,4|8|16,policy,1 if requested else 0,
                                   C.byref(output),C.byref(size),error,len(error))
                 assert status==0 and bool(output.value)==requested,error.value
                 if requested:
                     (folder/'guard.dxil').write_bytes(C.string_at(output,size.value));lib.ScorpiFreeDxilBinary(output)
                     ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'guard.dxil')],text=True)
                     assert 'icmp ult' in ir, 'prefixed index overflow guard missing'
-            print('PASS',model,resource,'extended prefix and overflow guard are binding-selected')
+            print('PASS',model,resource,'required extended-prefix addressing remains binding-selected')
         # A special binding must not require metadata for unrelated accesses in
         # the same stage. Constant array indices use only their actual register;
         # dynamic indexing conservatively unions only that declared array.
