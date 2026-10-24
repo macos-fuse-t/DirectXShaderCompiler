@@ -205,6 +205,39 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
             assert status==0 and bool(output.value)==consume,(model,consume,error.value)
             if output.value:lib.ScorpiFreeDxilBinary(output)
         print('PASS',model,'mixed dense/sparse feedback; unused statuses leave shader unchanged')
+        # Sparse allocation alone does not require shader-side page walks or
+        # MinLOD emulation. Cover dynamic indexing and every texture-load kind.
+        for texture, coord in (('Texture2D', 'int3(id.xy,0)'),
+                               ('Texture2DArray', 'int4(id.xyz,0)'),
+                               ('Texture3D', 'int4(id.xyz,0)')):
+            offset = 'int3(0,0,0)' if texture == 'Texture3D' else 'int2(0,0)'
+            for consume in (False, True):
+                source = (f'{texture}<float4> input[4]:register(t0);\n'
+                          'RWStructuredBuffer<float4> result:register(u0);\n'
+                          '[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {\n'
+                          f'uint status; float4 v=input[id.x&3].Load({coord},{offset},status);\n'
+                          'result[id.x]=' + ('CheckAccessFullyMapped(status)?v:0' if consume else 'v') + '; }')
+                (folder/'sparse-load.hlsl').write_text(source)
+                subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'sparse-load.dxil'),
+                                str(folder/'sparse-load.hlsl')],check=True)
+                code=(folder/'sparse-load.dxil').read_bytes()
+                view=(Binding*1)(Binding(0,0,0,4,0,0,32))
+                policy=(Requirement*1)(Requirement(0,0,0,4,1))
+                output,size,error=C.c_void_p(),C.c_size_t(),C.create_string_buffer(4096)
+                status=specialize(code,len(code),view if consume else None,1 if consume else 0,
+                                  99 if consume else 0xffffffff,16,4|8,policy,1,
+                                  C.byref(output),C.byref(size),error,len(error))
+                assert status==0 and bool(output.value)==consume,(model,texture,consume,error.value)
+                if consume:
+                    (folder/'sparse-load-lowered.dxil').write_bytes(C.string_at(output,size.value))
+                    lib.ScorpiFreeDxilBinary(output)
+                    ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'sparse-load-lowered.dxil')],text=True)
+                    assert 'ScorpiTypedBufferMetadata' in ir, 'required sparse feedback lost'
+                    assert not re.search(r'call .*@dx.op.getDimensions',ir), 'unneeded MinLOD query'
+                    assert len(re.findall(r'call .*@dx.op.textureLoad',ir))==1, 'duplicated texture read'
+                else:
+                    assert size.value==0, 'unused feedback must preserve the original binary'
+            print('PASS',model,texture,'sparse load unchanged without status; status-only rewrite without MinLOD')
         for resource, cls in (('Buffer',0), ('RWBuffer',1)):
             source = (f'{resource}<uint> aligned:register({"t" if cls==0 else "u"}1);\n'
                       f'{resource}<uint> prefixed:register({"t" if cls==0 else "u"}0);\n'

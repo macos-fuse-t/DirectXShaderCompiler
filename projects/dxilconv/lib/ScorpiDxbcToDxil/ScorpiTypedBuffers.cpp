@@ -511,29 +511,44 @@ public:
 
   void RewriteTextureLoad(CallInst *call) {
     auto *texture = call->getArgOperand(1);
+    std::vector<ExtractValueInst*> statuses;
+    for (auto *user : call->users())
+      if (auto *extract = dyn_cast<ExtractValueInst>(user))
+        if (extract->getNumIndices() == 1 && *extract->idx_begin() == 4 && !extract->use_empty())
+          statuses.push_back(extract);
+    std::set<Value*> seen;
+    const auto requirements = bindingPolicy ?
+        SamplingRequirements(dm, texture, policy, policyCount, seen) :
+        (nativeTextures ? 0u : UINT32_MAX);
     if(isa<UndefValue>(call->getArgOperand(2))){
-      IRBuilder<> b(call);std::set<Value*> seen;auto kind=Kind(texture,dm,seen);
+      if (statuses.empty()) return;
+      IRBuilder<> b(call);seen.clear();auto kind=Kind(texture,dm,seen);
       ReplaceStatus(call,TextureResident(b,texture,b.getInt32(0),call->getArgOperand(3),call->getArgOperand(4),
           kind==ResourceKind::Texture2DArray?call->getArgOperand(5):b.getInt32(0)));
       return;
     }
-    auto *minimum = Word(texture,4);
     IRBuilder<> b(call);
-    auto *clamp = b.CreateBitCast(minimum,b.getFloatTy());
-    auto *dims = Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
-    auto *last = b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
-    auto *first = Call(b,OpCode::Round_ni,b.getFloatTy(),{clamp});
-    auto *mip = b.CreateUIToFP(call->getArgOperand(2),b.getFloatTy());
-    auto *valid = b.CreateAnd(b.CreateFCmpOLE(clamp,last),b.CreateFCmpOGE(mip,first));
-    // Preserve the native out-of-bounds format defaults and SRV swizzle.
-    Value *outside = b.getInt32(UINT32_MAX);
-    if (!isa<UndefValue>(call->getArgOperand(6)))
-      outside = b.CreateSub(outside,call->getArgOperand(6));
-    call->setArgOperand(3,b.CreateSelect(valid,call->getArgOperand(3),outside));
-    std::set<Value*> seen;auto kind=Kind(texture,dm,seen);
+    // Sparse residency and resource MinLOD are independent requirements.
+    // A status-only rewrite must not alter the application's texture address.
+    if (requirements & SCORPI_SAMPLING_RESOURCE_MIN_LOD) {
+      auto *minimum = Word(texture,4);
+      auto *clamp = b.CreateBitCast(minimum,b.getFloatTy());
+      auto *dims = Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
+      auto *last = b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dims,3),b.getInt32(1)),b.getFloatTy());
+      auto *first = Call(b,OpCode::Round_ni,b.getFloatTy(),{clamp});
+      auto *mip = b.CreateUIToFP(call->getArgOperand(2),b.getFloatTy());
+      auto *valid = b.CreateAnd(b.CreateFCmpOLE(clamp,last),b.CreateFCmpOGE(mip,first));
+      // Preserve the native out-of-bounds format defaults and SRV swizzle.
+      Value *outside = b.getInt32(UINT32_MAX);
+      if (!isa<UndefValue>(call->getArgOperand(6)))
+        outside = b.CreateSub(outside,call->getArgOperand(6));
+      call->setArgOperand(3,b.CreateSelect(valid,call->getArgOperand(3),outside));
+    }
+    // Do not generate page-table reads whose result the shader never consumes.
+    if (statuses.empty()) return;
+    seen.clear();auto kind=Kind(texture,dm,seen);
     Value *coord[3];for(unsigned i=0;i<3;++i){coord[i]=call->getArgOperand(3+i);if(isa<UndefValue>(coord[i]))coord[i]=b.getInt32(0);if(!isa<UndefValue>(call->getArgOperand(6+i)))coord[i]=b.CreateAdd(coord[i],call->getArgOperand(6+i));}
     auto *resident=TextureResident(b,texture,call->getArgOperand(2),coord[0],coord[1],kind==ResourceKind::Texture2DArray?coord[2]:b.getInt32(0));
-    std::vector<ExtractValueInst*> statuses;for(auto *user:call->users())if(auto *extract=dyn_cast<ExtractValueInst>(user))if(extract->getNumIndices()==1 && *extract->idx_begin()==4)statuses.push_back(extract);
     for(auto *extract:statuses){extract->replaceAllUsesWith(b.CreateZExt(resident,b.getInt32Ty()));extract->eraseFromParent();}
   }
 
@@ -1089,7 +1104,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     textureLoads.erase(std::remove_if(textureLoads.begin(), textureLoads.end(),
         [&](CallInst *call) {
           if ((options & SCORPI_SHADER_BINDING_POLICY) &&
-              (requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_SPARSE | SCORPI_SAMPLING_RESOURCE_MIN_LOD))) return false;
+              (requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_RESOURCE_MIN_LOD)) return false;
           return !feedbackUsed(call);
         }), textureLoads.end());
   }
