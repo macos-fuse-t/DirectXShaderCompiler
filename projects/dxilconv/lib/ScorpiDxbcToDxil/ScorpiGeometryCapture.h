@@ -10,7 +10,7 @@ bool PrepareTessellationPixelPatchId(hlsl::DxilModule &dm, uint32_t space, std::
 bool PrepareTessellationPatchBias(hlsl::DxilModule &dm, uint32_t space, std::string &error);
 bool PrepareTessellationCaptureDomain(hlsl::DxilModule &source, uint32_t &vertexStride, std::string &error, uint32_t registerSpace);
 bool LowerGeometryPrimitiveId(hlsl::DxilModule &source, std::string &error);
-bool PrepareRasterReplayVertexShader(hlsl::DxilModule &source,
+bool PrepareRasterReplayDrawIds(hlsl::DxilModule &source,
     uint32_t registerSpace, std::string &error);
 // Capture an assembled input primitive after the application's VS. The replay
 // VS reads the same packed output signature; no application code is replayed.

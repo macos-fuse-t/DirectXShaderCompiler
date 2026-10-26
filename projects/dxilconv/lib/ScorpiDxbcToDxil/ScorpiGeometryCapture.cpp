@@ -381,20 +381,26 @@ bool LowerGeometryPrimitiveId(hlsl::DxilModule &dm, std::string &error) {
   return true;
 }
 
-bool PrepareRasterReplayVertexShader(hlsl::DxilModule &dm, uint32_t space,
+bool PrepareRasterReplayDrawIds(hlsl::DxilModule &dm, uint32_t space,
     std::string &error) {
   using namespace llvm;
   using namespace hlsl;
-  if (!dm.GetShaderModel()->IsVS()) { error = "draw ID adjustment requires a vertex shader"; return false; }
+  const bool pixel = dm.GetShaderModel()->IsPS();
+  if (!pixel && !dm.GetShaderModel()->IsVS()) { error = "draw ID adjustment requires a vertex or pixel shader"; return false; }
   std::vector<std::pair<CallInst *, unsigned>> loads;
   for (auto &block : *dm.GetEntryFunction()) for (auto &instruction : block) {
     auto *call = dyn_cast<CallInst>(&instruction);
-    if (!call || !call->getCalledFunction() || !call->getCalledFunction()->getName().startswith("dx.op.loadInput.")) continue;
+    if (!call || !call->getCalledFunction()) continue;
+    if (pixel && call->getCalledFunction()->getName().startswith("dx.op.primitiveID")) {
+      loads.emplace_back(call, 0); continue;
+    }
+    if (!call->getCalledFunction()->getName().startswith("dx.op.loadInput.")) continue;
     auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
     if (!id || id->getZExtValue() >= dm.GetInputSignature().GetElements().size()) continue;
     const auto kind = dm.GetInputSignature().GetElements()[id->getZExtValue()]->GetKind();
-    if (kind == DXIL::SemanticKind::VertexID || kind == DXIL::SemanticKind::InstanceID)
-      loads.emplace_back(call, kind == DXIL::SemanticKind::VertexID ? 0 : 1);
+    if (pixel ? kind == DXIL::SemanticKind::PrimitiveID :
+        kind == DXIL::SemanticKind::VertexID || kind == DXIL::SemanticKind::InstanceID)
+      loads.emplace_back(call, pixel || kind == DXIL::SemanticKind::VertexID ? 0 : 1);
   }
   if (loads.empty()) return true;
   for (const auto &cb : dm.GetCBuffers()) if (cb->GetSpaceID() == space && cb->GetLowerBound() == 0) {
@@ -424,8 +430,8 @@ bool PrepareRasterReplayVertexShader(hlsl::DxilModule &dm, uint32_t space,
         {bound, resource_helper::getAsConstant(props, dm.GetOP()->GetResourcePropertiesType(), *dm.GetShaderModel())});
   } else handle = op(OpCode::CreateHandle, b.getVoidTy(),
       {b.getInt8(unsigned(resource.GetClass())), b.getInt32(id), b.getInt32(0), b.getFalse()});
-  auto *params = op(OpCode::CBufferLoadLegacy, i32, {handle, b.getInt32(2)});
-  Value *biases[] = {b.CreateExtractValue(params, 0), b.CreateExtractValue(params, 1)};
+  auto *params = op(OpCode::CBufferLoadLegacy, i32, {handle, b.getInt32(pixel ? 1 : 2)});
+  Value *biases[] = {b.CreateExtractValue(params, pixel ? 2 : 0), b.CreateExtractValue(params, 1)};
   for (const auto &load : loads) {
     // Save the uses before constructing the add, so the new add keeps its
     // reference to the original system value rather than becoming recursive.

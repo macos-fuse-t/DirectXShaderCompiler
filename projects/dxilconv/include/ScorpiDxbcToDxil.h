@@ -114,6 +114,14 @@ ScorpiCreateRasterReplayVertexShader(const void *code, size_t size,
                                    size_t *binary_size, char *error_message,
                                    size_t error_message_size);
 
+// Preserve the original draw's PrimitiveID when replay draws one primitive
+// at a time. Reads primitive_id from private b0 in register_space.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateRasterReplayPixelDrawIds(const void *code, size_t size,
+                                   uint32_t register_space, void **binary,
+                                   size_t *binary_size, char *error_message,
+                                   size_t error_message_size);
+
 // Internal renderer ABI. Produces an attachment-free PS variant with private
 // b0=ScorpiRasterReplayParameters, raw coverage SRV t0 and raw visibility UAV u1 in
 // register_space. Coverage belongs to one generated primitive, after all sample
