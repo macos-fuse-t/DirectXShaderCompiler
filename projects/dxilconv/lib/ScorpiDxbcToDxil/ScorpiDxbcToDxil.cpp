@@ -27,6 +27,14 @@
 #include "dxc/DXIL/DxilOperations.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
 
 #include <algorithm>
 #include <array>
@@ -712,6 +720,134 @@ extern "C" int ScorpiLowerGeometryPrimitiveId(
     const void *code, size_t size, void **binary, size_t *binary_size, char *error, size_t error_size) {
   return CreateRasterReplayShader(code, size, 0, 0, 0, binary,
       binary_size, error, error_size, false, false, true);
+}
+namespace {
+bool DynamicMeshOutput(const llvm::Instruction &instruction) {
+  const auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+  if (!call || !call->getCalledFunction() || call->getNumArgOperands() != 6) return false;
+  const auto name = call->getCalledFunction()->getName();
+  return (name.startswith("dx.op.storeVertexOutput.") || name.startswith("dx.op.storePrimitiveOutput.")) &&
+      !llvm::isa<llvm::ConstantInt>(call->getArgOperand(2));
+}
+
+bool HasDynamicMeshOutputs(const llvm::Module &module) {
+  for (const auto &function : module) for (const auto &block : function)
+    for (const auto &instruction : block) if (DynamicMeshOutput(instruction)) return true;
+  return false;
+}
+
+class MeshOutputUnroll final : public llvm::LoopPass {
+public:
+  static char ID;
+  MeshOutputUnroll() : LoopPass(ID) {}
+  bool runOnLoop(llvm::Loop *loop, llvm::LPPassManager &manager) override {
+    bool needed = false;
+    size_t instructions = 0;
+    for (const auto *block : loop->getBlocks()) for (const auto &instruction : *block) {
+      needed |= DynamicMeshOutput(instruction);
+      ++instructions;
+    }
+    if (!needed) return false;
+    auto &evolution = getAnalysis<llvm::ScalarEvolution>();
+    const unsigned trips = evolution.getSmallConstantTripCount(loop);
+    // Bound compiler/code-size growth. Unresolved rows are rejected before MSC.
+    if (!trips || instructions > 4096 / trips) return false;
+    auto &loops = getAnalysis<llvm::LoopInfoWrapperPass>().getLoopInfo();
+    auto &assumptions = getAnalysis<llvm::AssumptionCacheTracker>().getAssumptionCache(*loop->getHeader()->getParent());
+    return llvm::UnrollLoop(loop, trips, trips, false, false, 1,
+        &loops, this, &manager, &assumptions);
+  }
+  void getAnalysisUsage(llvm::AnalysisUsage &usage) const override {
+    usage.addRequired<llvm::LoopInfoWrapperPass>();
+    usage.addRequired<llvm::ScalarEvolution>();
+    usage.addRequired<llvm::AssumptionCacheTracker>();
+    usage.addRequired<llvm::DominatorTreeWrapperPass>();
+    usage.addRequiredID(llvm::LoopSimplifyID);
+    usage.addRequiredID(llvm::LCSSAID);
+    usage.addPreserved<llvm::LoopInfoWrapperPass>();
+    usage.addPreserved<llvm::ScalarEvolution>();
+    usage.addPreserved<llvm::DominatorTreeWrapperPass>();
+    usage.addPreservedID(llvm::LoopSimplifyID);
+    usage.addPreservedID(llvm::LCSSAID);
+  }
+};
+char MeshOutputUnroll::ID;
+}
+
+extern "C" int ScorpiInspectMeshOutputRows(const void *code, size_t size, int *required) {
+  if (!required) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *required = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size())) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "mesh-output-inspect", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    *required = dm->GetShaderModel()->IsMS() && HasDynamicMeshOutputs(*parsed.get());
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
+extern "C" int ScorpiUnrollMeshOutputLoops(
+    const void *code, size_t size, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid mesh shader container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing mesh shader program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "mesh-output-loops", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid mesh shader bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing mesh shader module");
+    if (!dm->GetShaderModel()->IsMS()) return SCORPI_DXBC_TO_DXIL_OK;
+    if (!HasDynamicMeshOutputs(*parsed.get())) return SCORPI_DXBC_TO_DXIL_OK;
+    auto &registry = *llvm::PassRegistry::getPassRegistry();
+    llvm::initializeCore(registry);
+    llvm::initializeAnalysis(registry);
+    llvm::initializeTransformUtils(registry);
+    llvm::initializeScalarOpts(registry);
+    llvm::legacy::PassManager passes;
+    passes.add(new MeshOutputUnroll());
+    passes.run(*parsed.get());
+    if (HasDynamicMeshOutputs(*parsed.get())) throw std::runtime_error("mesh output row cannot be resolved at compile time");
+    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid mesh output unroll IR");
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); llvm::WriteBitcodeToFile(parsed.get().get(), stream); }
+    hlsl::SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("failed to allocate unrolled mesh shader");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = static_cast<uint32_t>(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  }
 }
 
 namespace {

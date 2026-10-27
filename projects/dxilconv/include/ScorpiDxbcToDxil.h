@@ -218,6 +218,15 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiLowerGeometryPrimitiveId(const void *code, size_t size, void **binary,
     size_t *binary_size, char *error, size_t error_size);
 
+// Inspect mesh output signature rows without changing the input bytecode.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectMeshOutputRows(const void *code, size_t size, int *required);
+// Fully unroll bounded mesh loops that dynamically index output signature rows.
+// No dispatch branches are added. Unchanged shaders return null output.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiUnrollMeshOutputLoops(const void *code, size_t size, void **binary,
+    size_t *binary_size, char *error, size_t error_size);
+
 // Metal stores logical 1D mip chains as height-one 2D textures. Promote the
 // DXIL resource kind and texture coordinates to match that physical storage.
 // An unchanged shader returns a null binary and zero size.
