@@ -15,6 +15,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "dxc/DXIL/DxilModule.h"
@@ -599,6 +600,132 @@ extern "C" int ScorpiCreateDxilBinary(
 
 extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
   std::free(dxil_binary);
+}
+
+extern "C" int ScorpiCreateSignedRenderTargetShader(const void *code, size_t size,
+    uint32_t signed_targets, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size || (signed_targets & ~255u))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  if (!signed_targets) return SCORPI_DXBC_TO_DXIL_OK;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    if (!IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid signed-target shader container");
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing signed-target DXIL program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
+        GetDxilBitcodeSize(program)), "signed-targets", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid signed-target DXIL bitcode");
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm || !dm->GetShaderModel()->IsPS()) throw std::runtime_error("signed targets require a pixel shader");
+    auto selected = [&](const DxilSignatureElement &e, unsigned row) {
+      return e.GetKind() == DXIL::SemanticKind::Target &&
+          row < e.GetSemanticIndexVec().size() && e.GetSemanticIndexVec()[row] < 8 &&
+          (signed_targets & (1u << e.GetSemanticIndexVec()[row]));
+    };
+    bool changed = false;
+    for (const auto &e : dm->GetOutputSignature().GetElements())
+      for (unsigned row = 0; row < e->GetRows(); ++row)
+        changed |= selected(*e, row) && !(e->GetCompType() == CompType::getI32());
+    if (!changed) return SCORPI_DXBC_TO_DXIL_OK;
+
+    DxilSignature original(dm->GetOutputSignature());
+    auto &signature = dm->GetOutputSignature(); signature.ClearElements();
+    struct Group { unsigned first, count, id; bool signed_type; };
+    std::vector<std::vector<Group>> groups(original.GetElements().size());
+    for (const auto &e : original.GetElements()) {
+      if (e->GetID() >= groups.size()) throw std::runtime_error("invalid output signature ID");
+      for (unsigned first = 0; first < e->GetRows();) {
+        const auto type = selected(*e, first) ? CompType::getI32() : e->GetCompType();
+        unsigned end = first + 1;
+        while (end < e->GetRows() &&
+            (selected(*e, end) ? CompType::getI32() : e->GetCompType()) == type) ++end;
+        auto copy = signature.CreateElement();
+        const auto &indices = e->GetSemanticIndexVec();
+        if (end > indices.size()) throw std::runtime_error("invalid output semantic rows");
+        std::vector<unsigned> subset(indices.begin() + first, indices.begin() + end);
+        copy->Initialize(e->GetName(), type, *e->GetInterpolationMode(), end-first,
+            e->GetCols(), e->GetStartRow()+int(first), e->GetStartCol(),
+            DxilSignatureElement::kUndefinedID, subset);
+        copy->SetKind(e->GetKind()); copy->SetUsageMask(e->GetUsageMask());
+        groups[e->GetID()].push_back({first,end-first,signature.AppendElement(std::move(copy)),type==CompType::getI32()});
+        first = end;
+      }
+    }
+    std::vector<CallInst *> stores;
+    for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
+      if (auto *call = dyn_cast<CallInst>(&inst)) {
+        auto *fn = call->getCalledFunction();
+        auto *op = call->getNumArgOperands() ? dyn_cast<ConstantInt>(call->getArgOperand(0)) : nullptr;
+        if (fn && fn->getName().startswith("dx.op.storeOutput.") && op &&
+            op->getZExtValue() == unsigned(DXIL::OpCode::StoreOutput)) stores.push_back(call);
+      }
+    for (auto *call : stores) {
+      auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+      if (!id || id->getZExtValue() >= groups.size()) throw std::runtime_error("invalid output store ID");
+      const auto &ranges = groups[id->getZExtValue()];
+      auto emit = [&](IRBuilder<> &at, const Group &g, Value *row) {
+        Value *value = call->getArgOperand(4);
+        if (g.signed_type && !value->getType()->isIntegerTy(32)) {
+          if (!value->getType()->isFloatTy()) throw std::runtime_error("signed RTV exports require 32-bit registers");
+          value = at.CreateBitCast(value, at.getInt32Ty());
+        }
+        auto *store = at.CreateCall(dm->GetOP()->GetOpFunc(DXIL::OpCode::StoreOutput,value->getType()),
+            {call->getArgOperand(0),at.getInt32(g.id),at.CreateSub(row,at.getInt32(g.first)),call->getArgOperand(3),value});
+        store->setDebugLoc(call->getDebugLoc());
+      };
+      auto *row = call->getArgOperand(2);
+      if (auto *constant = dyn_cast<ConstantInt>(row)) {
+        bool found = false;
+        for (const auto &g : ranges) if (constant->getZExtValue() >= g.first &&
+            constant->getZExtValue()-g.first < g.count) { IRBuilder<> at(call); emit(at,g,row); found=true; break; }
+        if (!found) throw std::runtime_error("invalid output store row");
+      } else if (ranges.size() == 1) { IRBuilder<> at(call); emit(at,ranges[0],row); }
+      else {
+        // A dynamically indexed output array may span different RTV types.
+        // Preserve the selected row and issue exactly one typed store.
+        auto *before=call->getParent(), *after=before->splitBasicBlock(call,"rt.continue");
+        before->getTerminator()->eraseFromParent();
+        auto *branch=SwitchInst::Create(row,after,original.GetElement(id->getZExtValue()).GetRows(),before);
+        for (const auto &g : ranges) {
+          auto *block=BasicBlock::Create(context,"rt.store",before->getParent(),after);
+          IRBuilder<> at(block); emit(at,g,row); at.CreateBr(after);
+          for (unsigned i=0;i<g.count;++i) branch->addCase(at.getInt32(g.first+i),block);
+        }
+      }
+      call->eraseFromParent();
+    }
+    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid signed-target lowering IR");
+    dm->GetSerializedViewIdState().clear();
+    DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
+    auto *result=std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("signed-target output allocation failed");
+    std::memcpy(result,output->GetPtr(),output->GetPtrSize());
+    auto *header=static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset=uint32_t(offsetof(DxilContainerHeader,Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result)+hashOffset,
+        header->ContainerSizeInBytes-hashOffset,header->Hash.Digest);
+    *binary=result; *binary_size=output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error,error_size,exception.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error,error_size,"unexpected signed-target conversion failure");return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
 }
 
 static int CreateRasterReplayShader(

@@ -80,6 +80,14 @@ ScorpiCreateDxilBinary(const void *shader_code,
                        char *error_message,
                        size_t error_message_size);
 
+// Retype only exports bound to signed integer RTVs. Float exports are raw
+// register bits, not numeric float-to-int conversions. Null output means the
+// shader already has the required types. Other color slots remain unchanged.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateSignedRenderTargetShader(const void *code, size_t size,
+    uint32_t signed_targets, void **binary, size_t *binary_size,
+    char *error, size_t error_size);
+
 enum {
   SCORPI_COVERAGE_MASK_PIXEL = 1,
   SCORPI_COVERAGE_REPLAY_SAFE_VERTEX = 2,
