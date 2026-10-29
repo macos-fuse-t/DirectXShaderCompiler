@@ -728,6 +728,40 @@ extern "C" int ScorpiCreateSignedRenderTargetShader(const void *code, size_t siz
   }
 }
 
+extern "C" int ScorpiInspectOutputCoverage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, int *writes_coverage) {
+  if (!code || !size || !writes_coverage)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *writes_coverage = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto binary = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(binary.data());
+    if (!hlsl::IsValidDxilContainer(container, binary.size()))
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    const auto *part = hlsl::GetDxilPartByType(container, hlsl::DFCC_OutputSignature);
+    if (!part) return SCORPI_DXBC_TO_DXIL_OK;
+    if (part->PartSize < sizeof(hlsl::DxilProgramSignature))
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    hlsl::DxilProgramSignature signature;
+    const auto *data = hlsl::GetDxilPartData(part);
+    std::memcpy(&signature, data, sizeof(signature));
+    if (signature.ParamOffset < sizeof(signature) || signature.ParamOffset > part->PartSize ||
+        signature.ParamCount > (part->PartSize - signature.ParamOffset) /
+            sizeof(hlsl::DxilProgramSignatureElement))
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    for (uint32_t i = 0; i < signature.ParamCount; ++i) {
+      hlsl::DxilProgramSignatureElement element;
+      std::memcpy(&element, data + signature.ParamOffset + i * sizeof(element), sizeof(element));
+      if (element.SystemValue == hlsl::DxilProgramSigSemantic::Coverage) {
+        *writes_coverage = 1;
+        break;
+      }
+    }
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
 extern "C" int ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
     uint32_t samples, void **binary, size_t *binary_size,
     char *error, size_t error_size) {

@@ -95,6 +95,11 @@ ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
     uint32_t sample_count, void **binary, size_t *binary_size,
     char *error, size_t error_size);
 
+// Inspect the original output signature, before backend-generated masks.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectOutputCoverage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, int *writes_coverage);
+
 enum {
   SCORPI_COVERAGE_MASK_PIXEL = 1,
   SCORPI_COVERAGE_REPLAY_SAFE_VERTEX = 2,
