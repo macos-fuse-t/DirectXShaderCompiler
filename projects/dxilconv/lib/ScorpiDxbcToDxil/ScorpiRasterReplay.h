@@ -8,6 +8,8 @@ namespace hlsl {
 class DxilModule;
 }
 namespace scorpi {
+bool LowerAlphaToCoverage(hlsl::DxilModule &module, uint32_t sampleCount,
+                         std::string &error, bool &changed);
 bool PrepareMsaa8TextureLoads(hlsl::DxilModule &module, std::string &error, bool &changed,
     const ScorpiSamplingRequirement *policy = nullptr, size_t policy_count = 0);
 // Adds a private cbuffer b0, raw SRV t0 and visibility UAV u1 in registerSpace. The caller must

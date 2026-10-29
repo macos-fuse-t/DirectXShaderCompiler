@@ -88,6 +88,13 @@ ScorpiCreateSignedRenderTargetShader(const void *code, size_t size,
     uint32_t signed_targets, void **binary, size_t *binary_size,
     char *error, size_t error_size);
 
+// Lower target-zero alpha to native output coverage, preserving color bits.
+// Existing SV_Coverage disables alpha-to-coverage and returns null output.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
+    uint32_t sample_count, void **binary, size_t *binary_size,
+    char *error, size_t error_size);
+
 enum {
   SCORPI_COVERAGE_MASK_PIXEL = 1,
   SCORPI_COVERAGE_REPLAY_SAFE_VERTEX = 2,

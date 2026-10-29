@@ -728,6 +728,57 @@ extern "C" int ScorpiCreateSignedRenderTargetShader(const void *code, size_t siz
   }
 }
 
+extern "C" int ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
+    uint32_t samples, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    if (!IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid alpha-to-coverage shader container");
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing alpha-to-coverage DXIL program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
+        GetDxilBitcodeSize(program)), "alpha-to-coverage", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid alpha-to-coverage bitcode");
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    bool changed = false;
+    std::string why;
+    if (!dm || !scorpi::LowerAlphaToCoverage(*dm, samples, why, changed))
+      throw std::runtime_error(why.empty() ? "invalid alpha-to-coverage lowering" : why);
+    if (!changed) return SCORPI_DXBC_TO_DXIL_OK;
+    dm->GetSerializedViewIdState().clear();
+    DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("alpha-to-coverage output allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t offset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + offset,
+        header->ContainerSizeInBytes - offset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected alpha-to-coverage conversion failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 static int CreateRasterReplayShader(
     const void *code, size_t size, uint32_t register_space,
     uint32_t sample_count, uint32_t sample_mask, void **binary,

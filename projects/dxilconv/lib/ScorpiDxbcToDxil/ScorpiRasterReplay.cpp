@@ -61,6 +61,85 @@ void PredicateWrite(CallInst *call, Value *active) {
 }
 } // namespace
 
+bool LowerAlphaToCoverage(hlsl::DxilModule &dm, uint32_t samples,
+                         std::string &error, bool &changed) {
+  using namespace llvm;
+  using namespace hlsl;
+  changed = false;
+  if (!dm.GetShaderModel()->IsPS() || !dm.GetEntryFunction() ||
+      (samples != 1 && samples != 2 && samples != 4 && samples != 8)) {
+    error = "alpha-to-coverage requires a pixel shader and 1/2/4/8 samples";
+    return false;
+  }
+  unsigned alphaID = UINT32_MAX, alphaRow = 0;
+  for (const auto &e : dm.GetOutputSignature().GetElements()) {
+    // D3D11.3 16.9.4/17.18: declared output coverage takes precedence.
+    if (e->GetKind() == DXIL::SemanticKind::Coverage) return true;
+    if (e->GetKind() == DXIL::SemanticKind::Target && e->GetCols() == 4)
+      for (unsigned row = 0; row < e->GetSemanticIndexVec().size(); ++row)
+        if (e->GetSemanticIndexVec()[row] == 0) {
+          alphaID = e->GetID(); alphaRow = row;
+        }
+  }
+  // Alpha is undefined when target zero does not export it. Choose full
+  // coverage without introducing any shader work for that undefined case.
+  if (alphaID == UINT32_MAX) return true;
+  auto *entry = dm.GetEntryFunction();
+  auto &context = entry->getContext();
+  auto *f32 = Type::getFloatTy(context);
+  auto *i32 = Type::getInt32Ty(context);
+  IRBuilder<> b(&*entry->getEntryBlock().getFirstInsertionPt());
+  auto *alpha = b.CreateAlloca(f32, nullptr, "scorpi.alpha");
+  b.CreateStore(ConstantFP::get(f32, 1.0), alpha);
+  for (auto &block : *entry) for (auto &inst : block) {
+    auto *call = dyn_cast<CallInst>(&inst);
+    if (!call || !call->getCalledFunction() ||
+        !call->getCalledFunction()->getName().startswith("dx.op.storeOutput") ||
+        call->getArgOperand(1) != b.getInt32(alphaID) ||
+        call->getArgOperand(3) != b.getInt8(3)) continue;
+    IRBuilder<> at(call);
+    Value *value = call->getArgOperand(4);
+    if (value->getType()->isHalfTy()) value = at.CreateFPExt(value, f32);
+    // D3D output registers are typeless: integer exports preserve float bits.
+    if (value->getType() == i32) value = at.CreateBitCast(value, f32);
+    if (value->getType() != f32) {
+      error = "unsupported alpha output type";
+      return false;
+    }
+    value = at.CreateSelect(at.CreateICmpEQ(call->getArgOperand(2), at.getInt32(alphaRow)),
+                           value, at.CreateLoad(alpha));
+    at.CreateStore(value, alpha);
+  }
+  auto element = std::make_unique<DxilSignatureElement>(DXIL::SigPointKind::PSOut);
+  element->Initialize("SV_Coverage", CompType::getU32(),
+                      DXIL::InterpolationMode::Undefined, 1, 1);
+  element->AppendSemanticIndex(0); element->SetKind(DXIL::SemanticKind::Coverage);
+  const unsigned coverageID = dm.GetOutputSignature().AppendElement(std::move(element));
+  for (auto &block : *entry) if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) {
+    IRBuilder<> at(ret);
+    Value *value = at.CreateLoad(alpha);
+    // Ordered comparisons explicitly map NaN and negative alpha to zero;
+    // clamp positive infinity before conversion. The nested masks increase
+    // monotonically, with zero/full coverage at the required endpoints.
+    value = at.CreateSelect(at.CreateFCmpOGT(value, ConstantFP::get(f32, 0)),
+                            value, ConstantFP::get(f32, 0));
+    value = at.CreateSelect(at.CreateFCmpOLT(value, ConstantFP::get(f32, 1)),
+                            value, ConstantFP::get(f32, 1));
+    auto *count = at.CreateFPToUI(at.CreateFAdd(
+        at.CreateFMul(value, ConstantFP::get(f32, samples)),
+        ConstantFP::get(f32, .5)), i32);
+    auto *mask = at.CreateSub(at.CreateShl(at.getInt32(1), count), at.getInt32(1));
+    at.CreateCall(dm.GetOP()->GetOpFunc(OpCode::StoreOutput, i32),
+        {at.getInt32(unsigned(OpCode::StoreOutput)), at.getInt32(coverageID),
+         at.getInt32(0), at.getInt8(0), mask});
+  }
+  DominatorTree dominators; dominators.recalculate(*entry);
+  PromoteMemToReg({alpha}, dominators);
+  dm.CollectShaderFlagsForModule();
+  changed = true;
+  return !verifyModule(*dm.GetModule());
+}
+
 bool PrepareMsaa8TextureLoads(hlsl::DxilModule &dm, std::string &error,
                               bool &changed,
                               const ScorpiSamplingRequirement *policy,
@@ -632,6 +711,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
         IRBuilder<> at(call);
         auto *value = call->getArgOperand(4);
         if (value->getType()->isHalfTy()) value = at.CreateFPExt(value, f32);
+        if (value->getType() == i32) value = at.CreateBitCast(value, f32);
         if (value->getType() != f32) return fail("8x alpha-to-coverage requires floating-point target alpha");
         at.CreateStore(value, alpha);
       }
