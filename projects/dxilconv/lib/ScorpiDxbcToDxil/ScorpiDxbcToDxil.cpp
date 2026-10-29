@@ -762,6 +762,290 @@ extern "C" int ScorpiInspectOutputCoverage(const void *code, size_t size,
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
 }
 
+namespace {
+uint32_t InspectDxbcRasterizer(const void *code, size_t size) {
+  // Inspect declarations/opcodes with the converter's own token parser. Do not
+  // convert every D3D11 shader into DXIL merely to choose its variant key.
+  const auto *tokens = ValidateShaderTokenStream(code, size);
+  D3D10ShaderBinary::CShaderCodeParser parser(tokens);
+  D3D10ShaderBinary::CInstruction instruction;
+  uint32_t requirements = 0;
+  while (!parser.EndOfShader()) {
+    const auto offset = parser.CurrentTokenOffset();
+    const auto opcode = DECODE_D3D10_SB_OPCODE_TYPE(tokens[offset]);
+    uint32_t length = DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(tokens[offset]);
+    if (opcode == D3D10_SB_OPCODE_CUSTOMDATA ||
+        ((opcode == D3D11_SB_OPCODE_DCL_INTERFACE ||
+          opcode == D3D11_SB_OPCODE_DCL_FUNCTION_TABLE) &&
+         DECODE_IS_D3D10_SB_OPCODE_EXTENDED(tokens[offset]))) {
+      if (tokens[1] - offset < 2) throw std::runtime_error("truncated DXBC instruction");
+      length = tokens[offset + 1];
+    }
+    if (!length || length > tokens[1] - offset)
+      throw std::runtime_error("invalid DXBC instruction length");
+    switch (opcode) {
+    case D3D10_1_SB_OPCODE_SAMPLE_INFO:
+    case D3D10_SB_OPCODE_DCL_INPUT:
+    case D3D10_SB_OPCODE_DCL_INPUT_PS:
+    case D3D10_SB_OPCODE_DCL_INPUT_PS_SIV:
+    case D3D10_SB_OPCODE_DCL_INPUT_PS_SGV:
+      if (length < 2) throw std::runtime_error("truncated DXBC rasterizer operand");
+      parser.ParseInstruction(&instruction);
+      if (parser.CurrentTokenOffset() != offset + length)
+        throw std::runtime_error("invalid DXBC rasterizer instruction");
+      if (opcode == D3D10_1_SB_OPCODE_SAMPLE_INFO) {
+        if (instruction.m_Operands[1].OperandType() == D3D10_SB_OPERAND_TYPE_RASTERIZER)
+          requirements |= SCORPI_RASTERIZER_SAMPLE_COUNT;
+      } else {
+        if (instruction.m_Operands[0].OperandType() == D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK)
+          requirements |= SCORPI_RASTERIZER_INPUT_COVERAGE;
+        if (opcode == D3D10_SB_OPCODE_DCL_INPUT_PS || opcode == D3D10_SB_OPCODE_DCL_INPUT_PS_SIV) {
+          const auto mode = DECODE_D3D10_SB_INPUT_INTERPOLATION_MODE(tokens[offset]);
+          if (mode == D3D10_SB_INTERPOLATION_LINEAR_CENTROID ||
+              mode == D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_CENTROID)
+            requirements |= SCORPI_RASTERIZER_CENTROID;
+        }
+      }
+      break;
+    case D3D11_SB_OPCODE_EVAL_CENTROID:
+      requirements |= SCORPI_RASTERIZER_CENTROID;
+      break;
+    default: break;
+    }
+    parser.SetCurrentTokenOffset(offset + length);
+  }
+  return requirements;
+}
+
+std::vector<llvm::CallInst *> RasterizerSampleCountCalls(llvm::Module &module) {
+  std::vector<llvm::CallInst *> calls;
+  for (auto &function : module) {
+    if (!function.getName().startswith("dx.op.renderTargetGetSampleCount"))
+      continue;
+    for (auto *user : function.users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      auto *opcode = call && call->getNumArgOperands() == 1
+          ? llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0)) : nullptr;
+      if (!call || call->getCalledFunction() != &function || !opcode ||
+          opcode->getZExtValue() != unsigned(hlsl::DXIL::OpCode::RenderTargetGetSampleCount) ||
+          !call->getType()->isIntegerTy(32))
+        throw std::runtime_error("invalid rasterizer sample-count instruction");
+      calls.push_back(call);
+    }
+  }
+  return calls;
+}
+
+bool LowerPixelRasterizer(hlsl::DxilModule &dm, uint32_t samples,
+    uint32_t forced_samples, uint32_t sample_mask, bool &native_centroid) {
+  using namespace llvm;
+  using namespace hlsl;
+  if (!dm.GetShaderModel()->IsPS()) return false;
+  const uint32_t all = samples == 32 ? UINT32_MAX : (1u << samples) - 1;
+  // Native centroid already handles the full-mask case. Forced rasterization
+  // also ignores the output sample mask when choosing its centroid location.
+  const bool correct_centroid = !forced_samples && samples > 1 && (sample_mask & all) != all;
+  std::vector<unsigned> centroid_ids;
+  for (const auto &element : dm.GetInputSignature().GetElements())
+    if (element->GetInterpolationMode()->IsAnyCentroid())
+      centroid_ids.push_back(element->GetID());
+  struct Work { CallInst *call; bool coverage; bool load; };
+  std::vector<Work> work;
+  for (auto &function : *dm.GetModule()) for (auto &block : function) for (auto &inst : block) {
+    auto *call = dyn_cast<CallInst>(&inst);
+    if (!call || !call->getCalledFunction() || !call->getNumArgOperands() ||
+        !call->getCalledFunction()->getName().startswith("dx.op.")) continue;
+    auto *opcode = dyn_cast<ConstantInt>(call->getArgOperand(0));
+    if (!opcode) continue;
+    const auto op = static_cast<DXIL::OpCode>(opcode->getZExtValue());
+    bool centroid = op == DXIL::OpCode::EvalCentroid;
+    if (op == DXIL::OpCode::LoadInput && call->getNumArgOperands() >= 4)
+      if (auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1)))
+        centroid = std::find(centroid_ids.begin(), centroid_ids.end(), id->getZExtValue()) != centroid_ids.end();
+    const bool coverage = op == DXIL::OpCode::Coverage && forced_samples == 1;
+    if ((centroid && correct_centroid) || coverage)
+      work.push_back({call, coverage, op == DXIL::OpCode::LoadInput});
+  }
+  bool changed = false;
+  auto *ops = dm.GetOP();
+  for (const auto &item : work) {
+    auto *call = item.call;
+    IRBuilder<> at(call);
+    if (item.coverage) {
+      // Coincident native samples broadcast a single forced rasterizer sample.
+      // D3D input coverage still contains exactly one logical coverage bit.
+      auto *raw = at.CreateCall(call->getCalledFunction(), {call->getArgOperand(0)});
+      auto *logical = at.CreateZExt(at.CreateICmpNE(raw, at.getInt32(0)), at.getInt32Ty());
+      call->replaceAllUsesWith(logical);
+      call->eraseFromParent();
+      changed = true;
+      continue;
+    }
+    // MSC masks dx.op.coverage before exposing it to the shader. Preserve
+    // native masking/discard behavior and select the centroid later in AIR,
+    // where the unmasked sample-mask input remains available. An explicit
+    // evaluation makes an ordinary centroid input a native interpolant.
+    native_centroid = true;
+    if (item.load) {
+      auto *value = at.CreateCall(ops->GetOpFunc(DXIL::OpCode::EvalCentroid, call->getType()),
+          {at.getInt32(unsigned(DXIL::OpCode::EvalCentroid)), call->getArgOperand(1),
+           call->getArgOperand(2), call->getArgOperand(3)});
+      call->replaceAllUsesWith(value);
+      call->eraseFromParent();
+      changed = true;
+    }
+  }
+  return changed;
+}
+}
+
+extern "C" int ScorpiInspectRasterizerRequirements(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, uint32_t *requirements) {
+  if (!code || !size || !requirements || (!metadata && metadata_size))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *requirements = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    const hlsl::DxilProgramHeader *program = nullptr;
+    if (const auto *container = hlsl::IsDxilContainerLike(code, size)) {
+      if (!hlsl::IsValidDxilContainer(container, size))
+        return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+      program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+      if (!program) {
+        auto *part = hlsl::GetDxilPartByType(container,
+            static_cast<hlsl::DxilFourCC>(hlsl::DXBC_GenericShaderEx));
+        if (!part) part = hlsl::GetDxilPartByType(container,
+            static_cast<hlsl::DxilFourCC>(hlsl::DXBC_GenericShader));
+        if (!part) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+        *requirements = InspectDxbcRasterizer(hlsl::GetDxilPartData(part), part->PartSize);
+        return SCORPI_DXBC_TO_DXIL_OK;
+      }
+    } else if (IsDxilProgram(code, size)) {
+      program = static_cast<const hlsl::DxilProgramHeader *>(code);
+    } else {
+      *requirements = InspectDxbcRasterizer(code, size);
+      return SCORPI_DXBC_TO_DXIL_OK;
+    }
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)),
+        "sample-count-inspection", false);
+    // Load signatures/symbols, not instruction bodies, for ordinary DXIL.
+    auto parsed = llvm::getLazyBitcodeModule(std::move(source), context);
+    if (!parsed) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    bool declared = false;
+    for (auto &function : *parsed.get())
+      declared |= function.getName().startswith("dx.op.renderTargetGetSampleCount") ||
+          function.getName().startswith("dx.op.evalCentroid.") ||
+          function.getName().startswith("dx.op.coverage.");
+    const bool pixel = hlsl::GetVersionShaderType(program->ProgramVersion) ==
+        hlsl::DXIL::ShaderKind::Pixel;
+    if (!declared && !pixel) return SCORPI_DXBC_TO_DXIL_OK;
+    if (declared) {
+      if (parsed.get()->materializeAllPermanently())
+        return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+      if (!RasterizerSampleCountCalls(*parsed.get()).empty())
+        *requirements |= SCORPI_RASTERIZER_SAMPLE_COUNT;
+    }
+    if (pixel) {
+      // Decoding all resource metadata can fail on incomplete DDI metadata and
+      // is unrelated to interpolation. Load only the pixel entry signature.
+      hlsl::DxilMDHelper helper(parsed.get().get(),
+          std::unique_ptr<hlsl::DxilExtraPropertyHelper>(new hlsl::DxilExtraPropertyHelper(parsed.get().get())));
+      const auto *entries = helper.GetDxilEntryPoints();
+      if (!entries || entries->getNumOperands() != 1)
+        return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+      llvm::Function *entry = nullptr; std::string name;
+      const llvm::MDOperand *signatures = nullptr, *resources = nullptr, *properties = nullptr;
+      helper.GetDxilEntryPoint(entries->getOperand(0), entry, name, signatures, resources, properties);
+      hlsl::DxilEntrySignature signature(hlsl::DXIL::ShaderKind::Pixel, true);
+      helper.LoadDxilSignatures(*signatures, signature);
+      for (const auto &element : signature.InputSignature.GetElements())
+        if (element->GetInterpolationMode()->IsAnyCentroid())
+          *requirements |= SCORPI_RASTERIZER_CENTROID;
+      for (auto &function : *parsed.get()) {
+        if (function.use_empty()) continue;
+        if (function.getName().startswith("dx.op.evalCentroid."))
+          *requirements |= SCORPI_RASTERIZER_CENTROID;
+        if (function.getName().startswith("dx.op.coverage."))
+          *requirements |= SCORPI_RASTERIZER_INPUT_COVERAGE;
+      }
+    }
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
+extern "C" int ScorpiSpecializeRasterizerShader(const void *code, size_t size,
+    uint32_t samples, uint32_t forced_samples, uint32_t sample_mask,
+    void **binary, size_t *binary_size, uint32_t *requirements,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!code || !size || !binary || !binary_size)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  if (requirements) *requirements = 0;
+  if (!samples || samples > 32 || (samples & (samples - 1)))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    if (!IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid sample-count shader container");
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing sample-count DXIL program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
+        GetDxilBitcodeSize(program)), "sample-count-specialization", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid sample-count bitcode");
+    auto calls = RasterizerSampleCountCalls(*parsed.get());
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing sample-count DXIL module");
+    for (auto *call : calls) {
+      call->replaceAllUsesWith(ConstantInt::get(call->getType(), samples));
+      call->eraseFromParent();
+    }
+    bool native_centroid = false;
+    const bool pixel_changed = LowerPixelRasterizer(*dm, samples, forced_samples, sample_mask, native_centroid);
+    if (requirements && native_centroid) *requirements |= SCORPI_RASTERIZER_CENTROID;
+    if (calls.empty() && !pixel_changed) return SCORPI_DXBC_TO_DXIL_OK;
+    for (auto function = parsed.get()->begin(); function != parsed.get()->end();) {
+      auto &candidate = *function++;
+      if (candidate.isDeclaration() && candidate.getName().startswith("dx.op.") &&
+          candidate.use_empty()) {
+        dm->RemoveFunction(&candidate);
+        candidate.eraseFromParent();
+      }
+    }
+    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid sample-count specialization IR");
+    dm->CollectShaderFlagsForModule();
+    dm->GetSerializedViewIdState().clear();
+    DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("sample-count output allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t offset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + offset,
+        header->ContainerSizeInBytes - offset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected sample-count specialization failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 extern "C" int ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
     uint32_t samples, void **binary, size_t *binary_size,
     char *error, size_t error_size) {

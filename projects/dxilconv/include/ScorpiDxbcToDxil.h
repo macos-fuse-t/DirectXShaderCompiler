@@ -101,6 +101,25 @@ ScorpiInspectOutputCoverage(const void *code, size_t size,
     const void *metadata, size_t metadata_size, int *writes_coverage);
 
 enum {
+  SCORPI_RASTERIZER_SAMPLE_COUNT = 1,
+  SCORPI_RASTERIZER_CENTROID = 2,
+  SCORPI_RASTERIZER_INPUT_COVERAGE = 4,
+};
+// Inspect once per shader. Ordinary shaders do not require a rasterizer variant.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectRasterizerRequirements(const void *code, size_t size,
+    const void *metadata, size_t metadata_size, uint32_t *requirements);
+
+// Fold the logical count, normalize forced input coverage and expose centroid
+// inputs as native interpolants. Returned requirements identify AIR adaptations
+// still needed after native compilation. Null binary means DXIL was unchanged.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiSpecializeRasterizerShader(const void *code, size_t size,
+    uint32_t sample_count, uint32_t forced_sample_count, uint32_t sample_mask,
+    void **binary, size_t *binary_size, uint32_t *requirements,
+    char *error, size_t error_size);
+
+enum {
   SCORPI_COVERAGE_MASK_PIXEL = 1,
   SCORPI_COVERAGE_REPLAY_SAFE_VERTEX = 2,
   SCORPI_COVERAGE_REPLAY_SAFE_HULL = 4,
