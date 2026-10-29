@@ -641,7 +641,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                        b.getInt32(0)),
         b.getInt32(i - 1), centroidSample);
   auto *fullCoverage =
-      b.CreateICmpEQ(coverage, b.getInt32((1u << sampleCount) - 1));
+      b.CreateICmpEQ(maskedCoverage, b.getInt32((1u << sampleCount) - 1));
   auto *helperAtCenter =
       b.CreateAnd(b.CreateICmpEQ(maskedCoverage, b.getInt32(0)),
                   b.getInt1(sampleMask == ((1u << sampleCount) - 1)));
