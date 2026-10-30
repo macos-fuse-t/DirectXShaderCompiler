@@ -968,27 +968,35 @@ static bool CanMergeDDISignatureRecord(
          existing.SemanticIndex == record.SemanticIndex &&
          existing.StartRow == record.StartRow &&
          existing.Stream == record.Stream && existing.Rows == 1 &&
-         record.Rows == 1 && existing.ComponentType == record.ComponentType;
+         record.Rows == 1 && existing.ComponentType == record.ComponentType &&
+         existing.StartCol <= record.StartCol + record.Cols &&
+         record.StartCol <= existing.StartCol + existing.Cols;
 }
 
 static void AppendOrMergeDDISignatureRecord(
     SignatureHelper &SigHelper,
     const SignatureHelper::ElementRecord &record) {
-  for (SignatureHelper::ElementRecord &existing :
-       SigHelper.m_ElementRecords) {
-    if (!CanMergeDDISignatureRecord(existing, record))
+  SignatureHelper::ElementRecord merged = record;
+  for (size_t i = 0; i < SigHelper.m_ElementRecords.size();) {
+    const SignatureHelper::ElementRecord &existing =
+        SigHelper.m_ElementRecords[i];
+    if (!CanMergeDDISignatureRecord(existing, merged)) {
+      ++i;
       continue;
+    }
 
     const unsigned existingEnd = existing.StartCol + existing.Cols;
-    const unsigned recordEnd = record.StartCol + record.Cols;
-    const unsigned startCol = std::min(existing.StartCol, record.StartCol);
+    const unsigned recordEnd = merged.StartCol + merged.Cols;
+    const unsigned startCol = std::min(existing.StartCol, merged.StartCol);
     const unsigned endCol = std::max(existingEnd, recordEnd);
-    existing.StartCol = startCol;
-    existing.Cols = endCol - startCol;
-    return;
+    merged.StartCol = startCol;
+    merged.Cols = endCol - startCol;
+    SigHelper.m_ElementRecords.erase(SigHelper.m_ElementRecords.begin() + i);
+    // A newly filled gap can connect a range visited earlier.
+    i = 0;
   }
 
-  SigHelper.m_ElementRecords.emplace_back(record);
+  SigHelper.m_ElementRecords.emplace_back(merged);
 }
 
 void DxbcConverter::ExtractSignatureFromDDI(
@@ -1091,11 +1099,32 @@ void DxbcConverter::ExtractSignatureFromDDI(
     // This would happen is component type is not supplied by the runtime.
     IFTBOOL(!E.ComponentType.IsInvalid(), DXC_E_INCORRECT_DDI_SIGNATURE);
 
-    // DDI may describe one system-value register with multiple component
-    // records. DXIL and Metal require that semantic to remain one signature
-    // element. Arbitrary split records keep distinct synthesized semantic
-    // indices and therefore do not merge here.
-    AppendOrMergeDDISignatureRecord(SigHelper, E);
+    // A DDI mask may contain holes occupied by another semantic. Only merge
+    // contiguous components; claiming the enclosing range corrupts register
+    // ownership when clip and cull distances are interleaved.
+    for (unsigned col = E.StartCol; col < 4;) {
+      if (!(P.Mask & (1u << col))) {
+        ++col;
+        continue;
+      }
+      E.StartCol = col;
+      do {
+        ++col;
+      } while (col < 4 && (P.Mask & (1u << col)));
+      E.Cols = col - E.StartCol;
+      if (P.SystemValue == D3D10_SB_NAME_UNDEFINED &&
+          !(m_pSM->IsPS() && SigHelper.IsOutput()))
+        E.SemanticIndex = P.Register * 4u + E.StartCol;
+      AppendOrMergeDDISignatureRecord(SigHelper, E);
+    }
+  }
+
+  // DDI has no semantic indices. Use register/component identity so separate
+  // clip/cull ranges (including another register) cannot alias semantic zero.
+  for (SignatureHelper::ElementRecord &E : SigHelper.m_ElementRecords) {
+    if (E.SemanticName == "SV_ClipDistance" ||
+        E.SemanticName == "SV_CullDistance")
+      E.SemanticIndex = E.StartRow * 4u + E.StartCol;
   }
 }
 
@@ -1525,9 +1554,9 @@ void DxbcConverter::ConvertSignature(SignatureHelper &SigHelper,
         for (unsigned iCol = 0; iCol < E.GetCols(); iCol++) {
           unsigned c = E.GetStartCol() + iCol;
           SignatureHelper::RegAndCompAndStream Key(r, c, Stream);
-          DXASSERT(SigHelper.m_DxbcRegisterToSignatureElement.find(Key) ==
-                       SigHelper.m_DxbcRegisterToSignatureElement.end(),
-                   "otherwise elements are wrong");
+          IFTBOOL(SigHelper.m_DxbcRegisterToSignatureElement.find(Key) ==
+                      SigHelper.m_DxbcRegisterToSignatureElement.end(),
+                  DXC_E_INCORRECT_DDI_SIGNATURE);
           SigHelper.m_DxbcRegisterToSignatureElement[Key] = (unsigned)iElem;
         }
       }
@@ -8681,6 +8710,15 @@ void DxbcConverter::Optimize() {
   if (m_bRunDxilCleanup) {
     PassManager.add(createDxilCleanupPass());
     PassManager.run(*m_pModule);
+    // Cleanup removes temporary-register calls, but DCE leaves their external
+    // declarations behind. Unused DXIL operation declarations fail validation.
+    for (auto it = m_pModule->begin(); it != m_pModule->end();) {
+      Function *F = &*it++;
+      if (F->isDeclaration() && F->use_empty()) {
+        m_pPR->RemoveFunction(F);
+        F->eraseFromParent();
+      }
+    }
   }
 
 #if DXBCCONV_DBG
