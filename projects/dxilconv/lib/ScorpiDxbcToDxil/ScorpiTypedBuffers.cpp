@@ -1168,7 +1168,10 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   if (options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY)
     calls.erase(std::remove_if(calls.begin(), calls.end(), [&](CallInst *call) {
       return Opcode(call) != OpCode::GetDimensions &&
-          !(requirements(call->getArgOperand(1)) & SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX);
+          // Native prefix/RGB32 addressing can wrap a large unsigned index
+          // back into the texture. Bound it in logical element space first.
+          !(requirements(call->getArgOperand(1)) & (SCORPI_SAMPLING_TYPED_PREFIX |
+              SCORPI_SAMPLING_TYPED_RGB32 | SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX));
     }), calls.end());
   if (options & (SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_BINDING_POLICY)) {
     // A clamp belongs to one instruction, not the entire shader. Ordinary

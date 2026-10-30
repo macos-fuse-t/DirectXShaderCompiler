@@ -405,8 +405,8 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 #define SCORPI_SAMPLING_NULL_BUFFER 128u
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
-// The native compiler handles typed addressing. Only repair GetDimensions
-// for bindings with an alignment prefix or scalar-backed RGB32 view.
+// Keep native typed addressing, repairing dimensions and logical bounds
+// before an alignment prefix or scalar-backed RGB32 scaling is applied.
 #define SCORPI_SHADER_TYPED_DIMENSIONS_ONLY 16u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
