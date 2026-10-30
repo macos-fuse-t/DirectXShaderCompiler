@@ -183,8 +183,10 @@ bool PrepareMsaa8TextureLoads(hlsl::DxilModule &dm, std::string &error,
   if (!changed)
     return true;
   struct Info {
-    Kind kind = Kind::Invalid;
-    unsigned samples = 0;
+    Kind kind;
+    unsigned samples;
+    Info(Kind resource_kind = Kind::Invalid, unsigned sample_count = 0)
+        : kind(resource_kind), samples(sample_count) {}
   };
   std::function<Info(Value *, unsigned)> info = [&](Value *v,
                                                     unsigned depth) -> Info {
