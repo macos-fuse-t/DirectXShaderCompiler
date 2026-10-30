@@ -1002,6 +1002,81 @@ public:
 };
 }
 
+// Root buffer descriptors have no view length and cannot use GetDimensions.
+// Only table/heap descriptors carry the bounds required by this correction.
+static bool RawHandleHasBounds(DxilModule &dm, Value *handle,
+    const ScorpiTypedBufferBinding *bindings, size_t count, std::set<Value *> &seen) {
+  if (!seen.insert(handle).second) return true;
+  if (auto *phi = dyn_cast<PHINode>(handle)) {
+    for (auto &v : phi->incoming_values())
+      if (!RawHandleHasBounds(dm, v, bindings, count, seen)) return false;
+    return true;
+  }
+  if (auto *select = dyn_cast<SelectInst>(handle))
+    return RawHandleHasBounds(dm, select->getTrueValue(), bindings, count, seen) &&
+        RawHandleHasBounds(dm, select->getFalseValue(), bindings, count, seen);
+  auto *call = dyn_cast<CallInst>(handle);
+  if (!call) return false;
+  if (Opcode(call) == OpCode::AnnotateHandle)
+    return RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen);
+  if (Opcode(call) == OpCode::CreateHandleFromHeap) return true;
+  unsigned cls, space, lower;
+  if (Opcode(call) == OpCode::CreateHandle) {
+    cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+    unsigned id = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
+    const auto &resource = cls == unsigned(ResourceClass::SRV) ? dm.GetSRV(id) : dm.GetUAV(id);
+    space = resource.GetSpaceID(); lower = resource.GetLowerBound();
+  } else if (Opcode(call) == OpCode::CreateHandleFromBinding) {
+    auto binding = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
+    cls = binding.resourceClass; space = binding.spaceID; lower = binding.rangeLowerBound;
+  } else return false;
+  for (size_t i = 0; i < count; ++i) {
+    const auto &range = bindings[i];
+    if (cls == range.resource_class && space == range.space && lower >= range.base_register &&
+        uint64_t(lower) - range.base_register < range.count)
+      return range.table_offset != UINT32_MAX;
+  }
+  return false;
+}
+
+// Native buffer bounds checks cover the base address, but not the trailing
+// components of a vector raw load. Preserve that native load and mask only
+// live trailing results; scalar loads and all other resource kinds stay native.
+static unsigned RawLoadComponentMask(CallInst *call) {
+  unsigned mask = 0;
+  std::vector<User *> users(call->user_begin(), call->user_end());
+  for (auto *user : users) {
+    auto *extract = dyn_cast<ExtractValueInst>(user);
+    if (!extract || extract->getNumIndices() != 1) { mask = 14; break; }
+    unsigned component = *extract->idx_begin();
+    if (component > 0 && component < 4 && !extract->use_empty())
+      mask |= 1u << component;
+  }
+  return mask;
+}
+
+static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
+  const unsigned mask = RawLoadComponentMask(call);
+  if (!mask) return;
+  std::vector<User *> users(call->user_begin(), call->user_end());
+  IRBuilder<> b(call->getNextNode());
+  auto *dimensions = b.CreateCall(dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getInt32Ty()),
+      {b.getInt32(unsigned(OpCode::GetDimensions)), call->getArgOperand(1), b.getInt32(0)});
+  auto *size = b.CreateExtractValue(dimensions, 0);
+  auto *offset = call->getArgOperand(2);
+  auto *inRange = b.CreateICmpULT(offset, size);
+  auto *remaining = b.CreateSub(size, offset);
+  const unsigned bytes = call->getType()->getStructElementType(0)->getPrimitiveSizeInBits() / 8;
+  Value *result = call;
+  for (unsigned c = 1; c < 4; ++c) if (mask & (1u << c)) {
+    auto *value = b.CreateExtractValue(call, c);
+    auto *valid = b.CreateAnd(inRange, b.CreateICmpUGE(remaining, b.getInt32((c + 1) * bytes)));
+    result = b.CreateInsertValue(result,
+        b.CreateSelect(valid, value, Constant::getNullValue(value->getType())), c);
+  }
+  for (auto *user : users) user->replaceUsesOfWith(call, result);
+}
+
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
@@ -1009,6 +1084,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
   std::vector<CallInst *> bufferLoads;
+  std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
@@ -1024,6 +1100,14 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
       if ((kind == ResourceKind::RawBuffer || kind == ResourceKind::StructuredBuffer) &&
           (SamplingRequirements(dm, call->getArgOperand(1), policy, policyCount, seen) &
            SCORPI_SAMPLING_NULL_BUFFER)) nullBufferAccesses.push_back(call);
+    }
+    if ((op == OpCode::BufferLoad || op == OpCode::RawBufferLoad) && RawLoadComponentMask(call)) {
+      std::set<Value *> seen;
+      if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::RawBuffer) {
+        seen.clear();
+        if (RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen))
+          rawLoads.push_back(call);
+      }
     }
     if(op==OpCode::CheckAccessFullyMapped)feedbackChecks.push_back(call);
     if (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad) bufferLoads.push_back(call);
@@ -1106,7 +1190,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
           return !feedbackUsed(call);
         }), textureLoads.end());
   }
-  if (calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
+  if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
       nullBufferAccesses.empty()) return false;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
@@ -1171,6 +1255,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
     for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
   }
+  for (auto *call : rawLoads) BoundRawLoadComponents(dm, call);
   // The native converter elides constant-offset raw/structured buffer bounds
   // checks even with BoundsCheck enabled. A null UAV can consequently write
   // the zero-address page, corrupting later null reads. Guard only handles
