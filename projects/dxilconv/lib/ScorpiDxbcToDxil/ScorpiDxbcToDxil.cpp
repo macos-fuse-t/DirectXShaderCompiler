@@ -1988,9 +1988,14 @@ extern "C" int ScorpiLowerTextureLayouts(const void *code, size_t size, int spli
           for (auto *extract : extracts) {
             if (extract->getNumIndices() != 1) throw std::runtime_error("unsupported 1D dimensions result");
             unsigned index = *extract->idx_begin();
+            // DXBC resinfo requires zero for dimensions that do not exist.
+            // The physical 2D height and mip count must not leak into them.
+            if (index == 2 || (!array && index == 1)) {
+              extract->replaceAllUsesWith(zero);
+              extract->eraseFromParent();
+              continue;
+            }
             if (array && index == 1) index = 2;
-            else if (array && index == 2) index = 3;
-            else if (!array && index == 1) index = 3;
             if (index == *extract->idx_begin()) continue;
             auto *replacement = llvm::ExtractValueInst::Create(call, {index}, "", extract);
             extract->replaceAllUsesWith(replacement);
