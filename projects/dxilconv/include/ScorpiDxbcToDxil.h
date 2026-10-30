@@ -80,6 +80,16 @@ ScorpiCreateDxilBinary(const void *shader_code,
                        char *error_message,
                        size_t error_message_size);
 
+// Internal renderer linkage ABI: four DDI component types (0=unchanged,
+// 1=uint32, 2=int32, 3=float32) per register, packed into four nibbles.
+// Retypes stream-zero arbitrary outputs with bitcasts, never numeric conversion.
+// Selected components of each signature element must agree on a 32-bit type.
+// Returns a null binary when the existing output types already match.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiRetypeShaderOutputs(const void *code, size_t size,
+    const uint16_t component_types[32], void **binary, size_t *binary_size,
+    char *error_message, size_t error_message_size);
+
 // Retype only exports bound to signed integer RTVs. Float exports are raw
 // register bits, not numeric float-to-int conversions. Null output means the
 // shader already has the required types. Other color slots remain unchanged.

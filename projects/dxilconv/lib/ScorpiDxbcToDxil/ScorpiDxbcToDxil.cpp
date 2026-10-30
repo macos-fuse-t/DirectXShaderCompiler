@@ -44,6 +44,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -1290,6 +1291,108 @@ extern "C" int ScorpiInspectMeshOutputRows(const void *code, size_t size, int *r
     *required = dm->GetShaderModel()->IsMS() && HasDynamicMeshOutputs(*parsed.get());
     return SCORPI_DXBC_TO_DXIL_OK;
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
+}
+
+extern "C" int ScorpiRetypeShaderOutputs(
+    const void *code, size_t size, const uint16_t component_types[32],
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!component_types || !binary || !binary_size)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid output-linkage container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing output-linkage program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "output-linkage", false);
+    auto parsed = llvm::parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid output-linkage bitcode");
+    auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm || !(dm->GetShaderModel()->IsVS() || dm->GetShaderModel()->IsDS() ||
+                 dm->GetShaderModel()->IsGS()))
+      throw std::runtime_error("output linkage requires a rasterizer producer");
+    std::map<unsigned, llvm::Type *> types;
+    for (auto &element : dm->GetOutputSignature().GetElements()) {
+      // System values and non-rasterized streams retain their ABI.
+      if (element->GetKind() != hlsl::DXIL::SemanticKind::Arbitrary ||
+          element->GetOutputStream() != 0) continue;
+      unsigned selected = 0;
+      for (unsigned row = 0; row < element->GetRows(); ++row) {
+        const int reg = element->GetStartRow() + int(row);
+        if (reg < 0 || reg >= 32) continue;
+        for (unsigned col = element->GetStartCol();
+             col < element->GetStartCol() + element->GetCols(); ++col) {
+          const unsigned type = (component_types[reg] >> (4 * col)) & 15;
+          if (!type) continue;
+          if (type > 3 || (selected && selected != type))
+            throw std::runtime_error("mixed component types within one linkage element");
+          selected = type;
+        }
+      }
+      if (!selected) continue;
+      const auto type = selected == 1 ? hlsl::CompType::getU32() :
+          selected == 2 ? hlsl::CompType::getI32() : hlsl::CompType::getF32();
+      if (element->GetCompType() == type) continue;
+      if (element->GetCompType().GetSizeInBits() != 32)
+        throw std::runtime_error("output linkage requires 32-bit components");
+      // D3D11.3 7.8.1: instructions interpret untyped 32-bit registers.
+      // Match Metal's typed interface while preserving those register bits.
+      element->SetCompType(type);
+      types[element->GetID()] = selected == 3 ? llvm::Type::getFloatTy(context) :
+          llvm::Type::getInt32Ty(context);
+    }
+    if (types.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    std::vector<llvm::CallInst *> stores;
+    for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst))
+        if (call->getCalledFunction() &&
+            call->getCalledFunction()->getName().startswith("dx.op.storeOutput."))
+          stores.push_back(call);
+    for (auto *call : stores) {
+      auto *id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+      if (!id) throw std::runtime_error("dynamic output linkage ID");
+      auto type = types.find(unsigned(id->getZExtValue()));
+      if (type == types.end()) continue;
+      llvm::IRBuilder<> at(call);
+      auto *value = call->getArgOperand(4);
+      if (!value->getType()->isIntegerTy(32) && !value->getType()->isFloatTy())
+        throw std::runtime_error("unsupported output linkage store type");
+      auto *store = at.CreateCall(dm->GetOP()->GetOpFunc(hlsl::DXIL::OpCode::StoreOutput, type->second),
+          {call->getArgOperand(0), call->getArgOperand(1), call->getArgOperand(2),
+           call->getArgOperand(3), at.CreateBitCast(value, type->second)});
+      store->setDebugLoc(call->getDebugLoc()); call->eraseFromParent();
+    }
+    if (llvm::verifyModule(*parsed.get())) throw std::runtime_error("invalid output linkage IR");
+    dm->GetSerializedViewIdState().clear();
+    hlsl::DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<hlsl::AbstractMemoryStream> bitcode, output;
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(hlsl::CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); llvm::WriteBitcodeToFile(parsed.get().get(), stream); }
+    hlsl::SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        llvm::StringRef(), hlsl::SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("output linkage allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<hlsl::DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = uint32_t(offsetof(hlsl::DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected output linkage exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
 }
 
 extern "C" int ScorpiUnrollMeshOutputLoops(
