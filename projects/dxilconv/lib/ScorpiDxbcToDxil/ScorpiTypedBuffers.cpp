@@ -1106,8 +1106,8 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
 // The renderer opts in after measuring its device. Preserve raw data users,
 // share canonical values, and leave explicit preserve/FP16/FP64 untouched.
 static bool FlushFp32Math(DxilModule &dm, uint32_t options) {
-  if (!(options & (SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS |
-                   SCORPI_SHADER_FLUSH_FP32_ARITHMETIC))) return false;
+  // Converted trig may return a tiny input unchanged, bypassing the GPU's
+  // arithmetic FTZ behavior. Its inputs need canonicalization on every device.
   struct Math { Instruction *inst; unsigned first, count; bool output; };
   std::vector<Math> math;
   for (auto &f : *dm.GetModule()) {
@@ -1118,7 +1118,8 @@ static bool FlushFp32Math(DxilModule &dm, uint32_t options) {
           isa<FCmpInst>(inst) &&
           inst.getOperand(0)->getType()->getScalarType()->isFloatTy())
         math.push_back({&inst, 0, 2, false});
-      if (!(options & SCORPI_SHADER_FLUSH_FP32_ARITHMETIC) ||
+      const bool trig = Opcode(&inst) == OpCode::Sin || Opcode(&inst) == OpCode::Cos;
+      if ((!(options & SCORPI_SHADER_FLUSH_FP32_ARITHMETIC) && !trig) ||
           !inst.getType()->getScalarType()->isFloatTy()) continue;
       switch (inst.getOpcode()) {
       case Instruction::FSub:
@@ -1142,7 +1143,8 @@ static bool FlushFp32Math(DxilModule &dm, uint32_t options) {
         const bool bounded = op == OpCode::Round_ne || op == OpCode::Round_ni ||
             op == OpCode::Round_pi || op == OpCode::Round_z || op == OpCode::Frc ||
             op == OpCode::Log || op == OpCode::Sqrt || op == OpCode::Rsqrt ||
-            op == OpCode::Saturate || op == OpCode::FMin || op == OpCode::FMax;
+            op == OpCode::Saturate || op == OpCode::FMin || op == OpCode::FMax ||
+            op == OpCode::Sin || op == OpCode::Cos;
         math.push_back({&inst, 1, cast<CallInst>(&inst)->getNumArgOperands() - 1, !bounded});
         break;
       }
@@ -1191,6 +1193,42 @@ static bool FlushFp32Math(DxilModule &dm, uint32_t options) {
       item.inst->setOperand(i, flush(value));
   }
   return changed;
+}
+
+// Native converted Sin/Cos return zero for nonfinite inputs, including with
+// DisableNanInfOptimization. Preserve native finite arithmetic; share one
+// integer classification across Sin/Cos using the same SSA input. Integer
+// classification remains valid even when the original shader permits fast math.
+static bool FixNonfiniteTrig(DxilModule &dm) {
+  std::vector<CallInst *> calls;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst))
+      if (call->getType()->isFloatTy() &&
+          (Opcode(call) == OpCode::Sin || Opcode(call) == OpCode::Cos))
+        calls.push_back(call);
+  std::map<Value *, Value *> nonfinite;
+  for (auto *call : calls) {
+    auto *value = call->getArgOperand(1);
+    auto found = nonfinite.find(value);
+    if (found == nonfinite.end()) {
+      Instruction *position = call;
+      if (auto *definition = dyn_cast<Instruction>(value))
+        position = isa<PHINode>(definition) ? &*definition->getParent()->getFirstInsertionPt() :
+            definition->getNextNode();
+      else if (auto *argument = dyn_cast<Argument>(value))
+        position = &*argument->getParent()->getEntryBlock().getFirstInsertionPt();
+      IRBuilder<> b(position);
+      auto *bits = b.CreateBitCast(value, b.getInt32Ty());
+      auto *magnitude = b.CreateAnd(bits, b.getInt32(0x7fffffff));
+      found = nonfinite.emplace(value, b.CreateICmpUGE(magnitude, b.getInt32(0x7f800000))).first;
+    }
+    std::vector<User *> users(call->user_begin(), call->user_end());
+    IRBuilder<> b(call->getNextNode());
+    auto *nan = ConstantFP::get(dm.GetModule()->getContext(), APFloat::getQNaN(APFloat::IEEEsingle));
+    auto *result = b.CreateSelect(found->second, nan, call);
+    for (auto *user : users) user->replaceUsesOfWith(call, result);
+  }
+  return !calls.empty();
 }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
@@ -1259,6 +1297,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
+  const bool fixedTrig = FixNonfiniteTrig(dm);
   const bool flushedMath = FlushFp32Math(dm, options);
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
@@ -1367,7 +1406,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath;
+      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath || fixedTrig;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){

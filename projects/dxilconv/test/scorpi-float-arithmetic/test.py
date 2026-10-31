@@ -77,3 +77,12 @@ RWByteAddressBuffer output:register(u0);
 [numthreads(1,1,1)]void main(){ SETUP output.Store4(0,VALUES); }'''
         assert adapt(compile_shader(text.replace('SETUP', setup).replace('VALUES', values), flags), 64) is None
         print('PASS', setup.split()[0], 'unrelated operations unchanged')
+
+    trig = source.replace('a + b, a * b, a / b, floor(a)', 'sin(a), cos(a), a, b')
+    code = compile_shader(trig, ['-T', 'cs_6_0'])
+    result = adapt(code, 0)
+    assert result is not None, 'nonfinite trig correction is independent of denorm policy'
+    (tmp / 'trig.dxil').write_bytes(result)
+    ir = subprocess.check_output([str(build / 'bin/dxc'), '-dumpbin', str(tmp / 'trig.dxil')], text=True)
+    assert ir.count('2139095040') == 1, 'sin/cos of one input must share its nonfinite classification'
+    print('PASS sin/cos shared nonfinite classification; unrelated shaders unchanged')
