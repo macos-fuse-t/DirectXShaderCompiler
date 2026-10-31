@@ -43,7 +43,8 @@ def ir(code, tmp):
 
 with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
     tmp = Path(name)
-    for kind in ['float', 'internal', 'signed', 'unsigned', 'default', 'native16']:
+    for kind in ['float', 'internal', 'signed', 'unsigned', 'default', 'native16',
+                 'nonfinite', 'finite-fast', 'native16-nonfinite']:
         source = fixture
         if kind in ['signed', 'unsigned']:
             source = source.replace('half', 'i16').replace('.f16', '.i16')
@@ -57,16 +58,19 @@ with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
             source = source.replace('  %sum = fadd half', '  %input = fptrunc float %wide to half\n  %sum = fadd half')
             source = source.replace('  call void @dx.op.storeOutput.f16', '  %output = fpext half %sum to float\n  call void @dx.op.storeOutput.f32').replace('half %sum)', 'float %output)')
             source = source.replace('declare half @dx.op.loadInput.f16', 'declare float @dx.op.loadInput.f32').replace('declare void @dx.op.storeOutput.f16(i32, i32, i32, i8, half)', 'declare void @dx.op.storeOutput.f32(i32, i32, i32, i8, float)').replace('i8 8, i8', 'i8 9, i8')
-        if kind == 'native16':
+        if kind in ['nonfinite', 'finite-fast', 'native16-nonfinite']:
+            source = source.replace('fadd half', 'fadd fast half')
+            if kind != 'finite-fast': source = source.replace('0xH3C00', '0xHFC00')
+        if kind in ['native16', 'native16-nonfinite']:
             source = source.replace('i32 6, i32 0', 'i32 6, i32 2').replace('i64 288', 'i64 8388896')
         (tmp / 'shader.ll').write_text(source)
         subprocess.run([str(build / 'bin/llvm-as'), str(tmp / 'shader.ll'), '-o', str(tmp / 'shader.bc')], check=True)
-        code = program((tmp / 'shader.bc').read_bytes(), 2 if kind == 'native16' else 0)
+        code = program((tmp / 'shader.bc').read_bytes(), 2 if kind.startswith('native16') else 0)
         result, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(2048)
         rc = lower(code, len(code), None, 0, 0xffffffff, 0, 0, None, 0,
                    C.byref(result), C.byref(size), error, len(error))
         assert rc == 0, (kind, rc, error.value)
-        if kind in ['default', 'native16', 'unsigned']:
+        if kind in ['default', 'native16', 'unsigned', 'native16-nonfinite']:
             assert not result.value and size.value == 0, kind
         else:
             assert result.value, kind
@@ -75,9 +79,11 @@ with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
             finally:
                 lib.ScorpiFreeDxilBinary(result)
             text = ir(output, tmp)
-            if kind in ['float', 'internal']:
+            if kind in ['float', 'internal', 'nonfinite', 'finite-fast']:
                 assert '@dx.op.loadInput.f32' in text and '@dx.op.storeOutput.f32' in text
-                assert 'fadd half' in text and 'dx.op.legacyF32ToF16' in text and 'fpext half' in text
+                assert 'dx.op.legacyF32ToF16' in text and 'fpext half' in text
+                expected_add = 'fadd nsz arcp half' if kind == 'nonfinite' else 'fadd fast half' if kind == 'finite-fast' else 'fadd half'
+                assert expected_add in text, (kind, text)
             else:
                 assert '@dx.op.loadInput.i32' in text and '@dx.op.storeOutput.i32' in text
                 assert 'add i16' in text and 'trunc i32' in text
