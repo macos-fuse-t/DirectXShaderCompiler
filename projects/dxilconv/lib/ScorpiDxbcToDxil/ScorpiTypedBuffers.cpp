@@ -6,6 +6,8 @@
 #include "dxc/DXIL/DxilResourceBinding.h"
 #include "dxc/DXIL/DxilResourceProperties.h"
 #include "dxc/DXIL/DxilShaderModel.h"
+#include "dxc/DXIL/DxilSignature.h"
+#include "dxc/DXIL/DxilSignatureElement.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -1336,10 +1338,72 @@ bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
   return inlinedSubroutines;
 }
 
+namespace {
+bool WidenMinimumPrecisionIO(DxilModule &dm) {
+  // Minimum precision permits a wider interface. MSC's stage-in/position
+  // lowering emits invalid AIR for f16 interfaces and invalid pipelines for
+  // signed i16 interfaces. Keep the shader's arithmetic precision and convert only at
+  // the interface; explicit native 16-bit shaders retain their exact ABI.
+  if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
+      dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
+  using Types = std::map<unsigned, CompType>;
+  Types inputs, outputs, patches;
+  auto widen = [](DxilSignature &signature, Types &types) {
+    for (auto &element : signature.GetElements()) {
+      auto type = element->GetCompType();
+      if (!(type == CompType::getF16()) && !(type == CompType::getI16())) continue;
+      types.emplace(element->GetID(), type);
+      element->SetCompType(type.GetBaseCompType());
+    }
+  };
+  widen(dm.GetInputSignature(), inputs);
+  widen(dm.GetOutputSignature(), outputs);
+  widen(dm.GetPatchConstOrPrimSignature(), patches);
+  if (inputs.empty() && outputs.empty() && patches.empty()) return false;
+  std::vector<CallInst *> calls;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst)) {
+      auto op = Opcode(call);
+      if (op == OpCode::LoadInput || op == OpCode::LoadOutputControlPoint ||
+          op == OpCode::LoadPatchConstant || op == OpCode::StoreOutput ||
+          op == OpCode::StorePatchConstant) calls.push_back(call);
+    }
+  for (auto *call : calls) {
+    auto op = Opcode(call);
+    const auto &types = op == OpCode::LoadInput ? inputs :
+        (op == OpCode::LoadPatchConstant || op == OpCode::StorePatchConstant) ? patches : outputs;
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic minimum-precision signature ID");
+    auto selected = types.find(unsigned(id->getZExtValue()));
+    if (selected == types.end()) continue;
+    IRBuilder<> at(call);
+    bool floating = selected->second == CompType::getF16();
+    Type *wide = floating ? at.getFloatTy() : at.getInt32Ty();
+    SmallVector<Value *, 8> args;
+    for (auto &arg : call->arg_operands()) args.push_back(arg);
+    const bool store = op == OpCode::StoreOutput || op == OpCode::StorePatchConstant;
+    if (store) {
+      auto *value = args[4];
+      args[4] = floating ? at.CreateFPExt(value, wide) : at.CreateSExt(value, wide);
+    }
+    auto *replacement = at.CreateCall(dm.GetOP()->GetOpFunc(op, wide), args);
+    replacement->setDebugLoc(call->getDebugLoc());
+    if (!store) {
+      auto *value = floating ? at.CreateFPTrunc(replacement, call->getType()) :
+          at.CreateTrunc(replacement, call->getType());
+      call->replaceAllUsesWith(value);
+    }
+    call->eraseFromParent();
+  }
+  return true;
+}
+}
+
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
+  const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1457,7 +1521,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
