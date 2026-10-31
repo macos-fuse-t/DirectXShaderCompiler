@@ -408,6 +408,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // Keep native typed addressing, repairing dimensions and logical bounds
 // before an alignment prefix or scalar-backed RGB32 scaling is applied.
 #define SCORPI_SHADER_TYPED_DIMENSIONS_ONLY 16u
+// Some native GPUs preserve FP32 subnormals in comparisons. Canonicalize only
+// comparison inputs when the caller has observed that behavior on its device.
+#define SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS 32u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;

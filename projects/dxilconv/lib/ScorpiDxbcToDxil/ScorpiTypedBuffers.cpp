@@ -1109,7 +1109,14 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
+  std::vector<FCmpInst *> comparisons;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
+    if ((options & SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS) &&
+        (!f.hasFnAttribute("fp32-denorm-mode") ||
+         f.getFnAttribute("fp32-denorm-mode").getValueAsString() != "preserve"))
+      if (auto *compare = dyn_cast<FCmpInst>(&inst))
+        if (compare->getOperand(0)->getType()->getScalarType()->isFloatTy())
+          comparisons.push_back(compare);
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
     if ((options & SCORPI_SHADER_BINDING_POLICY) &&
@@ -1216,7 +1223,33 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return false;
+      nullBufferAccesses.empty() && comparisons.empty()) return false;
+  // Preserve the original SSA values for raw moves/stores and other users.
+  // Share one canonicalization at each definition across all its comparisons.
+  std::map<Value *, Value *> comparisonInputs;
+  for (auto *compare : comparisons) for (unsigned i = 0; i < 2; ++i) {
+    auto *value = compare->getOperand(i);
+    auto found = comparisonInputs.find(value);
+    if (found == comparisonInputs.end()) {
+      Instruction *position = compare;
+      if (auto *definition = dyn_cast<Instruction>(value))
+        position = isa<PHINode>(definition) ? &*definition->getParent()->getFirstInsertionPt() :
+            definition->getNextNode();
+      else if (auto *argument = dyn_cast<Argument>(value))
+        position = &*argument->getParent()->getEntryBlock().getFirstInsertionPt();
+      IRBuilder<> b(position);
+      auto *type = value->getType()->isVectorTy() ?
+          static_cast<Type *>(VectorType::get(b.getInt32Ty(), value->getType()->getVectorNumElements())) :
+          b.getInt32Ty();
+      auto *bits = b.CreateBitCast(value, type);
+      auto *magnitude = b.CreateAnd(bits, ConstantInt::get(type, 0x7fffffff));
+      auto *subnormal = b.CreateICmpULT(magnitude, ConstantInt::get(type, 0x00800000));
+      auto *sign = b.CreateAnd(bits, ConstantInt::get(type, 0x80000000));
+      auto *flushed = b.CreateBitCast(b.CreateSelect(subnormal, sign, bits), value->getType());
+      found = comparisonInputs.emplace(value, flushed).first;
+    }
+    compare->setOperand(i, found->second);
+  }
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
