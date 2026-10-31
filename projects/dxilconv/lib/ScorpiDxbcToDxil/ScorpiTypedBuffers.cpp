@@ -10,6 +10,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/IPO.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -1102,6 +1103,25 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
+  bool inlinedSubroutines = false;
+  for (auto &function : *dm.GetModule())
+    if (function.hasLocalLinkage() && !function.isDeclaration() &&
+        function.getName().startswith("dx.label.")) {
+      function.addFnAttr(Attribute::AlwaysInline);
+      inlinedSubroutines = true;
+    }
+  if (inlinedSubroutines) {
+    // DXBC call/label helpers share the thread's temporary-register globals.
+    // Inline them before native conversion, then promote that storage to SSA.
+    // Ordinary shaders never run these passes.
+    legacy::PassManager cleanup;
+    cleanup.add(createAlwaysInlinerPass(false));
+    cleanup.add(createGlobalOptimizerPass());
+    cleanup.add(createPromoteMemoryToRegisterPass());
+    cleanup.add(createInstructionCombiningPass());
+    cleanup.add(createCFGSimplificationPass());
+    cleanup.run(*dm.GetModule());
+  }
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1223,7 +1243,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty() && comparisons.empty()) return false;
+      nullBufferAccesses.empty() && comparisons.empty()) return inlinedSubroutines;
   // Preserve the original SSA values for raw moves/stores and other users.
   // Share one canonicalization at each definition across all its comparisons.
   std::map<Value *, Value *> comparisonInputs;

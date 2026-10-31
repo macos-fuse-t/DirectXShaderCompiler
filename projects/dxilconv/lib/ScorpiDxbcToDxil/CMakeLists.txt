@@ -29,6 +29,7 @@ foreach(target ScorpiDxbcToDxil ScorpiDxbcToDxilStatic)
     LLVMDxilRootSignature
     LLVMMSSupport
     LLVMScalarOpts
+    LLVMipo
     LLVMSupport
   )
 
@@ -51,7 +52,7 @@ if(MSVC)
   set(scorpi_bundle_targets
     ScorpiDxbcToDxilStatic DxbcConverter DxilConvPasses LLVMDxcSupport
     LLVMDxilContainer LLVMDxilRootSignature LLVMMSSupport LLVMScalarOpts
-    LLVMSupport LLVMDxilHash LLVMInstCombine LLVMProfileData LLVMHLSL
+    LLVMSupport LLVMDxilHash LLVMInstCombine LLVMProfileData LLVMHLSL LLVMipo
     LLVMBitWriter LLVMTransformUtils LLVMipa LLVMAnalysis LLVMDxcBindingTable
     LLVMDXIL LLVMBitReader LLVMCore)
   set(scorpi_bundle_inputs)
