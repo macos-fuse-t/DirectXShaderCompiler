@@ -1834,7 +1834,7 @@ extern "C" int ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t loc
 }
 
 extern "C" int ScorpiEmulateAtomic64WithOptions(const void *code, size_t size, uint32_t lock_space,
-    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_texture_minmax,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_minmax,
     void **binary, size_t *binary_size, char *error, size_t error_size) {
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count))
@@ -1853,7 +1853,7 @@ extern "C" int ScorpiEmulateAtomic64WithOptions(const void *code, size_t size, u
     if (!parsed) throw std::runtime_error("invalid atomic shader bitcode");
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) throw std::runtime_error("missing atomic shader module");
-    if (!ScorpiLowerAtomic64(*dm, lock_space, bindings, binding_count, native_texture_minmax!=0)) return SCORPI_DXBC_TO_DXIL_OK;
+    if (!ScorpiLowerAtomic64(*dm, lock_space, bindings, binding_count, native_minmax!=0)) return SCORPI_DXBC_TO_DXIL_OK;
     if (llvm::verifyModule(*parsed.get(), &llvm::errs())) throw std::runtime_error("invalid atomic lowering IR");
     hlsl::DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
     CComPtr<hlsl::AbstractMemoryStream> bitcode, output;

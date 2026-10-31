@@ -283,12 +283,25 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiPromoteTexture1D(const void *code, size_t size, void **binary,
     size_t *binary_size, char *error, size_t error_size);
 
-// Private descriptor metadata ABI v3. Each heap slot contains a native buffer
+// Private descriptor metadata ABI v4. Each heap slot contains a native buffer
 // descriptor for an immutable view-local payload: a 32-byte record followed by
 // sparse feedback (when needed). Copies preserve that descriptor verbatim.
 // t0 is per-draw root metadata; resource and sampler payloads use disjoint ranges.
-#define SCORPI_DESCRIPTOR_METADATA_ABI 3
+#define SCORPI_DESCRIPTOR_METADATA_ABI 4
 #define SCORPI_METADATA_RECORD_BYTES 32
+// Buffer lock identity is the byte offset within a 64-KiB backing tile.
+// Texture identities use full-resource coordinates; word 7 carries the view
+// array/depth origin instead of a buffer byte origin.
+// Dropping the tile identity permits collisions and preserves sparse aliases.
+#define SCORPI_ATOMIC64_TILE_BYTES 65536u
+#define SCORPI_ATOMIC64_STRIPES (SCORPI_ATOMIC64_TILE_BYTES / 8u)
+// Two words per stripe: native-reader gate followed by the fallback mutex.
+#define SCORPI_ATOMIC64_WORDS_PER_STRIPE 2u
+#define SCORPI_ATOMIC64_WAVE_LANES 32u
+#define SCORPI_ATOMIC64_LOCK_WORDS ((SCORPI_ATOMIC64_STRIPES + 1u) * SCORPI_ATOMIC64_WORDS_PER_STRIPE)
+#define SCORPI_ATOMIC64_EMULATED_BIT 0x80000000u
+#define SCORPI_ATOMIC64_READER_MASK 0x7fffffffu
+#define SCORPI_ATOMIC64_ORIGIN_WORD 7u
 #define SCORPI_METADATA_RESOURCE_REGISTER 1
 #define SCORPI_METADATA_RESOURCE_DESCRIPTORS 1048576
 #define SCORPI_METADATA_SAMPLER_REGISTER 1048577
@@ -339,12 +352,6 @@ ScorpiLowerTypedBufferViews(const void *code, size_t size,
     uint32_t metadata_space, uint32_t self_offset,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 
-// Resource i64 atomics only; null output means the shader was unchanged.
-// The caller must supply a shared, initially-zero private raw UAV at u0/space.
-SCORPI_DXBC_TO_DXIL_EXPORT int
-ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
-    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
-    void **binary, size_t *binary_size, char *error, size_t error_size);
 // DXBC/SM5 cannot contain i64 atomics and bypasses bitcode parsing entirely.
 enum ScorpiAtomic64Requirements {
     SCORPI_ATOMIC64_BUFFER = 1,
@@ -355,8 +362,12 @@ enum ScorpiAtomic64Requirements {
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectAtomic64Requirements(const void *code, size_t size, uint32_t *requirements);
 SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiEmulateAtomic64(const void *code, size_t size, uint32_t lock_space,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiEmulateAtomic64WithOptions(const void *code, size_t size, uint32_t lock_space,
-    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_texture_minmax,
+    const ScorpiTypedBufferBinding *bindings, size_t binding_count, int native_minmax,
     void **binary, size_t *binary_size, char *error, size_t error_size);
 
 SCORPI_DXBC_TO_DXIL_EXPORT int

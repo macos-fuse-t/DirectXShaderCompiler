@@ -256,6 +256,13 @@ class Lowering {
     metadataHandles[f] = handle;
     return handle;
   }
+  unsigned MetadataResource(std::unique_ptr<DxilResource> resource) {
+    for (const auto &existing : dm.GetSRVs())
+      if (existing->GetSpaceID() == resource->GetSpaceID() &&
+          existing->GetLowerBound() == resource->GetLowerBound() &&
+          existing->GetGlobalName() == resource->GetGlobalName()) return existing->GetID();
+    return dm.AddSRV(std::move(resource));
+  }
   Value *Load(IRBuilder<> &b, Value *handle, Value *offset) {
     return b.CreateExtractValue(Call(b, OpCode::BufferLoad, b.getInt32Ty(),
         {handle, offset, UndefValue::get(b.getInt32Ty())}), 0);
@@ -297,7 +304,7 @@ public:
     resource->SetGlobalName("ScorpiTypedBufferMetadata");
     resource->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
         {Type::getInt32Ty(ctx)}, "ScorpiTypedBufferMetadata")->getPointerTo()));
-    resourceID = dm.AddSRV(std::move(resource));
+    resourceID = MetadataResource(std::move(resource));
     for (unsigned i = 0; i != 2; ++i) {
       auto descriptors = std::make_unique<DxilResource>();
       descriptors->SetID(dm.GetSRVs().size()); descriptors->SetRW(false);
@@ -307,7 +314,7 @@ public:
       descriptors->SetGlobalName(i ? "ScorpiSamplerMetadata" : "ScorpiResourceMetadata");
       descriptors->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
           {Type::getInt32Ty(ctx)}, "ScorpiDescriptorMetadata")->getPointerTo()));
-      descriptorResourceIDs[i] = dm.AddSRV(std::move(descriptors));
+      descriptorResourceIDs[i] = MetadataResource(std::move(descriptors));
     }
   }
 
@@ -327,26 +334,26 @@ public:
   }
 
   // Word 7 returns the metadata buffer handle, used for view-local feedback.
-  Value *Word(Value *handle, unsigned word) {
-    auto key = std::make_pair(handle, word);
+  Value *Word(Value *handle, unsigned word, bool atomicOrigin = false) {
+    auto key = std::make_pair(handle, word * 2 + unsigned(atomicOrigin));
     auto found = words.find(key);
     if (found != words.end()) return found->second;
     if (auto *phi = dyn_cast<PHINode>(handle)) {
-      auto *value = PHINode::Create(word == 7 ? dm.GetOP()->GetHandleType() : Type::getInt32Ty(phi->getContext()), phi->getNumIncomingValues(),
+      auto *value = PHINode::Create(word == 7 && !atomicOrigin ? dm.GetOP()->GetHandleType() : Type::getInt32Ty(phi->getContext()), phi->getNumIncomingValues(),
           "scorpi.view.prefix", phi);
       words[key] = value;
       for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
-        value->addIncoming(Word(phi->getIncomingValue(i), word), phi->getIncomingBlock(i));
+        value->addIncoming(Word(phi->getIncomingValue(i), word, atomicOrigin), phi->getIncomingBlock(i));
       return value;
     }
     if (auto *select = dyn_cast<SelectInst>(handle)) {
-      auto *a = Word(select->getTrueValue(), word), *b = Word(select->getFalseValue(), word);
+      auto *a = Word(select->getTrueValue(), word, atomicOrigin), *b = Word(select->getFalseValue(), word, atomicOrigin);
       IRBuilder<> builder(select->getNextNode());
       return words[key] = builder.CreateSelect(select->getCondition(), a, b);
     }
     auto *call = dyn_cast<CallInst>(handle);
     if (!call) throw std::runtime_error("unsupported typed-buffer handle");
-    if (Opcode(call) == OpCode::AnnotateHandle) return words[key] = Word(call->getArgOperand(1), word);
+    if (Opcode(call) == OpCode::AnnotateHandle) return words[key] = Word(call->getArgOperand(1), word, atomicOrigin);
     uint32_t cls, resourceSpace, lower;
     Value *index;
     if (Opcode(call) == OpCode::CreateHandle) {
@@ -389,7 +396,22 @@ public:
       metadata = DescriptorMetadataHandle(b, slot, cls == unsigned(ResourceClass::Sampler));
       offset = b.getInt32(0);
     }
-    if (word == 7) return words[key] = metadata;
+    if (word == 7 && !atomicOrigin) return words[key] = metadata;
+    if (atomicOrigin && range->table_offset != UINT32_MAX) {
+      auto *dimensions = Call(b,OpCode::GetDimensions,b.getInt32Ty(),{metadata,b.getInt32(0)});
+      auto *present = b.CreateICmpUGE(b.CreateExtractValue(dimensions,0),b.getInt32(SCORPI_METADATA_RECORD_BYTES));
+      auto *before = b.GetInsertBlock();
+      auto *after = before->splitBasicBlock(b.GetInsertPoint(),"scorpi.atomic.origin.end");
+      before->getTerminator()->eraseFromParent();
+      auto *load = BasicBlock::Create(call->getContext(),"scorpi.atomic.origin.load",before->getParent(),after);
+      b.SetInsertPoint(before);b.CreateCondBr(present,load,after);
+      b.SetInsertPoint(load);
+      auto *value = Load(b,metadata,b.CreateAdd(offset,b.getInt32(word*4)));
+      b.CreateBr(after);b.SetInsertPoint(&*after->begin());
+      auto *result = b.CreatePHI(b.getInt32Ty(),2);
+      result->addIncoming(b.getInt32(0),before);result->addIncoming(value,load);
+      return words[key] = result;
+    }
     return words[key] = Load(b, metadata, b.CreateAdd(offset, b.getInt32(word * 4)));
   }
 
@@ -1563,4 +1585,10 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     dm.CollectShaderFlagsForModule();
   }
   return true;
+}
+
+llvm::Value *ScorpiAtomic64Origin(hlsl::DxilModule &dm, llvm::Value *handle,
+    const ScorpiTypedBufferBinding *bindings, size_t count, uint32_t space) {
+  Lowering lowering(dm, bindings, count, space, 0, 0, nullptr, 0);
+  return lowering.Word(handle, SCORPI_ATOMIC64_ORIGIN_WORD, true);
 }

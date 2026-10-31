@@ -10,7 +10,7 @@ class Module;
 // Returns false without changing modules that have no resource i64 atomics.
 bool ScorpiLowerAtomic64(hlsl::DxilModule &module, uint32_t lock_space,
                          const ScorpiTypedBufferBinding *bindings,
-                         size_t binding_count, bool native_texture_minmax = false);
+                         size_t binding_count, bool native_minmax = false);
 bool ScorpiHasAtomic64(llvm::Module &module);
 
 uint32_t ScorpiClassifyAtomic64(llvm::Module &module);
