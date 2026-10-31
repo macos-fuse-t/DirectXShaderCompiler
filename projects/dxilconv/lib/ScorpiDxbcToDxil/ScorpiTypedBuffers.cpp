@@ -1397,6 +1397,27 @@ bool WidenMinimumPrecisionIO(DxilModule &dm) {
   }
   return true;
 }
+
+bool RoundMinimumPrecisionConversions(DxilModule &dm) {
+  if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
+      dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
+  std::vector<FPTruncInst *> casts;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *cast = dyn_cast<FPTruncInst>(&inst))
+      if (cast->getSrcTy()->isFloatTy() && cast->getDestTy()->isHalfTy()) casts.push_back(cast);
+  // D3D11.3 3.2.2 and 7.20.3.4 require round-to-zero when narrowing.
+  // LLVM fptrunc uses nearest-even; the legacy DXIL conversion carries the
+  // required native rounding mode without changing half arithmetic or native16.
+  for (auto *cast : casts) {
+    IRBuilder<> at(cast);
+    auto *bits = at.CreateCall(dm.GetOP()->GetOpFunc(OpCode::LegacyF32ToF16, at.getFloatTy()),
+        {at.getInt32(unsigned(OpCode::LegacyF32ToF16)), cast->getOperand(0)});
+    auto *value = at.CreateBitCast(at.CreateTrunc(bits, at.getInt16Ty()), at.getHalfTy());
+    cast->replaceAllUsesWith(value);
+    cast->eraseFromParent();
+  }
+  return !casts.empty();
+}
 }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
@@ -1404,6 +1425,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
   const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
+  const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1521,7 +1543,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){

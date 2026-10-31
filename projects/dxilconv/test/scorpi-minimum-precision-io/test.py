@@ -43,7 +43,7 @@ def ir(code, tmp):
 
 with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
     tmp = Path(name)
-    for kind in ['float', 'signed', 'unsigned', 'default', 'native16']:
+    for kind in ['float', 'internal', 'signed', 'unsigned', 'default', 'native16']:
         source = fixture
         if kind in ['signed', 'unsigned']:
             source = source.replace('half', 'i16').replace('.f16', '.i16')
@@ -52,7 +52,12 @@ with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
         elif kind == 'default':
             source = source.replace('half', 'float').replace('.f16', '.f32')
             source = source.replace('0xH3C00', '1.0').replace('i8 8, i8', 'i8 9, i8').replace('i64 288', 'i64 256')
-        elif kind == 'native16':
+        elif kind in ['internal', 'native16']:
+            source = source.replace('  %input = call half @dx.op.loadInput.f16', '  %wide = call float @dx.op.loadInput.f32')
+            source = source.replace('  %sum = fadd half', '  %input = fptrunc float %wide to half\n  %sum = fadd half')
+            source = source.replace('  call void @dx.op.storeOutput.f16', '  %output = fpext half %sum to float\n  call void @dx.op.storeOutput.f32').replace('half %sum)', 'float %output)')
+            source = source.replace('declare half @dx.op.loadInput.f16', 'declare float @dx.op.loadInput.f32').replace('declare void @dx.op.storeOutput.f16(i32, i32, i32, i8, half)', 'declare void @dx.op.storeOutput.f32(i32, i32, i32, i8, float)').replace('i8 8, i8', 'i8 9, i8')
+        if kind == 'native16':
             source = source.replace('i32 6, i32 0', 'i32 6, i32 2').replace('i64 288', 'i64 8388896')
         (tmp / 'shader.ll').write_text(source)
         subprocess.run([str(build / 'bin/llvm-as'), str(tmp / 'shader.ll'), '-o', str(tmp / 'shader.bc')], check=True)
@@ -70,9 +75,9 @@ with tempfile.TemporaryDirectory(prefix='scorpi-minimum-precision-') as name:
             finally:
                 lib.ScorpiFreeDxilBinary(result)
             text = ir(output, tmp)
-            if kind == 'float':
+            if kind in ['float', 'internal']:
                 assert '@dx.op.loadInput.f32' in text and '@dx.op.storeOutput.f32' in text
-                assert 'fadd half' in text and 'fptrunc float' in text and 'fpext half' in text
+                assert 'fadd half' in text and 'dx.op.legacyF32ToF16' in text and 'fpext half' in text
             else:
                 assert '@dx.op.loadInput.i32' in text and '@dx.op.storeOutput.i32' in text
                 assert 'add i16' in text and 'trunc i32' in text
