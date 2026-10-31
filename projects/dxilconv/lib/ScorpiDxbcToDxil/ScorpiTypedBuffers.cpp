@@ -9,8 +9,10 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -1103,19 +1105,56 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
-  bool inlinedSubroutines = false;
+  std::vector<Function *> subroutines;
   for (auto &function : *dm.GetModule())
     if (function.hasLocalLinkage() && !function.isDeclaration() &&
-        function.getName().startswith("dx.label.")) {
-      function.addFnAttr(Attribute::AlwaysInline);
-      inlinedSubroutines = true;
-    }
+        function.getName().startswith("dx.label."))
+      subroutines.push_back(&function);
+  const bool inlinedSubroutines = !subroutines.empty();
   if (inlinedSubroutines) {
+    auto legacyCall = [](Value *value) {
+      auto *call = dyn_cast_or_null<CallInst>(value);
+      auto *function = call ? call->getCalledFunction() : nullptr;
+      return function && function->hasLocalLinkage() && !function->isDeclaration() &&
+          function->getName().startswith("dx.label.") ? call : nullptr;
+    };
+    {
+      CallGraph graph(*dm.GetModule());
+      std::vector<std::pair<WeakTrackingVH, unsigned>> pending;
+      for (auto &function : *dm.GetModule())
+        if (std::find(subroutines.begin(), subroutines.end(), &function) == subroutines.end())
+          for (auto &block : function) for (auto &inst : block)
+            if (auto *call = legacyCall(&inst)) pending.emplace_back(call, 0);
+      while (!pending.empty()) {
+        auto item = pending.back(); pending.pop_back();
+        auto *call = legacyCall(item.first);
+        if (!call) continue;
+        // SM4/5 CALL is a no-op when its 32-entry return stack is full.
+        // Expand per call site: a shared helper can be reached at both the
+        // boundary and a shallower depth. No runtime depth tracking is needed.
+        if (item.second == 32) {
+          graph[call->getParent()->getParent()]->removeCallEdgeFor(call);
+          call->eraseFromParent();
+          continue;
+        }
+        InlineFunctionInfo info(&graph);
+        if (!InlineFunction(call, info, false))
+          throw std::runtime_error("cannot inline DXBC subroutine");
+        for (auto &nested : info.InlinedCalls)
+          if (auto *next = legacyCall(nested)) pending.emplace_back(next, item.second + 1);
+      }
+    }
+    // All reachable call sites are expanded. Drop the original helper bodies
+    // together, including references from one now-unused helper to another.
+    for (auto *function : subroutines) function->dropAllReferences();
+    for (auto *function : subroutines) {
+      dm.RemoveFunction(function);
+      function->eraseFromParent();
+    }
     // DXBC call/label helpers share the thread's temporary-register globals.
     // Inline them before native conversion, then promote that storage to SSA.
     // Ordinary shaders never run these passes.
     legacy::PassManager cleanup;
-    cleanup.add(createAlwaysInlinerPass(false));
     cleanup.add(createGlobalOptimizerPass());
     cleanup.add(createPromoteMemoryToRegisterPass());
     cleanup.add(createInstructionCombiningPass());
