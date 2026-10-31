@@ -6396,6 +6396,10 @@ void DxbcConverter::ConvertComparison(CmpInst::Predicate Predicate,
                                       const unsigned DstIdx,
                                       const unsigned SrcIdx1,
                                       const unsigned SrcIdx2) {
+  // Refactoring permission does not make NaNs impossible in comparisons.
+  // Keep source modifiers and predicates exact without changing arithmetic.
+  IRBuilderBase::FastMathFlagGuard ComparisonFlags(*m_pBuilder);
+  m_pBuilder->clearFastMathFlags();
   CMask WriteMask = CMask::FromDXBC(Inst.m_Operands[DstIdx].m_WriteMask);
   CompType OperationType = DXBC::GetCompTypeWithMinPrec(
       ElementType, GetHigherPrecision(Inst.m_Operands[SrcIdx1].m_MinPrecision,
@@ -6414,9 +6418,23 @@ void DxbcConverter::ConvertComparison(CmpInst::Predicate Predicate,
       case CmpInst::FCMP_OEQ:
       case CmpInst::FCMP_UNE:
       case CmpInst::FCMP_OLT:
-      case CmpInst::FCMP_OGE:
-        Out[c] = m_pBuilder->CreateFCmp(Predicate, In1[c], In2[c]);
+      case CmpInst::FCMP_OGE: {
+        // DXBC float comparisons flush subnormal inputs. Apply that rule
+        // before IRBuilder can fold literal comparisons using IEEE values;
+        // moves and integer interpretations must retain their original bits.
+        auto flushConstant = [](Value *value) -> Value * {
+          auto *constant = dyn_cast<ConstantFP>(value);
+          if (constant && value->getType()->isFloatTy() &&
+              constant->getValueAPF().isDenormal())
+            return ConstantFP::get(value->getContext(),
+                APFloat::getZero(APFloat::IEEEsingle,
+                    constant->getValueAPF().isNegative()));
+          return value;
+        };
+        Out[c] = m_pBuilder->CreateFCmp(Predicate,
+            flushConstant(In1[c]), flushConstant(In2[c]));
         break;
+      }
 
       case CmpInst::ICMP_EQ:
       case CmpInst::ICMP_NE:
