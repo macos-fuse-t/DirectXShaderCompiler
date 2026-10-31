@@ -1102,6 +1102,97 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
   for (auto *user : users) user->replaceUsesOfWith(call, result);
 }
 
+// Metal permits preserving FP32 subnormals; Direct3D's default math does not.
+// The renderer opts in after measuring its device. Preserve raw data users,
+// share canonical values, and leave explicit preserve/FP16/FP64 untouched.
+static bool FlushFp32Math(DxilModule &dm, uint32_t options) {
+  if (!(options & (SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS |
+                   SCORPI_SHADER_FLUSH_FP32_ARITHMETIC))) return false;
+  struct Math { Instruction *inst; unsigned first, count; bool output; };
+  std::vector<Math> math;
+  for (auto &f : *dm.GetModule()) {
+    if (f.hasFnAttribute("fp32-denorm-mode") &&
+        f.getFnAttribute("fp32-denorm-mode").getValueAsString() == "preserve") continue;
+    for (auto &block : f) for (auto &inst : block) {
+      if ((options & SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS) &&
+          isa<FCmpInst>(inst) &&
+          inst.getOperand(0)->getType()->getScalarType()->isFloatTy())
+        math.push_back({&inst, 0, 2, false});
+      if (!(options & SCORPI_SHADER_FLUSH_FP32_ARITHMETIC) ||
+          !inst.getType()->getScalarType()->isFloatTy()) continue;
+      switch (inst.getOpcode()) {
+      case Instruction::FSub:
+        // LLVM represents sign-only negation as -0 - x. DXBC MOV source
+        // modifiers preserve subnormals, so leave that bit operation intact.
+        if (auto *zero = dyn_cast<ConstantFP>(inst.getOperand(0)))
+          if (zero->isZero() && zero->isNegative()) continue;
+        LLVM_FALLTHROUGH;
+      case Instruction::FAdd: case Instruction::FMul:
+      case Instruction::FDiv: case Instruction::FRem:
+        math.push_back({&inst, 0, 2, true});
+        break;
+      case Instruction::Call: {
+        const auto op = Opcode(&inst);
+        if (op == OpCode::NumOpCodes || op == OpCode::FAbs) break;
+        const auto cls = OP::GetOpCodeClass(op);
+        if (cls != OpCodeClass::Unary && cls != OpCodeClass::Binary &&
+            cls != OpCodeClass::Tertiary && cls != OpCodeClass::Dot2 &&
+            cls != OpCodeClass::Dot3 && cls != OpCodeClass::Dot4) break;
+        // With flushed inputs these operations cannot produce subnormals.
+        const bool bounded = op == OpCode::Round_ne || op == OpCode::Round_ni ||
+            op == OpCode::Round_pi || op == OpCode::Round_z || op == OpCode::Frc ||
+            op == OpCode::Log || op == OpCode::Sqrt || op == OpCode::Rsqrt ||
+            op == OpCode::Saturate || op == OpCode::FMin || op == OpCode::FMax;
+        math.push_back({&inst, 1, cast<CallInst>(&inst)->getNumArgOperands() - 1, !bounded});
+        break;
+      }
+      default: break;
+      }
+    }
+  }
+  bool changed = false;
+  std::map<Value *, Value *> canonical;
+  auto flush = [&](Value *value) -> Value * {
+    auto found = canonical.find(value);
+    if (found != canonical.end()) return found->second;
+    Instruction *position = nullptr;
+    if (auto *definition = dyn_cast<Instruction>(value))
+      position = isa<PHINode>(definition) ? &*definition->getParent()->getFirstInsertionPt() :
+          definition->getNextNode();
+    else if (auto *argument = dyn_cast<Argument>(value))
+      position = &*argument->getParent()->getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> b(dm.GetModule()->getContext());
+    if (position) b.SetInsertPoint(position);
+    auto *type = value->getType()->isVectorTy() ?
+        static_cast<Type *>(VectorType::get(b.getInt32Ty(), value->getType()->getVectorNumElements())) :
+        b.getInt32Ty();
+    auto *bits = b.CreateBitCast(value, type);
+    auto *magnitude = b.CreateAnd(bits, ConstantInt::get(type, 0x7fffffff));
+    auto *subnormal = b.CreateICmpULT(magnitude, ConstantInt::get(type, 0x00800000));
+    auto *sign = b.CreateAnd(bits, ConstantInt::get(type, 0x80000000));
+    auto *result = b.CreateBitCast(b.CreateSelect(subnormal, sign, bits), value->getType());
+    canonical.emplace(value, result);
+    canonical.emplace(result, result);
+    changed |= result != value;
+    return result;
+  };
+  // Canonicalize results first so consumers reuse them, including across PHIs
+  // and backedges. Snapshot users before creating the canonicalization itself.
+  for (auto &item : math) {
+    if (!item.inst->getType()->getScalarType()->isFloatTy()) continue;
+    if (!item.output) { canonical.emplace(item.inst, item.inst); continue; }
+    std::vector<User *> users(item.inst->user_begin(), item.inst->user_end());
+    auto *result = flush(item.inst);
+    for (auto *user : users) user->replaceUsesOfWith(item.inst, result);
+  }
+  for (auto &item : math) for (unsigned i = item.first; i < item.first + item.count; ++i) {
+    auto *value = item.inst->getOperand(i);
+    if (value->getType()->getScalarType()->isFloatTy())
+      item.inst->setOperand(i, flush(value));
+  }
+  return changed;
+}
+
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
@@ -1168,14 +1259,8 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
-  std::vector<FCmpInst *> comparisons;
+  const bool flushedMath = FlushFp32Math(dm, options);
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
-    if ((options & SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS) &&
-        (!f.hasFnAttribute("fp32-denorm-mode") ||
-         f.getFnAttribute("fp32-denorm-mode").getValueAsString() != "preserve"))
-      if (auto *compare = dyn_cast<FCmpInst>(&inst))
-        if (compare->getOperand(0)->getType()->getScalarType()->isFloatTy())
-          comparisons.push_back(compare);
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
     if ((options & SCORPI_SHADER_BINDING_POLICY) &&
@@ -1282,33 +1367,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty() && comparisons.empty()) return inlinedSubroutines;
-  // Preserve the original SSA values for raw moves/stores and other users.
-  // Share one canonicalization at each definition across all its comparisons.
-  std::map<Value *, Value *> comparisonInputs;
-  for (auto *compare : comparisons) for (unsigned i = 0; i < 2; ++i) {
-    auto *value = compare->getOperand(i);
-    auto found = comparisonInputs.find(value);
-    if (found == comparisonInputs.end()) {
-      Instruction *position = compare;
-      if (auto *definition = dyn_cast<Instruction>(value))
-        position = isa<PHINode>(definition) ? &*definition->getParent()->getFirstInsertionPt() :
-            definition->getNextNode();
-      else if (auto *argument = dyn_cast<Argument>(value))
-        position = &*argument->getParent()->getEntryBlock().getFirstInsertionPt();
-      IRBuilder<> b(position);
-      auto *type = value->getType()->isVectorTy() ?
-          static_cast<Type *>(VectorType::get(b.getInt32Ty(), value->getType()->getVectorNumElements())) :
-          b.getInt32Ty();
-      auto *bits = b.CreateBitCast(value, type);
-      auto *magnitude = b.CreateAnd(bits, ConstantInt::get(type, 0x7fffffff));
-      auto *subnormal = b.CreateICmpULT(magnitude, ConstantInt::get(type, 0x00800000));
-      auto *sign = b.CreateAnd(bits, ConstantInt::get(type, 0x80000000));
-      auto *flushed = b.CreateBitCast(b.CreateSelect(subnormal, sign, bits), value->getType());
-      found = comparisonInputs.emplace(value, flushed).first;
-    }
-    compare->setOperand(i, found->second);
-  }
+      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){

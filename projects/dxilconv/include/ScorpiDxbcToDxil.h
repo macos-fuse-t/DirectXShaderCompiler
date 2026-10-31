@@ -411,6 +411,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // Some native GPUs preserve FP32 subnormals in comparisons. Canonicalize only
 // comparison inputs when the caller has observed that behavior on its device.
 #define SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS 32u
+// Enforce default/FTZ arithmetic only when native device probes require it.
+// Explicit preserve-mode shaders and raw data movement remain unchanged.
+#define SCORPI_SHADER_FLUSH_FP32_ARITHMETIC 64u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;
