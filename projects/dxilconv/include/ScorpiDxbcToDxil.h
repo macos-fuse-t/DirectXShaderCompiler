@@ -90,6 +90,21 @@ ScorpiRetypeShaderOutputs(const void *code, size_t size,
     const uint16_t component_types[32], void **binary, size_t *binary_size,
     char *error_message, size_t error_message_size);
 
+// Native rasterizer linkage by semantic and semantic index, independent of
+// each stage's register packing. Names point into the returned allocation.
+// Flat float inputs request uint32 bit transport; ordinary inputs retain their
+// interpolation type. Release the array with ScorpiFreeDxilBinary.
+typedef struct ScorpiShaderLinkageElement {
+    const char *semantic_name;
+    uint32_t semantic_index, register_index, first_component, component_count;
+    uint32_t component_type, output, flat_float;
+} ScorpiShaderLinkageElement;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectShaderLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error_message, size_t error_message_size);
+
 // Retype only exports bound to signed integer RTVs. Float exports are raw
 // register bits, not numeric float-to-int conversions. Null output means the
 // shader already has the required types. Other color slots remain unchanged.
@@ -414,6 +429,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // Enforce default/FTZ arithmetic only when native device probes require it.
 // Explicit preserve-mode shaders and raw data movement remain unchanged.
 #define SCORPI_SHADER_FLUSH_FP32_ARITHMETIC 64u
+// Match a rasterizer producer retyped with ScorpiRetypeShaderOutputs.
+// Transport only flat FP32 varyings as integer bits; interpolation is unchanged.
+#define SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS 128u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;

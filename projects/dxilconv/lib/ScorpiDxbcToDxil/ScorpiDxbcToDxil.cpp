@@ -1293,6 +1293,94 @@ extern "C" int ScorpiInspectMeshOutputRows(const void *code, size_t size, int *r
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
 }
 
+extern "C" int ScorpiInspectShaderLinkage(
+    const void *code, size_t size, const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!code || !size || !elements || !count)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *elements = nullptr; *count = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size())) throw std::runtime_error("invalid linkage container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing linkage program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "rasterizer-linkage", false);
+    auto parsed = llvm::getLazyBitcodeModule(std::move(source), context);
+    if (!parsed) throw std::runtime_error("invalid linkage bitcode");
+    // Resource metadata and instruction bodies are unrelated to the interface.
+    hlsl::DxilMDHelper helper(parsed.get().get(),
+        std::unique_ptr<hlsl::DxilExtraPropertyHelper>(new hlsl::DxilExtraPropertyHelper(parsed.get().get())));
+    const auto *entries = helper.GetDxilEntryPoints();
+    if (!entries || entries->getNumOperands() != 1) throw std::runtime_error("expected one linkage entry");
+    llvm::Function *entry = nullptr; std::string name;
+    const llvm::MDOperand *signatures = nullptr, *resources = nullptr, *properties = nullptr;
+    helper.GetDxilEntryPoint(entries->getOperand(0), entry, name, signatures, resources, properties);
+    hlsl::ShaderFlags flags;
+    if (properties) if (auto *node = llvm::dyn_cast_or_null<llvm::MDNode>(properties->get()))
+      for (unsigned i = 0; i + 1 < node->getNumOperands(); i += 2) {
+        auto *tag = llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(i));
+        auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(i+1));
+        if (tag && value && tag->getZExtValue() == hlsl::DxilMDHelper::kDxilShaderFlagsTag)
+          flags.SetShaderFlagsRaw(value->getZExtValue());
+      }
+    const auto kind = hlsl::GetVersionShaderType(program->ProgramVersion);
+    hlsl::DxilEntrySignature signature(kind, !flags.GetUseNativeLowPrecision());
+    helper.LoadDxilSignatures(*signatures, signature);
+    std::vector<ScorpiShaderLinkageElement> linkage;
+    std::vector<std::string> names;
+    auto reflect = [&](const hlsl::DxilSignature &sig, bool output) {
+      for (const auto &element : sig.GetElements()) {
+        if (element->GetKind() != hlsl::DXIL::SemanticKind::Arbitrary || element->GetOutputStream()) continue;
+        auto type = element->GetCompType();
+        if (flags.GetLowPrecisionPresent() && !flags.GetUseNativeLowPrecision() &&
+            (type == hlsl::CompType::getF16() || type == hlsl::CompType::getI16()))
+          type = type.GetBaseCompType();
+        uint32_t selected = type == hlsl::CompType::getF32() ? 3 :
+            type == hlsl::CompType::getI32() ? 2 : type == hlsl::CompType::getU32() ? 1 : 0;
+        const bool flat = !output && kind == hlsl::DXIL::ShaderKind::Pixel && selected == 3 &&
+            element->GetInterpolationMode()->IsConstant();
+        if (flat) selected = 1;
+        if (!selected) continue;
+        for (unsigned row = 0; row < element->GetRows(); ++row) {
+          int reg = element->GetStartRow() + int(row);
+          if (reg < 0 || reg >= 32) continue;
+          names.emplace_back(element->GetName());
+          linkage.push_back({nullptr, element->GetSemanticIndexVec().at(row), uint32_t(reg),
+              element->GetStartCol(), element->GetCols(), selected, uint32_t(output), uint32_t(flat)});
+        }
+      }
+    };
+    reflect(signature.InputSignature, false);
+    reflect(signature.OutputSignature, true);
+    if (linkage.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    size_t bytes = linkage.size() * sizeof(ScorpiShaderLinkageElement);
+    for (const auto &name : names) bytes += name.size() + 1;
+    auto *result = static_cast<ScorpiShaderLinkageElement *>(std::malloc(bytes));
+    if (!result) throw std::runtime_error("linkage allocation failed");
+    std::memcpy(result, linkage.data(), linkage.size() * sizeof(*result));
+    char *name_cursor = reinterpret_cast<char *>(result + linkage.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+      result[i].semantic_name = name_cursor;
+      std::memcpy(name_cursor, names[i].c_str(), names[i].size() + 1);
+      name_cursor += names[i].size() + 1;
+    }
+    *elements = result; *count = linkage.size();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what());
+    return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+  } catch (...) {
+    SetError(error, error_size, "unexpected linkage inspection exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 extern "C" int ScorpiRetypeShaderOutputs(
     const void *code, size_t size, const uint16_t component_types[32],
     void **binary, size_t *binary_size, char *error, size_t error_size) {
@@ -1317,6 +1405,7 @@ extern "C" int ScorpiRetypeShaderOutputs(
     if (!dm || !(dm->GetShaderModel()->IsVS() || dm->GetShaderModel()->IsDS() ||
                  dm->GetShaderModel()->IsGS()))
       throw std::runtime_error("output linkage requires a rasterizer producer");
+    const bool widened = ScorpiWidenMinimumPrecisionIO(*dm);
     std::map<unsigned, llvm::Type *> types;
     for (auto &element : dm->GetOutputSignature().GetElements()) {
       // System values and non-rasterized streams retain their ABI.
@@ -1347,7 +1436,7 @@ extern "C" int ScorpiRetypeShaderOutputs(
       types[element->GetID()] = selected == 3 ? llvm::Type::getFloatTy(context) :
           llvm::Type::getInt32Ty(context);
     }
-    if (types.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    if (types.empty() && !widened) return SCORPI_DXBC_TO_DXIL_OK;
     std::vector<llvm::CallInst *> stores;
     for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst))
@@ -1722,7 +1811,7 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
       (!policy && policy_count) ||
-      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_TYPED_DIMENSIONS_ONLY | SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS | SCORPI_SHADER_FLUSH_FP32_ARITHMETIC)))
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_TYPED_DIMENSIONS_ONLY | SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS | SCORPI_SHADER_FLUSH_FP32_ARITHMETIC | SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {

@@ -1418,7 +1418,43 @@ bool RoundMinimumPrecisionConversions(DxilModule &dm) {
   }
   return !casts.empty();
 }
+
+bool RetypeFlatFloatInputs(DxilModule &dm) {
+  // Native flat float varyings may clamp infinities during rasterization.
+  // Integer varyings carry the same register bits without interpolation.
+  if (!dm.GetShaderModel()->IsPS()) return false;
+  std::set<unsigned> ids;
+  for (auto &element : dm.GetInputSignature().GetElements()) {
+    if (element->GetKind() == SemanticKind::Arbitrary &&
+        element->GetCompType() == CompType::getF32() &&
+        element->GetInterpolationMode()->IsConstant()) {
+      ids.insert(element->GetID());
+      element->SetCompType(CompType::getU32());
+    }
+  }
+  if (ids.empty()) return false;
+  std::vector<CallInst *> loads;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst))
+      if (Opcode(call) == OpCode::LoadInput) loads.push_back(call);
+  for (auto *call : loads) {
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic flat input signature ID");
+    if (!ids.count(unsigned(id->getZExtValue()))) continue;
+    IRBuilder<> at(call);
+    SmallVector<Value *, 8> args;
+    for (auto &arg : call->arg_operands()) args.push_back(arg);
+    auto *load = at.CreateCall(dm.GetOP()->GetOpFunc(OpCode::LoadInput, at.getInt32Ty()), args);
+    load->setDebugLoc(call->getDebugLoc());
+    call->replaceAllUsesWith(at.CreateBitCast(load, call->getType()));
+    call->eraseFromParent();
+  }
+  return true;
 }
+
+}
+
+bool ScorpiWidenMinimumPrecisionIO(DxilModule &dm) { return WidenMinimumPrecisionIO(dm); }
 
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
@@ -1426,6 +1462,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
   const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
   const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
+  const bool flatFloatInputs = (options & SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS) && RetypeFlatFloatInputs(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1543,7 +1580,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || flatFloatInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
