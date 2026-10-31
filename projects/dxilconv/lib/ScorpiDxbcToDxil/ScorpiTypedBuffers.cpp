@@ -694,15 +694,22 @@ public:
         taps.End(b,result);
       }
     }
-    for(unsigned c=0;c<4;++c){auto *selector=b.CreateAnd(b.CreateLShr(mapping,b.getInt32(c*3)),b.getInt32(7));Value *one=element->isIntegerTy()?static_cast<Value*>(ConstantInt::get(element,1)):ConstantFP::get(element,1);auto *defaultValue=b.CreateSelect(b.CreateICmpEQ(selector,b.getInt32(5)),one,Constant::getNullValue(element));result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
+    auto emptyValue = [&](IRBuilder<> &builder, unsigned component) -> Value * {
+      auto *selector = builder.CreateAnd(builder.CreateLShr(mapping,builder.getInt32(component*3)),builder.getInt32(7));
+      Value *one = element->isIntegerTy() ? static_cast<Value *>(ConstantInt::get(element,1)) : ConstantFP::get(element,1);
+      auto *value = builder.CreateSelect(builder.CreateICmpEQ(selector,builder.getInt32(5)),one,Constant::getNullValue(element));
+      return comparison ? Compare(builder,state,call->getArgOperand(10),value) : value;
+    };
+    Value *emptyComparison = comparison ? emptyValue(b,0) : nullptr;
+    for(unsigned c=0;c<4;++c){auto *defaultValue=comparison?emptyComparison:emptyValue(b,c);result=b.CreateInsertValue(result,b.CreateSelect(empty,defaultValue,b.CreateExtractValue(result,c)),c);}
     auto *reducedExit=b.GetInsertBlock();
     b.CreateBr(after);
     b.SetInsertPoint(reducedExit->getTerminator());
     IRBuilder<> normalResult(normal->getTerminator()),merged(&*after->begin());Value *assembled=UndefValue::get(call->getType());
+    Value *normalEmptyComparison = comparison ? emptyValue(normalResult,0) : nullptr;
     for(unsigned c=0;c<5;++c){auto *type=call->getType()->getStructElementType(c);auto *phi=PHINode::Create(type,3,"scorpi.cube.component",&*after->begin());
       Value *normalValue=normalResult.getInt32(1);
-      if(c<4){auto *selector=normalResult.CreateAnd(normalResult.CreateLShr(mapping,normalResult.getInt32(c*3)),normalResult.getInt32(7));
-        auto *defaultValue=normalResult.CreateSelect(normalResult.CreateICmpEQ(selector,normalResult.getInt32(5)),ConstantFP::get(type,1),Constant::getNullValue(type));
+      if(c<4){auto *defaultValue=comparison?normalEmptyComparison:emptyValue(normalResult,c);
         normalValue=normalResult.CreateSelect(empty,defaultValue,normalResult.CreateExtractValue(call,c));}
       phi->addIncoming(normalValue,normal);phi->addIncoming(c==4?b.CreateSelect(empty,b.getInt32(1),b.CreateExtractValue(result,c)):b.CreateExtractValue(result,c),reducedExit);phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);assembled=merged.CreateInsertValue(assembled,phi,c);}
     for(auto *user:originalUsers)user->replaceUsesOfWith(call,assembled);
@@ -820,9 +827,15 @@ public:
     pre.CreateCondBr(pre.CreateFCmpOGT(accessMinimum,gather?ConstantFP::get(pre.getFloatTy(),0):lastMip),empty,bounded);
     auto *elementType = call->getType()->getStructElementType(0);
     IRBuilder<> out(empty);
-    auto *emptyResult = Call(out,OpCode::TextureLoad,elementType,
+    Value *emptyResult = Call(out,OpCode::TextureLoad,elementType,
         {texture,out.getInt32(0),out.getInt32(UINT32_MAX),out.getInt32(0),out.getInt32(0),
          out.getInt32(0),out.getInt32(0),out.getInt32(0)});
+    // Empty-set comparison sampling compares against the OOB texel value;
+    // returning that raw value skips the sampler's comparison function.
+    if (comparison) {
+      auto *value = Compare(out,state,call->getArgOperand(10),out.CreateExtractValue(emptyResult,0));
+      for (unsigned c=0;c<4;++c) emptyResult = out.CreateInsertValue(emptyResult,value,c);
+    }
     out.CreateBr(after);
     pre.SetInsertPoint(bounded);
     Value *ordinary = (!minmaxFiltering||gather||comparison)?pre.getTrue():pre.CreateICmpEQ(pre.CreateAnd(state,pre.getInt32(0x180)),pre.getInt32(0));
