@@ -1217,6 +1217,39 @@ static bool CleanupBitcastPattern(Instruction *I1) {
   return false;
 }
 
+// Register promotion exposes literal FP32 operands through DXIL bitcasts and
+// source modifiers. Resolve only these constant forms; dynamic inputs keep the
+// target's native comparison and moves retain their original bit patterns.
+static bool GetFloatComparisonConstant(Value *V, APFloat &Result,
+                                       unsigned Depth = 0) {
+  if (!V->getType()->isFloatTy() || Depth > 8) return false;
+  if (auto *C = dyn_cast<ConstantFP>(V)) {
+    Result = C->getValueAPF();
+    return true;
+  }
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I) return false;
+  if (DxilInst_BitcastI32toF32 BC = DxilInst_BitcastI32toF32(I)) {
+    auto *C = dyn_cast<ConstantInt>(BC.get_value());
+    if (!C) return false;
+    Result = APFloat(APFloat::IEEEsingle, C->getValue());
+    return true;
+  }
+  if (DxilInst_FAbs Abs = DxilInst_FAbs(I)) {
+    if (!GetFloatComparisonConstant(Abs.get_value(), Result, Depth + 1))
+      return false;
+    Result.clearSign();
+    return true;
+  }
+  if (BinaryOperator::isFNeg(V)) {
+    if (!GetFloatComparisonConstant(BinaryOperator::getFNegArgument(V),
+                                    Result, Depth + 1)) return false;
+    Result.changeSign();
+    return true;
+  }
+  return false;
+}
+
 void DxilCleanup::CleanupPatterns() {
   for (auto itFn = m_pModule->begin(), endFn = m_pModule->end(); itFn != endFn;
        ++itFn) {
@@ -1228,6 +1261,22 @@ void DxilCleanup::CleanupPatterns() {
       for (auto itInst = BB->begin(), endInst = BB->end(); itInst != endInst;
            ++itInst) {
         Instruction *I1 = &*itInst;
+
+        if (auto *Compare = dyn_cast<FCmpInst>(I1)) {
+          Constant *Operands[2] = {};
+          for (unsigned Operand = 0; Operand < 2; ++Operand) {
+            APFloat Value(0.0f);
+            if (GetFloatComparisonConstant(Compare->getOperand(Operand), Value)) {
+              if (Value.isDenormal())
+                Value = APFloat::getZero(APFloat::IEEEsingle, Value.isNegative());
+              Operands[Operand] = ConstantFP::get(*m_pCtx, Value);
+              Compare->setOperand(Operand, Operands[Operand]);
+            }
+          }
+          if (Operands[0] && Operands[1])
+            Compare->replaceAllUsesWith(ConstantExpr::getFCmp(
+                Compare->getPredicate(), Operands[0], Operands[1]));
+        }
 
         // Cleanup i1 pattern:
         // %1 = icmp eq i32 %0, 1
