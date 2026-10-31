@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check extended-multiply lowering and its low-only fast path.
+"""Check extended arithmetic lowering and discarded-output fast paths.
 
 Usage: test.py <DXC build directory>; numerical semantics have native coverage.
 """
@@ -31,12 +31,12 @@ def adapt(code):
         lib.ScorpiFreeDxilBinary(output)
 
 
-def shader(signed, half):
+def shader(operation, half):
     code = [0x50050, 0, 0x04000059, 0x00208e46, 0, 1,
             0x0300009d, 0x0011e000, 0, 0x02000068, 2,
             0x0400009b, 1, 1, 1]
     start = len(code)
-    code.append(38 if signed else 81)
+    code.append([81, 38, 132, 133][operation])
     for i in range(2):
         code += [0xd000] if half == (2 if i == 0 else 1) else [0x001000f2, i]
     code += [0x0020800a, 0, 0, 0x0020801a, 0, 0]
@@ -51,20 +51,27 @@ def shader(signed, half):
 
 with tempfile.TemporaryDirectory(prefix='scorpi-extended-multiply-') as name:
     tmp = Path(name)
-    for signed in (False, True):
+    for operation in range(4):
         for half in range(3):
-            result = adapt(shader(signed, half))
+            result = adapt(shader(operation, half))
             assert result is not None
             assert adapt(result) is None, 'lowering must be idempotent'
             (tmp / 'shader.dxil').write_bytes(result)
             ir = subprocess.check_output([str(build / 'bin/dxc'), '-dumpbin',
                                           str(tmp / 'shader.dxil')], text=True)
             assert 'call %dx.types.twoi32' not in ir
+            assert 'call %dx.types.i32c' not in ir
             wide = re.search(r'\bmul (?:nuw |nsw )*i64\b', ir)
-            if half == 2:
+            if operation >= 2:
+                assert not wide and '64-Bit integer' not in ir
+                if half == 1:
+                    assert 'icmp ult' not in ir, 'discarded carry must not retain its comparison'
+                else:
+                    assert 'icmp ult' in ir
+            elif half == 2:
                 assert re.search(r'\bmul (?:nuw |nsw )*i32\b', ir) and not wide, 'low-only multiply must stay i32'
                 assert 'sext i32' not in ir and 'zext i32' not in ir
             else:
                 assert wide
-                assert ('sext i32' if signed else 'zext i32') in ir
-            print('PASS', 'signed' if signed else 'unsigned', ['both', 'high', 'low'][half])
+                assert ('sext i32' if operation == 1 else 'zext i32') in ir
+            print('PASS', ['umul', 'imul', 'uaddc', 'usubb'][operation], ['both', 'first', 'second'][half])

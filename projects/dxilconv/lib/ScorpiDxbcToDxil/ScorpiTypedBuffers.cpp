@@ -1232,23 +1232,34 @@ static bool FixNonfiniteTrig(DxilModule &dm) {
 }
 
 // The native converter treats IMul's high half as unsigned and aborts on UMul.
+// Carry/borrow instructions are also unsupported; use add/sub and comparisons.
 // Express the exact signed/unsigned product using native integer arithmetic.
 // DXIL's two-result order is high, low (unlike SPIR-V's low, high).
-static bool LowerExtendedMultiply(DxilModule &dm) {
+static bool LowerExtendedIntegerArithmetic(DxilModule &dm) {
   std::vector<CallInst *> calls;
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
     if (auto *call = dyn_cast<CallInst>(&inst))
-      if (Opcode(call) == OpCode::IMul || Opcode(call) == OpCode::UMul)
+      if (Opcode(call) == OpCode::IMul || Opcode(call) == OpCode::UMul ||
+          Opcode(call) == OpCode::UAddc || Opcode(call) == OpCode::USubb)
         calls.push_back(call);
   for (auto *call : calls) {
     IRBuilder<> b(call);
+    auto *a = call->getArgOperand(1), *c = call->getArgOperand(2);
+    if (Opcode(call) == OpCode::UAddc || Opcode(call) == OpCode::USubb) {
+      const bool add = Opcode(call) == OpCode::UAddc;
+      auto *value = add ? b.CreateAdd(a, c) : b.CreateSub(a, c);
+      auto *flag = b.CreateICmpULT(add ? value : a, add ? a : c);
+      auto *pair = b.CreateInsertValue(UndefValue::get(call->getType()), value, 0);
+      call->replaceAllUsesWith(b.CreateInsertValue(pair, flag, 1));
+      call->eraseFromParent();
+      continue;
+    }
     const bool isSigned = Opcode(call) == OpCode::IMul;
     auto extend = [&](Value *value) {
       return isSigned ? b.CreateSExt(value, b.getInt64Ty()) :
           b.CreateZExt(value, b.getInt64Ty());
     };
-    auto *product = b.CreateMul(extend(call->getArgOperand(1)),
-        extend(call->getArgOperand(2)));
+    auto *product = b.CreateMul(extend(a), extend(c));
     auto *high = b.CreateTrunc(b.CreateLShr(product, b.getInt64(32)), b.getInt32Ty());
     auto *low = b.CreateTrunc(product, b.getInt32Ty());
     auto *pair = b.CreateInsertValue(UndefValue::get(call->getType()), high, 0);
@@ -1331,7 +1342,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
-  const bool loweredMultiply = LowerExtendedMultiply(dm);
+  const bool loweredIntegerArithmetic = LowerExtendedIntegerArithmetic(dm);
   const bool fixedTrig = FixNonfiniteTrig(dm);
   const bool flushedMath = FlushFp32Math(dm, options);
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
@@ -1441,7 +1452,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath || fixedTrig || loweredMultiply;
+      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
