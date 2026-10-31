@@ -2074,6 +2074,8 @@ static int CreateGeometryCaptureBinary(
     auto *dxil = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     std::string error;
     if (!dxil) throw std::runtime_error("missing DXIL module");
+    phase = "inline legacy subroutines";
+    ScorpiInlineDxbcSubroutines(*dxil);
     phase = "generate capture IR";
     std::unique_ptr<llvm::Module> generated;
     if (tessellation_mode == 7) {

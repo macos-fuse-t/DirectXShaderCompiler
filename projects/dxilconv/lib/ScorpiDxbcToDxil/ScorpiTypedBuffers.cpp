@@ -1276,9 +1276,7 @@ static bool LowerExtendedIntegerArithmetic(DxilModule &dm) {
   return !calls.empty();
 }
 
-bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
-    size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
-    const ScorpiSamplingRequirement *policy, size_t policyCount) {
+bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
   std::vector<Function *> subroutines;
   for (auto &function : *dm.GetModule())
     if (function.hasLocalLinkage() && !function.isDeclaration() &&
@@ -1335,6 +1333,13 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     cleanup.add(createCFGSimplificationPass());
     cleanup.run(*dm.GetModule());
   }
+  return inlinedSubroutines;
+}
+
+bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
+    size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
+    const ScorpiSamplingRequirement *policy, size_t policyCount) {
+  const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
