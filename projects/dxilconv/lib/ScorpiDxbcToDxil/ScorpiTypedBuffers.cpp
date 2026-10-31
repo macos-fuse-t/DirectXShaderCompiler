@@ -627,7 +627,8 @@ public:
     if(ClampOperand(opcode)){unsigned at=opcode==OpCode::SampleGrad?16:(opcode==OpCode::SampleBias||opcode==OpCode::SampleCmp)?11:10;if(!isa<UndefValue>(call->getArgOperand(at)))accessMin=max(accessMin,call->getArgOperand(at));}
     auto *viewDims=Call(b,OpCode::GetDimensions,b.getInt32Ty(),{texture,b.getInt32(0)});
     auto *last=b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(viewDims,3),b.getInt32(1)),b.getFloatTy());
-    auto *empty=b.CreateFCmpOGT(accessMin,gather?f(0):last);
+    auto *empty=b.CreateFCmpOGT(accessMin,last);
+    if(gather)empty=b.CreateOr(empty,b.CreateFCmpOGE(accessMin,f(1)));
     Value *precision = b.getFalse();
     if (preciseClamp) { auto *scaled=b.CreateFMul(accessMin,f(16)); precision=b.CreateAnd(b.CreateFCmpOGT(accessMin,f(0)),b.CreateFCmpONE(scaled,unary(OpCode::Round_ni,scaled))); }
     b.CreateCondBr(b.CreateOr(precision,b.CreateOr(b.CreateAnd(ordinary,b.CreateOr(b.CreateFCmpOGT(resMin,f(0)),b.CreateICmpNE(Word(texture,0),b.getInt32(0)))),minmaxFiltering?b.CreateICmpNE(b.CreateAnd(state,b.getInt32(0x100)),b.getInt32(0)):b.getFalse())),reduce,normal);
@@ -695,6 +696,7 @@ public:
       }
     }
     auto emptyValue = [&](IRBuilder<> &builder, unsigned component) -> Value * {
+      if(gather)component=cast<ConstantInt>(call->getArgOperand(9))->getZExtValue();
       auto *selector = builder.CreateAnd(builder.CreateLShr(mapping,builder.getInt32(component*3)),builder.getInt32(7));
       Value *one = element->isIntegerTy() ? static_cast<Value *>(ConstantInt::get(element,1)) : ConstantFP::get(element,1);
       auto *value = builder.CreateSelect(builder.CreateICmpEQ(selector,builder.getInt32(5)),one,Constant::getNullValue(element));
@@ -824,7 +826,11 @@ public:
     // Unlike sampler clamps, resource/instruction clamps can empty the view.
     // Even a fractional clamp past its last mip is out of bounds. Use a real
     // out-of-bounds load to retain the view's missing-component defaults.
-    pre.CreateCondBr(pre.CreateFCmpOGT(accessMinimum,gather?ConstantFP::get(pre.getFloatTy(),0):lastMip),empty,bounded);
+    auto *emptyView = pre.CreateFCmpOGT(accessMinimum,lastMip);
+    // Gathers retain mip 0 for fractional clamps below 1 (D3D11.3 5.8.4),
+    // except when the clamp is already beyond the view's last mip (5.8.5).
+    if(gather)emptyView=pre.CreateOr(emptyView,pre.CreateFCmpOGE(accessMinimum,ConstantFP::get(pre.getFloatTy(),1)));
+    pre.CreateCondBr(emptyView,empty,bounded);
     auto *elementType = call->getType()->getStructElementType(0);
     IRBuilder<> out(empty);
     Value *emptyResult = Call(out,OpCode::TextureLoad,elementType,
@@ -832,8 +838,11 @@ public:
          out.getInt32(0),out.getInt32(0),out.getInt32(0)});
     // Empty-set comparison sampling compares against the OOB texel value;
     // returning that raw value skips the sampler's comparison function.
-    if (comparison) {
-      auto *value = Compare(out,state,call->getArgOperand(10),out.CreateExtractValue(emptyResult,0));
+    // A gather returns its selected channel for all four OOB taps.
+    if (comparison || gather) {
+      const unsigned component = comparison ? 0 : cast<ConstantInt>(call->getArgOperand(9))->getZExtValue();
+      Value *value = out.CreateExtractValue(emptyResult,component);
+      if(comparison)value=Compare(out,state,call->getArgOperand(10),value);
       for (unsigned c=0;c<4;++c) emptyResult = out.CreateInsertValue(emptyResult,value,c);
     }
     out.CreateBr(after);
