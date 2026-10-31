@@ -6239,7 +6239,22 @@ void DxbcConverter::ConvertBinary(Instruction::BinaryOps OpCode,
       pVal2 = m_pBuilder->CreateAnd(pVal2, 0x0000001F);
     }
 
-    Out[c] = m_pBuilder->CreateBinOp(OpCode, In1[c], pVal2);
+    // Fold FP32 literals using DXBC's signed FTZ rule, before IRBuilder can
+    // replace the operation with an IEEE subnormal (or a finite 0/denorm).
+    auto flushConstant = [](Value *value) -> Value * {
+      auto *constant = dyn_cast<ConstantFP>(value);
+      if (constant && value->getType()->isFloatTy() &&
+          constant->getValueAPF().isDenormal())
+        return ConstantFP::get(value->getContext(),
+            APFloat::getZero(APFloat::IEEEsingle,
+                constant->getValueAPF().isNegative()));
+      return value;
+    };
+    const bool fp32 = OperationType.GetLLVMType(m_Ctx)->isFloatTy();
+    Out[c] = m_pBuilder->CreateBinOp(OpCode,
+        fp32 ? flushConstant(In1[c]) : In1[c],
+        fp32 ? flushConstant(pVal2) : pVal2);
+    if (fp32) Out[c] = flushConstant(Out[c]);
 
     if (ElementType.GetKind() == CompType::Kind::F64) {
       c++;
