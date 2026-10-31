@@ -1219,8 +1219,8 @@ static bool CleanupBitcastPattern(Instruction *I1) {
 
 // Register promotion exposes literal FP32 operands through DXIL bitcasts and
 // source modifiers. Resolve only these constant forms; dynamic inputs keep the
-// target's native comparison and moves retain their original bit patterns.
-static bool GetFloatComparisonConstant(Value *V, APFloat &Result,
+// target's native operations and moves retain their original bit patterns.
+static bool GetFloatConstant(Value *V, APFloat &Result,
                                        unsigned Depth = 0) {
   if (!V->getType()->isFloatTy() || Depth > 8) return false;
   if (auto *C = dyn_cast<ConstantFP>(V)) {
@@ -1236,13 +1236,13 @@ static bool GetFloatComparisonConstant(Value *V, APFloat &Result,
     return true;
   }
   if (DxilInst_FAbs Abs = DxilInst_FAbs(I)) {
-    if (!GetFloatComparisonConstant(Abs.get_value(), Result, Depth + 1))
+    if (!GetFloatConstant(Abs.get_value(), Result, Depth + 1))
       return false;
     Result.clearSign();
     return true;
   }
   if (BinaryOperator::isFNeg(V)) {
-    if (!GetFloatComparisonConstant(BinaryOperator::getFNegArgument(V),
+    if (!GetFloatConstant(BinaryOperator::getFNegArgument(V),
                                     Result, Depth + 1)) return false;
     Result.changeSign();
     return true;
@@ -1262,11 +1262,62 @@ void DxilCleanup::CleanupPatterns() {
            ++itInst) {
         Instruction *I1 = &*itInst;
 
+        // Register promotion also exposes arithmetic literals through bitcasts
+        // and source modifiers. Fold them with DXBC FTZ before later generic
+        // LLVM folding loses the operation's FP32 arithmetic semantics.
+        if (I1->getType()->isFloatTy() &&
+            (I1->getOpcode() == Instruction::FAdd ||
+             I1->getOpcode() == Instruction::FMul ||
+             I1->getOpcode() == Instruction::FDiv)) {
+          Constant *Operands[2] = {};
+          for (unsigned Operand = 0; Operand < 2; ++Operand) {
+            APFloat Value(0.0f);
+            if (GetFloatConstant(I1->getOperand(Operand), Value)) {
+              if (Value.isDenormal())
+                Value = APFloat::getZero(APFloat::IEEEsingle, Value.isNegative());
+              Operands[Operand] = ConstantFP::get(*m_pCtx, Value);
+              I1->setOperand(Operand, Operands[Operand]);
+            }
+          }
+          if (Operands[0] && Operands[1]) {
+            auto *Result = ConstantExpr::get(I1->getOpcode(), Operands[0], Operands[1]);
+            if (auto *Float = dyn_cast<ConstantFP>(Result))
+              if (Float->getValueAPF().isDenormal())
+                Result = ConstantFP::get(*m_pCtx,
+                    APFloat::getZero(APFloat::IEEEsingle, Float->getValueAPF().isNegative()));
+            I1->replaceAllUsesWith(Result);
+          }
+        }
+
+        if (auto *Call = dyn_cast<CallInst>(I1)) {
+          if (I1->getType()->isFloatTy() &&
+              Call->getCalledFunction() && hlsl::OP::IsDxilOpFunc(Call->getCalledFunction())) {
+            const auto Op = hlsl::OP::GetDxilOpFuncCallInst(Call);
+            const auto Class = hlsl::OP::GetOpCodeClass(Op);
+            if (Op != DXIL::OpCode::FAbs &&
+                (Class == DXIL::OpCodeClass::Unary ||
+                 Class == DXIL::OpCodeClass::Binary ||
+                 Class == DXIL::OpCodeClass::Tertiary ||
+                 Class == DXIL::OpCodeClass::Dot2 ||
+                 Class == DXIL::OpCodeClass::Dot3 ||
+                 Class == DXIL::OpCodeClass::Dot4)) {
+              for (unsigned Operand = 1; Operand < Call->getNumArgOperands(); ++Operand) {
+                APFloat Value(0.0f);
+                if (GetFloatConstant(Call->getArgOperand(Operand), Value)) {
+                  if (Value.isDenormal())
+                    Value = APFloat::getZero(APFloat::IEEEsingle, Value.isNegative());
+                  Call->setArgOperand(Operand, ConstantFP::get(*m_pCtx, Value));
+                }
+              }
+            }
+          }
+        }
+
         if (auto *Compare = dyn_cast<FCmpInst>(I1)) {
           Constant *Operands[2] = {};
           for (unsigned Operand = 0; Operand < 2; ++Operand) {
             APFloat Value(0.0f);
-            if (GetFloatComparisonConstant(Compare->getOperand(Operand), Value)) {
+            if (GetFloatConstant(Compare->getOperand(Operand), Value)) {
               if (Value.isDenormal())
                 Value = APFloat::getZero(APFloat::IEEEsingle, Value.isNegative());
               Operands[Operand] = ConstantFP::get(*m_pCtx, Value);
