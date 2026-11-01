@@ -1339,6 +1339,51 @@ bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
 }
 
 namespace {
+bool PromoteStaticIndexableTemps(DxilModule &dm) {
+  std::vector<Function *> functions;
+  for (auto &function : *dm.GetModule()) {
+    if (function.isDeclaration()) continue;
+    for (auto &inst : function.getEntryBlock()) {
+      auto *array = dyn_cast<AllocaInst>(&inst);
+      if (!array || !array->getName().startswith("dx.v32.x")) continue;
+      auto *type = dyn_cast<ArrayType>(array->getAllocatedType());
+      if (!type || !type->getElementType()->isIntegerTy(32)) continue;
+      bool promotable = !array->use_empty();
+      for (auto *user : array->users()) {
+        auto *index = dyn_cast<GetElementPtrInst>(user);
+        if (!index || index->getNumIndices() != 2) { promotable = false; break; }
+        auto *first = dyn_cast<ConstantInt>(index->getOperand(1));
+        auto *element = dyn_cast<ConstantInt>(index->getOperand(2));
+        if (!first || !first->isZero() || !element || element->getValue().uge(type->getNumElements())) {
+          promotable = false; break;
+        }
+        for (auto *access : index->users()) {
+          if (auto *load = dyn_cast<LoadInst>(access)) {
+            if (load->isSimple()) continue;
+          } else if (auto *store = dyn_cast<StoreInst>(access)) {
+            if (store->isSimple() && store->getPointerOperand() == index) continue;
+          }
+          promotable = false; break;
+        }
+        if (!promotable) break;
+      }
+      if (promotable) { functions.push_back(&function); break; }
+    }
+  }
+  if (functions.empty()) return false;
+  // Use DXC's DXIL-linker SROA/mem2reg sequence before MSC sees a large
+  // constant-indexed DXBC temporary array. Its alloca instcombine path can
+  // otherwise take minutes walking tens of thousands of uses.
+  legacy::FunctionPassManager passes(dm.GetModule());
+  passes.add(createSROAPass(false, false));
+  passes.add(createPromoteMemoryToRegisterPass());
+  passes.doInitialization();
+  bool changed = false;
+  for (auto *function : functions) changed |= passes.run(*function);
+  passes.doFinalization();
+  return changed;
+}
+
 bool LowerDynamicDomainInputs(DxilModule &dm) {
   if (!dm.GetShaderModel()->IsDS()) return false;
   std::vector<CallInst *> loads;
@@ -1523,6 +1568,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
+  const bool promotedStaticTemps = PromoteStaticIndexableTemps(dm);
   const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
   const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
   const bool preservedMinimumNonfinite = PreserveMinimumPrecisionNonfiniteConstants(dm);
@@ -1645,7 +1691,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
