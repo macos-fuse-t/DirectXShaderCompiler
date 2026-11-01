@@ -7478,6 +7478,10 @@ void DxbcConverter::LoadOperand(OperandValue &SrcVal,
       pR = &m_pPR->GetCBuffer(RecIdx);
     }
 
+    // Ordinary SM5 relative CB binding indices do not yet have the resource
+    // range synthesized for interface CBs. Fail conversion instead of
+    // dereferencing a null resource in GetCachedHandle.
+    IFTBOOL(pR != nullptr, E_NOTIMPL);
     const DxilCBuffer &R = *pR;
 
     // Setup cbuffer handle.
