@@ -514,6 +514,16 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
   auto *strips = b.CreateAlloca(ArrayType::get(i32, 4), nullptr, "capture.strips");
   for (unsigned stream = 0; stream < 4; ++stream)
     b.CreateStore(b.getInt32(0), b.CreateGEP(strips, {b.getInt32(0), b.getInt32(stream)}));
+  // The declared vertex limit applies to the whole GS invocation, including
+  // all streams. Reaching it terminates execution, rather than replacing the
+  // final captured vertex or executing subsequent shader side effects.
+  AllocaInst *totalCount = nullptr;
+  if (layout.stream_mask & (layout.stream_mask - 1)) {
+    totalCount = b.CreateAlloca(i32, nullptr, "capture.total");
+    b.CreateStore(b.getInt32(0), totalCount);
+  }
+  auto *limitExit = BasicBlock::Create(dm.GetCtx(), "capture.limit", entry);
+  ReturnInst::Create(dm.GetCtx(), limitExit);
   auto *values = b.CreateAlloca(ArrayType::get(i32, layout.vertex_stride / 4), nullptr, "capture.values");
   auto valuePointer = [&](Value *index) { return b.CreateGEP(values, {b.getInt32(0), index}); };
   std::unordered_map<unsigned, unsigned> offsets;
@@ -555,21 +565,27 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
       auto *streamBase = b.CreateAdd(base, b.getInt32(stream * streamStride));
       auto *strip = b.CreateGEP(strips, {b.getInt32(0), b.getInt32(stream)});
       if (opcode != OpCode::CutStream) {
-        if (!rasterize) for(unsigned col=0;col<4;++col)
-          call(OpCode::StoreOutput,b.getFloatTy(),{b.getInt32(0),b.getInt32(0),b.getInt8(col),
-              ConstantFP::get(b.getFloatTy(),col==3?1.0:0.0)});
         auto *emitted = b.CreateLoad(count);
-        auto *safeIndex = b.CreateSelect(b.CreateICmpULT(emitted, b.getInt32(layout.max_vertices)), emitted, b.getInt32(layout.max_vertices - 1));
-        auto *record = b.CreateAdd(streamBase, b.CreateAdd(b.getInt32(16), b.CreateMul(safeIndex, b.getInt32(recordStride))));
+        auto *record = b.CreateAdd(streamBase, b.CreateAdd(b.getInt32(16), b.CreateMul(emitted, b.getInt32(recordStride))));
         Value *id = primitiveComponent == UINT32_MAX ? primitiveID : b.CreateLoad(valuePointer(b.getInt32(primitiveComponent)));
         store(record, id);
         store(b.CreateAdd(record, b.getInt32(4)), b.CreateLoad(strip));
         for (unsigned i = 0; i < offset; ++i)
           store(b.CreateAdd(record, b.getInt32(8 + i * 4)), b.CreateLoad(valuePointer(b.getInt32(i))));
-        auto *next = b.CreateAdd(safeIndex, b.getInt32(1));
+        auto *next = b.CreateAdd(emitted, b.getInt32(1));
         b.CreateStore(next, count); b.CreateStore(b.CreateAdd(b.CreateLoad(strip), b.getInt32(1)), strip);
+        Value *total = next;
+        if (totalCount) {
+          total = b.CreateAdd(b.CreateLoad(totalCount), b.getInt32(1));
+          b.CreateStore(total, totalCount);
+        }
+        auto *reachedLimit = b.CreateICmpUGE(total, b.getInt32(layout.max_vertices));
+        auto *thenTerm = SplitBlockAndInsertIfThen(reachedLimit, original->getNextNode(), false);
+        BranchInst::Create(limitExit, thenTerm);
+        thenTerm->eraseFromParent();
       }
       if (opcode != OpCode::EmitStream) b.CreateStore(b.getInt32(0), strip);
+      if (!rasterize) original->eraseFromParent();
     }
   }
   for (auto &block : *entry) if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) {
@@ -577,6 +593,12 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
     for (unsigned stream = 0; stream < streamCount; ++stream)
       store(b.CreateAdd(base, b.getInt32(stream * streamStride)),
           b.CreateLoad(b.CreateGEP(counts, {b.getInt32(0), b.getInt32(stream)})));
+    if (!rasterize) {
+      for (unsigned col = 0; col < 4; ++col)
+        call(OpCode::StoreOutput, b.getFloatTy(), {b.getInt32(0), b.getInt32(0), b.getInt8(col),
+            ConstantFP::get(b.getFloatTy(), col == 3 ? 1.0 : 0.0)});
+      call(OpCode::EmitThenCutStream, b.getVoidTy(), {b.getInt8(0)});
+    }
   }
   if (!rasterize) {
     dm.GetOutputSignature().ClearElements();
@@ -586,6 +608,12 @@ bool PrepareGeometryShaderCapture(hlsl::DxilModule &dm, uint32_t space,
         1,4,0,0,DxilSignatureElement::kUndefinedID,{0});
     position->SetKind(DXIL::SemanticKind::Position);position->SetUsageMask(15);
     dm.GetOutputSignature().AppendElement(std::move(position));
+    // Captured payload is published through the private UAV. Only a single
+    // dummy point reaches the disabled raster stage, irrespective of the
+    // application's output width, topology or vertex count.
+    dm.SetMaxVertexCount(1);
+    dm.SetStreamPrimitiveTopology(DXIL::PrimitiveTopology::PointList);
+    dm.SetActiveStreamMask(1);
   }
   dm.CollectShaderFlagsForModule();
   auto *module = dm.GetModule();
