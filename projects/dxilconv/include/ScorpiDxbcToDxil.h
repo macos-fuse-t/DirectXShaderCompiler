@@ -83,6 +83,13 @@ ScorpiCreateDxilBinary(const void *shader_code,
                        char *error_message,
                        size_t error_message_size);
 
+// Optional execution-only input for native compilers. Preserve executable
+// DXIL and resource metadata; remove source-debug information. Unchanged
+// shaders return a null binary. Release output with ScorpiFreeDxilBinary.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiStripShaderDebugInfo(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
 // Internal renderer linkage ABI: four DDI component types (0=unchanged,
 // 1=uint32, 2=int32, 3=float32) per register, packed into four nibbles.
 // Retypes stream-zero arbitrary outputs with bitcasts, never numeric conversion.

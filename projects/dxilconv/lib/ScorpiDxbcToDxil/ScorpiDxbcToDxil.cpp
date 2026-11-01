@@ -17,6 +17,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilShaderModel.h"
@@ -601,6 +602,51 @@ extern "C" int ScorpiCreateDxilBinary(
 
 extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
   std::free(dxil_binary);
+}
+
+extern "C" int ScorpiStripShaderDebugInfo(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing DXIL program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
+        GetDxilBitcodeSize(program)), "strip-debug", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid DXIL bitcode");
+    if (!StripDebugInfo(**parsed)) return SCORPI_DXBC_TO_DXIL_OK;
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing DXIL module");
+    dm->StripDebugRelatedCode();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("debug-stripped output allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected debug stripping failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
 }
 
 extern "C" int ScorpiCreateSignedRenderTargetShader(const void *code, size_t size,
