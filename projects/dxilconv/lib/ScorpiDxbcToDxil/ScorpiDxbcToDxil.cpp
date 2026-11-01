@@ -1399,7 +1399,7 @@ static int InspectShaderLinkage(
           if (reg < 0 || reg >= 32) continue;
           names.emplace_back(element->GetName());
           linkage.push_back({nullptr, element->GetSemanticIndexVec().at(row), uint32_t(reg),
-              element->GetStartCol(), element->GetCols(), selected, uint32_t(output) |
+              uint32_t(element->GetStartCol()), element->GetCols(), selected, uint32_t(output) |
               (element->GetKind() != hlsl::DXIL::SemanticKind::Arbitrary ? 2u : 0u), uint32_t(flat)});
         }
       }
