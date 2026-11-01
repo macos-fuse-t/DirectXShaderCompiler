@@ -42,6 +42,31 @@ static void AddMissingSignatureRecordsFromDeclarations(
     D3D10_SB_OPERAND_TYPE DepthRegType, bool HasStencilRef,
     bool HasCoverageOut, bool StreamOutputOnly = false, unsigned RasterizedStream = UINT_MAX);
 
+static void AppendUsedSignatureElement(
+    SignatureHelper &signature, const SignatureHelper::UsedElement &used,
+    const CMask &mask) {
+  if (mask.IsZero() ||
+      mask.GetNumActiveComps() == mask.GetNumActiveRangeComps()) {
+    signature.m_UsedElements.emplace_back(used);
+    return;
+  }
+  // DDI records preserve holes in a component mask. Declaration coverage must
+  // use the same runs instead of requiring one record to span the holes.
+  for (unsigned col = 0; col < DXBC::kWidth;) {
+    if (!mask.IsSet(col)) {
+      ++col;
+      continue;
+    }
+    SignatureHelper::UsedElement run = used;
+    run.StartCol = col;
+    do {
+      ++col;
+    } while (col < DXBC::kWidth && mask.IsSet(col));
+    run.Cols = col - run.StartCol;
+    signature.m_UsedElements.emplace_back(run);
+  }
+}
+
 static bool SameBaseCompType(CompType A, CompType B) {
   if (A.IsInvalid() || B.IsInvalid())
     return false;
@@ -1206,6 +1231,23 @@ static void AddMissingSignatureRecordsFromDeclarations(
         break;
       }
     }
+    if (!covered) {
+      // Separate packed DDI records may collectively cover a declaration.
+      covered = true;
+      for (unsigned col = used.StartCol; col < used.StartCol + used.Cols; ++col) {
+        auto component = used;
+        component.StartCol = col;
+        component.Cols = 1;
+        if (!std::any_of(SigHelper.m_ElementRecords.begin(),
+                         SigHelper.m_ElementRecords.end(),
+                         [&](const SignatureHelper::ElementRecord &record) {
+                           return SignatureRecordCoversUsedElement(record, component);
+                         })) {
+          covered = false;
+          break;
+        }
+      }
+    }
     if (covered)
       continue;
 
@@ -2112,15 +2154,18 @@ void DxbcConverter::AnalyzeShader(
         E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
 
         if (RegType == D3D10_SB_OPERAND_TYPE_INPUT) {
-          m_pInputSignature->m_UsedElements.emplace_back(E);
+          AppendUsedSignatureElement(*m_pInputSignature, E,
+              CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         } else {
           if (m_pSM->IsDS()) {
             switch (RegType) {
             case D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT:
-              m_pInputSignature->m_UsedElements.emplace_back(E);
+              AppendUsedSignatureElement(*m_pInputSignature, E,
+                  CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
               break;
             case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
-              m_pPatchConstantSignature->m_UsedElements.emplace_back(E);
+              AppendUsedSignatureElement(*m_pPatchConstantSignature, E,
+                  CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
               break;
             default:
               DXASSERT(false, "check unsupported case");
@@ -2131,7 +2176,8 @@ void DxbcConverter::AnalyzeShader(
           if (m_pSM->IsHS()) {
             switch (RegType) {
             case D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT:
-              m_pInputSignature->m_UsedElements.emplace_back(E);
+              AppendUsedSignatureElement(*m_pInputSignature, E,
+                  CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
               break;
             case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
               break;
@@ -2161,7 +2207,8 @@ void DxbcConverter::AnalyzeShader(
       E.InterpolationMode = D3D_INTERPOLATION_UNDEFINED;
       E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
 
-      m_pInputSignature->m_UsedElements.emplace_back(E);
+      AppendUsedSignatureElement(*m_pInputSignature, E,
+          CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       break;
     }
 
@@ -2185,11 +2232,13 @@ void DxbcConverter::AnalyzeShader(
 
       switch (Inst.m_Operands[0].m_Type) {
       case D3D10_SB_OPERAND_TYPE_INPUT:
-        m_pInputSignature->m_UsedElements.emplace_back(E);
+        AppendUsedSignatureElement(*m_pInputSignature, E,
+            CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         break;
 
       case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
-        m_pPatchConstantSignature->m_UsedElements.emplace_back(E);
+        AppendUsedSignatureElement(*m_pPatchConstantSignature, E,
+            CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         break;
 
       default:
@@ -2211,7 +2260,8 @@ void DxbcConverter::AnalyzeShader(
           (D3D_INTERPOLATION_MODE)Inst.m_InputPSDecl.InterpolationMode;
       E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
 
-      m_pInputSignature->m_UsedElements.emplace_back(E);
+      AppendUsedSignatureElement(*m_pInputSignature, E,
+          CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       break;
     }
 
@@ -2226,7 +2276,8 @@ void DxbcConverter::AnalyzeShader(
           (D3D_INTERPOLATION_MODE)Inst.m_InputPSDeclSGV.InterpolationMode;
       E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
 
-      m_pInputSignature->m_UsedElements.emplace_back(E);
+      AppendUsedSignatureElement(*m_pInputSignature, E,
+          CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       break;
     }
 
@@ -2241,7 +2292,8 @@ void DxbcConverter::AnalyzeShader(
           (D3D_INTERPOLATION_MODE)Inst.m_InputPSDeclSIV.InterpolationMode;
       E.MinPrecision = Inst.m_Operands[0].m_MinPrecision;
 
-      m_pInputSignature->m_UsedElements.emplace_back(E);
+      AppendUsedSignatureElement(*m_pInputSignature, E,
+          CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       break;
     }
 
@@ -2274,7 +2326,8 @@ void DxbcConverter::AnalyzeShader(
                 : D3D_REGISTER_COMPONENT_UINT32,
             E.MinPrecision);
 
-        m_pOutputSignature->m_UsedElements.emplace_back(E);
+        AppendUsedSignatureElement(*m_pOutputSignature, E,
+            CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         break;
       }
 
@@ -2290,10 +2343,12 @@ void DxbcConverter::AnalyzeShader(
         E.OutputStream = CurrentOutputStream;
 
         if (!m_pSM->IsHS() || m_bControlPointPhase) {
-          m_pOutputSignature->m_UsedElements.emplace_back(E);
+          AppendUsedSignatureElement(*m_pOutputSignature, E,
+              CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         } else {
           DXASSERT_NOMSG(m_pSM->IsHS() && bPatchConstantPhase);
-          m_pPatchConstantSignature->m_UsedElements.emplace_back(E);
+          AppendUsedSignatureElement(*m_pPatchConstantSignature, E,
+              CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
         }
 
         MaxOutputRegister = std::max(MaxOutputRegister, E.Row);
@@ -2322,10 +2377,12 @@ void DxbcConverter::AnalyzeShader(
           DXBC::GetD3DRegCompType(E.SystemValue), E.MinPrecision);
 
       if (!m_pSM->IsHS() || m_bControlPointPhase) {
-        m_pOutputSignature->m_UsedElements.emplace_back(E);
+        AppendUsedSignatureElement(*m_pOutputSignature, E,
+            CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       } else {
         DXASSERT_NOMSG(m_pSM->IsHS() && bPatchConstantPhase);
-        m_pPatchConstantSignature->m_UsedElements.emplace_back(E);
+        AppendUsedSignatureElement(*m_pPatchConstantSignature, E,
+            CMask::FromDXBC(Inst.m_Operands[0].m_WriteMask));
       }
 
       MaxOutputRegister = std::max(MaxOutputRegister, E.Row);
@@ -7478,6 +7535,10 @@ void DxbcConverter::LoadOperand(OperandValue &SrcVal,
       pR = &m_pPR->GetCBuffer(RecIdx);
     }
 
+    // Ordinary SM5 relative CB binding indices do not yet have the resource
+    // range synthesized for interface CBs. Fail conversion instead of
+    // dereferencing a null resource in GetCachedHandle.
+    IFTBOOL(pR != nullptr, E_NOTIMPL);
     const DxilCBuffer &R = *pR;
 
     // Setup cbuffer handle.

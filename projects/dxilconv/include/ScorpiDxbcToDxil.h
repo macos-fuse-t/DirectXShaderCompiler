@@ -37,6 +37,9 @@ enum {
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM = 2,
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_SHIFT = 2,
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK = 12,
+  // Backend metadata v1 only: DX11 DDI stage interfaces link by register and
+  // component. This is not a flag in the v2 DXBC conversion signature dump.
+  SCORPI_SHADER_BACKEND_REGISTER_LINKAGE = 16,
 };
 
 typedef struct ScorpiShaderSignatureMetadata {
@@ -80,6 +83,13 @@ ScorpiCreateDxilBinary(const void *shader_code,
                        char *error_message,
                        size_t error_message_size);
 
+// Optional execution-only input for native compilers. Preserve executable
+// DXIL and resource metadata; remove source-debug information. Unchanged
+// shaders return a null binary. Release output with ScorpiFreeDxilBinary.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiStripShaderDebugInfo(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
 // Internal renderer linkage ABI: four DDI component types (0=unchanged,
 // 1=uint32, 2=int32, 3=float32) per register, packed into four nibbles.
 // Retypes stream-zero arbitrary outputs with bitcasts, never numeric conversion.
@@ -89,6 +99,37 @@ SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiRetypeShaderOutputs(const void *code, size_t size,
     const uint16_t component_types[32], void **binary, size_t *binary_size,
     char *error_message, size_t error_message_size);
+
+// Native rasterizer linkage by semantic and semantic index, independent of
+// each stage's register packing. Names point into the returned allocation.
+// Flat float inputs request uint32 bit transport; ordinary inputs retain their
+// interpolation type. Release the array with ScorpiFreeDxilBinary.
+typedef struct ScorpiShaderLinkageElement {
+    const char *semantic_name;
+    uint32_t semantic_index, register_index, first_component, component_count;
+    uint32_t component_type, output, flat_float;
+} ScorpiShaderLinkageElement;
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectShaderLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error_message, size_t error_message_size);
+
+// Complete register layout for DDI linkage. output bit0 selects outputs;
+// bit1 marks a system-value element. The legacy inspector stays arbitrary-only.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectRegisterLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size);
+
+// Link register-mapped DDI inputs to the complete upstream output layout.
+// The caller must select this only for DDI linkage, not API semantic linkage.
+// Geometry shaders retain unused/system fields to match the producer payload.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLinkRegisterInputs(const void *code, size_t size,
+    const ScorpiShaderLinkageElement *upstream, size_t upstream_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
 
 // Retype only exports bound to signed integer RTVs. Float exports are raw
 // register bits, not numeric float-to-int conversions. Null output means the
@@ -425,6 +466,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // Enforce default/FTZ arithmetic only when native device probes require it.
 // Explicit preserve-mode shaders and raw data movement remain unchanged.
 #define SCORPI_SHADER_FLUSH_FP32_ARITHMETIC 64u
+// Match a rasterizer producer retyped with ScorpiRetypeShaderOutputs.
+// Transport only flat FP32 varyings as integer bits; interpolation is unchanged.
+#define SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS 128u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;

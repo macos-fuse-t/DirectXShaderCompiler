@@ -17,6 +17,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilShaderModel.h"
@@ -601,6 +602,51 @@ extern "C" int ScorpiCreateDxilBinary(
 
 extern "C" void ScorpiFreeDxilBinary(void *dxil_binary) {
   std::free(dxil_binary);
+}
+
+extern "C" int ScorpiStripShaderDebugInfo(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing DXIL program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
+        GetDxilBitcodeSize(program)), "strip-debug", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid DXIL bitcode");
+    if (!StripDebugInfo(**parsed)) return SCORPI_DXBC_TO_DXIL_OK;
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm) throw std::runtime_error("missing DXIL module");
+    dm->StripDebugRelatedCode();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("debug-stripped output allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &exception) {
+    SetError(error, error_size, exception.what());
+    return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected debug stripping failure");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
 }
 
 extern "C" int ScorpiCreateSignedRenderTargetShader(const void *code, size_t size,
@@ -1293,6 +1339,360 @@ extern "C" int ScorpiInspectMeshOutputRows(const void *code, size_t size, int *r
   } catch (...) { return SCORPI_DXBC_TO_DXIL_INVALID_SHADER; }
 }
 
+static int InspectShaderLinkage(
+    const void *code, size_t size, const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size, bool includeSystem) {
+  SetError(error, error_size, "");
+  if (!code || !size || !elements || !count)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *elements = nullptr; *count = 0;
+  try {
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, metadata, metadata_size);
+    auto *container = reinterpret_cast<const hlsl::DxilContainerHeader *>(normalized.data());
+    if (!hlsl::IsValidDxilContainer(container, normalized.size())) throw std::runtime_error("invalid linkage container");
+    auto *program = hlsl::GetDxilProgramHeader(container, hlsl::DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing linkage program");
+    llvm::LLVMContext context;
+    auto source = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(
+        hlsl::GetDxilBitcodeData(program), hlsl::GetDxilBitcodeSize(program)), "rasterizer-linkage", false);
+    auto parsed = llvm::getLazyBitcodeModule(std::move(source), context);
+    if (!parsed) throw std::runtime_error("invalid linkage bitcode");
+    // Resource metadata and instruction bodies are unrelated to the interface.
+    hlsl::DxilMDHelper helper(parsed.get().get(),
+        std::unique_ptr<hlsl::DxilExtraPropertyHelper>(new hlsl::DxilExtraPropertyHelper(parsed.get().get())));
+    const auto *entries = helper.GetDxilEntryPoints();
+    if (!entries || entries->getNumOperands() != 1) throw std::runtime_error("expected one linkage entry");
+    llvm::Function *entry = nullptr; std::string name;
+    const llvm::MDOperand *signatures = nullptr, *resources = nullptr, *properties = nullptr;
+    helper.GetDxilEntryPoint(entries->getOperand(0), entry, name, signatures, resources, properties);
+    hlsl::ShaderFlags flags;
+    if (properties) if (auto *node = llvm::dyn_cast_or_null<llvm::MDNode>(properties->get()))
+      for (unsigned i = 0; i + 1 < node->getNumOperands(); i += 2) {
+        auto *tag = llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(i));
+        auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(i+1));
+        if (tag && value && tag->getZExtValue() == hlsl::DxilMDHelper::kDxilShaderFlagsTag)
+          flags.SetShaderFlagsRaw(value->getZExtValue());
+      }
+    const auto kind = hlsl::GetVersionShaderType(program->ProgramVersion);
+    hlsl::DxilEntrySignature signature(kind, !flags.GetUseNativeLowPrecision());
+    helper.LoadDxilSignatures(*signatures, signature);
+    std::vector<ScorpiShaderLinkageElement> linkage;
+    std::vector<std::string> names;
+    auto reflect = [&](const hlsl::DxilSignature &sig, bool output) {
+      for (const auto &element : sig.GetElements()) {
+        if (element->GetOutputStream() || (!includeSystem &&
+            element->GetKind() != hlsl::DXIL::SemanticKind::Arbitrary)) continue;
+        auto type = element->GetCompType();
+        if (flags.GetLowPrecisionPresent() && !flags.GetUseNativeLowPrecision() &&
+            (type == hlsl::CompType::getF16() || type == hlsl::CompType::getI16()))
+          type = type.GetBaseCompType();
+        uint32_t selected = type == hlsl::CompType::getF32() ? 3 :
+            type == hlsl::CompType::getI32() ? 2 : type == hlsl::CompType::getU32() ? 1 : 0;
+        const bool flat = !output && kind == hlsl::DXIL::ShaderKind::Pixel && selected == 3 &&
+            element->GetInterpolationMode()->IsConstant();
+        if (flat) selected = 1;
+        if (!selected) continue;
+        for (unsigned row = 0; row < element->GetRows(); ++row) {
+          int reg = element->GetStartRow() + int(row);
+          if (reg < 0 || reg >= 32) continue;
+          names.emplace_back(element->GetName());
+          linkage.push_back({nullptr, element->GetSemanticIndexVec().at(row), uint32_t(reg),
+              element->GetStartCol(), element->GetCols(), selected, uint32_t(output) |
+              (element->GetKind() != hlsl::DXIL::SemanticKind::Arbitrary ? 2u : 0u), uint32_t(flat)});
+        }
+      }
+    };
+    reflect(signature.InputSignature, false);
+    reflect(signature.OutputSignature, true);
+    if (linkage.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    size_t bytes = linkage.size() * sizeof(ScorpiShaderLinkageElement);
+    for (const auto &name : names) bytes += name.size() + 1;
+    auto *result = static_cast<ScorpiShaderLinkageElement *>(std::malloc(bytes));
+    if (!result) throw std::runtime_error("linkage allocation failed");
+    std::memcpy(result, linkage.data(), linkage.size() * sizeof(*result));
+    char *name_cursor = reinterpret_cast<char *>(result + linkage.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+      result[i].semantic_name = name_cursor;
+      std::memcpy(name_cursor, names[i].c_str(), names[i].size() + 1);
+      name_cursor += names[i].size() + 1;
+    }
+    *elements = result; *count = linkage.size();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what());
+    return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+  } catch (...) {
+    SetError(error, error_size, "unexpected linkage inspection exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
+extern "C" int ScorpiInspectShaderLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size) {
+  return InspectShaderLinkage(code, size, metadata, metadata_size, elements, count, error, error_size, false);
+}
+
+extern "C" int ScorpiInspectRegisterLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size) {
+  return InspectShaderLinkage(code, size, metadata, metadata_size, elements, count, error, error_size, true);
+}
+
+extern "C" int ScorpiLinkRegisterInputs(
+    const void *code, size_t size, const ScorpiShaderLinkageElement *upstream,
+    size_t upstream_count, void **binary, size_t *binary_size,
+    char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!code || !size || !binary || !binary_size || (!upstream && upstream_count))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    if (!IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid register-linkage container");
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing register-linkage program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(
+        GetDxilBitcodeData(program), GetDxilBitcodeSize(program)), "register-linkage", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid register-linkage bitcode");
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm || !(dm->GetShaderModel()->IsPS() || dm->GetShaderModel()->IsGS()))
+      throw std::runtime_error("register input linkage requires a pixel or geometry shader");
+    ScorpiWidenMinimumPrecisionIO(*dm);
+    std::vector<std::unique_ptr<DxilSignatureElement>> original;
+    for (const auto &e : dm->GetInputSignature().GetElements())
+      original.emplace_back(new DxilSignatureElement(*e));
+    auto oldElement = [&](unsigned id) -> const DxilSignatureElement & {
+      for (const auto &e : original) if (e->GetID() == id) return *e;
+      throw std::runtime_error("invalid register-linkage input ID");
+    };
+    struct Group {
+      std::string name;
+      CompType type;
+      InterpolationMode interpolation;
+      unsigned reg, col, cols, id;
+      DXIL::SemanticKind kind;
+      std::vector<unsigned> indices;
+    };
+    std::vector<ScorpiShaderLinkageElement> layout;
+    for (size_t i = 0; i < upstream_count; ++i) {
+      const auto &e = upstream[i];
+      if (!e.semantic_name || !(e.output & 1u) || e.register_index >= 32 ||
+          e.first_component >= 4 || !e.component_count ||
+          e.component_count > 4 - e.first_component ||
+          e.component_type < 1 || e.component_type > 3)
+        throw std::runtime_error("invalid upstream register layout");
+      layout.push_back(e);
+    }
+    std::vector<Group> groups;
+    const bool geometry = dm->GetShaderModel()->IsGS();
+    for (const auto &out : layout) {
+      const bool system = (out.output & 2u) != 0;
+      if (system && !geometry) continue;
+      CompType type = CompType::getInvalid();
+      InterpolationMode interpolation(DXIL::InterpolationMode::Undefined);
+      for (const auto &in : original) {
+        if (in->GetKind() != DXIL::SemanticKind::Arbitrary || !in->IsAllocated() ||
+            out.register_index < unsigned(in->GetStartRow()) ||
+            out.register_index >= unsigned(in->GetStartRow()) + in->GetRows() ||
+            out.first_component >= unsigned(in->GetStartCol()) + in->GetCols() ||
+            unsigned(in->GetStartCol()) >= out.first_component + out.component_count)
+          continue;
+        if (in->GetCompType().GetSizeInBits() != 32)
+          throw std::runtime_error("register input linkage requires 32-bit components");
+        if (type.IsInvalid()) {
+          type = in->GetCompType(); interpolation = *in->GetInterpolationMode();
+        } else if (!(type == in->GetCompType()) ||
+                   interpolation.GetKind() != in->GetInterpolationMode()->GetKind()) {
+          throw std::runtime_error("mixed types or interpolation within upstream input element");
+        }
+      }
+      if (geometry && (system || type.IsInvalid())) {
+        type = out.component_type == 1 ? CompType::getU32() :
+            out.component_type == 2 ? CompType::getI32() :
+            out.component_type == 3 ? CompType::getF32() : CompType::getInvalid();
+      }
+      if (type.IsInvalid()) continue;
+      const auto kind = system ? Semantic::GetByName(out.semantic_name)->GetKind() : DXIL::SemanticKind::Arbitrary;
+      if (!groups.empty()) {
+        auto &last = groups.back();
+        if (last.name == out.semantic_name && last.type == type && last.kind == kind &&
+            last.interpolation.GetKind() == interpolation.GetKind() &&
+            last.reg + last.indices.size() == out.register_index &&
+            last.col == out.first_component && last.cols == out.component_count) {
+          last.indices.push_back(out.semantic_index);
+          continue;
+        }
+      }
+      groups.push_back({out.semantic_name, type, interpolation, out.register_index,
+                        out.first_component, out.component_count, 0, kind, {out.semantic_index}});
+    }
+    auto &signature = dm->GetInputSignature();
+    signature.ClearElements();
+    unsigned occupied[32] = {};
+    for (const auto &g : groups)
+      for (unsigned row = 0; row < g.indices.size(); ++row) {
+        const unsigned mask = ((1u << g.cols) - 1) << g.col;
+        if (occupied[g.reg + row] & mask)
+          throw std::runtime_error("overlapping upstream input elements");
+        occupied[g.reg + row] |= mask;
+      }
+    std::map<unsigned, unsigned> systemIDs;
+    for (const auto &e : original) if (e->GetKind() != DXIL::SemanticKind::Arbitrary) {
+      if (geometry && e->IsAllocated() && std::any_of(groups.begin(), groups.end(), [&](const Group &g) {
+            return g.kind == e->GetKind() && g.name == e->GetName();
+          })) continue;
+      std::unique_ptr<DxilSignatureElement> copy(new DxilSignatureElement(*e));
+      // System values are linked by their system semantic. The consumer may
+      // originally have packed them in a register now used by an upstream
+      // arbitrary element; choose free internal input storage in that case.
+      if (copy->IsAllocated()) {
+        bool allocated = false;
+        for (unsigned row = 0; row + copy->GetRows() <= 32 && !allocated; ++row)
+          for (unsigned col = 0; col + copy->GetCols() <= 4 && !allocated; ++col) {
+            unsigned mask = ((1u << copy->GetCols()) - 1) << col;
+            bool free = true;
+            for (unsigned r = 0; r < copy->GetRows(); ++r)
+              free &= !(occupied[row + r] & mask);
+            if (!free) continue;
+            copy->SetStartRow(row); copy->SetStartCol(col);
+            for (unsigned r = 0; r < copy->GetRows(); ++r) occupied[row + r] |= mask;
+            allocated = true;
+          }
+        if (!allocated) throw std::runtime_error("linked system inputs exceed signature storage");
+      }
+      systemIDs[e->GetID()] = signature.AppendElement(std::move(copy));
+    }
+    for (auto &g : groups) {
+      auto e = signature.CreateElement();
+      e->Initialize(g.name, g.type, g.interpolation, g.indices.size(), g.cols,
+                    g.reg, g.col, DxilSignatureElement::kUndefinedID, g.indices);
+      e->SetKind(g.kind);
+      e->SetUsageMask((1u << g.cols) - 1);
+      g.id = signature.AppendElement(std::move(e));
+    }
+    struct Location { unsigned id, row, col; bool valid; };
+    auto locate = [&](unsigned reg, unsigned col) -> Location {
+      for (const auto &g : groups)
+        if (reg >= g.reg && reg < g.reg + g.indices.size() &&
+            col >= g.col && col < g.col + g.cols)
+          return {g.id, reg - g.reg, col - g.col, true};
+      return {0, 0, 0, false};
+    };
+    std::vector<CallInst *> loads;
+    for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
+      if (auto *call = dyn_cast<CallInst>(&inst))
+        if (call->getCalledFunction() && call->getCalledFunction()->getName().startswith("dx.op.loadInput."))
+          loads.push_back(call);
+    for (auto *old : loads) {
+      auto *id = dyn_cast<ConstantInt>(old->getArgOperand(1));
+      auto *column = dyn_cast<ConstantInt>(old->getArgOperand(3));
+      if (!id || !column) throw std::runtime_error("nonconstant register-linkage ID or column");
+      const auto &in = oldElement(id->getZExtValue());
+      if (in.GetKind() != DXIL::SemanticKind::Arbitrary && systemIDs.count(in.GetID())) {
+        old->setArgOperand(1, ConstantInt::get(old->getArgOperand(1)->getType(), systemIDs.at(in.GetID())));
+        continue;
+      }
+      if (column->getZExtValue() >= in.GetCols())
+        throw std::runtime_error("register-linkage column outside signature");
+      IRBuilder<> at(old);
+      auto *i32 = at.getInt32Ty();
+      const unsigned col = unsigned(in.GetStartCol()) + column->getZExtValue();
+      auto read = [&](Location location, Value *row) -> Value * {
+        if (!location.valid) return UndefValue::get(old->getType());
+        auto *type = signature.GetElement(location.id).GetCompType().IsFloatTy() ?
+            at.getFloatTy() : static_cast<Type *>(i32);
+        auto *call = at.CreateCall(dm->GetOP()->GetOpFunc(DXIL::OpCode::LoadInput, type),
+            {old->getArgOperand(0), at.getInt32(location.id), row,
+             at.getInt8(location.col), old->getArgOperand(4)});
+        call->setDebugLoc(old->getDebugLoc());
+        return call->getType() == old->getType() ? static_cast<Value *>(call) :
+            at.CreateBitCast(call, old->getType());
+      };
+      Value *value = nullptr;
+      auto *oldRow = old->getArgOperand(2);
+      if (auto *row = dyn_cast<ConstantInt>(oldRow)) {
+        auto location = locate(unsigned(in.GetStartRow()) + row->getZExtValue(), col);
+        if (in.GetKind() != DXIL::SemanticKind::Arbitrary) {
+          location = {0, 0, 0, false};
+          if (row->getZExtValue() < in.GetSemanticIndexVec().size())
+            for (const auto &g : groups) {
+              if (g.kind != in.GetKind() || g.name != in.GetName()) continue;
+              const auto index = in.GetSemanticIndexVec()[row->getZExtValue()];
+              const auto found = std::find(g.indices.begin(), g.indices.end(), index);
+              if (found != g.indices.end() && col >= g.col && col < g.col + g.cols)
+                location = {g.id, unsigned(found - g.indices.begin()), col - g.col, true};
+            }
+        }
+        value = read(location, at.getInt32(location.row));
+      } else {
+        // Preserve dynamic array access directly when the linked rows still
+        // form one rectangle. Only irregular layouts require selection.
+        auto first = locate(in.GetStartRow(), col);
+        bool rectangular = first.valid;
+        for (unsigned row = 1; row < in.GetRows() && rectangular; ++row) {
+          auto next = locate(unsigned(in.GetStartRow()) + row, col);
+          rectangular = next.valid && next.id == first.id &&
+              next.col == first.col && next.row == first.row + row;
+        }
+        if (rectangular) {
+          auto *row = first.row ? at.CreateAdd(oldRow, at.getInt32(first.row)) : oldRow;
+          auto &e = signature.GetElement(first.id);
+          e.SetDynIdxCompMask(e.GetDynIdxCompMask() | (1u << first.col));
+          value = read(first, row);
+        } else {
+          std::function<Value *(unsigned, unsigned)> select = [&](unsigned begin, unsigned end) -> Value * {
+            if (end - begin == 1) {
+              auto location = locate(unsigned(in.GetStartRow()) + begin, col);
+              return read(location, at.getInt32(location.row));
+            }
+            unsigned mid = begin + (end - begin) / 2;
+            auto *left = select(begin, mid); auto *right = select(mid, end);
+            return at.CreateSelect(at.CreateICmpULT(oldRow, at.getInt32(mid)), left, right);
+          };
+          if (!in.GetRows()) throw std::runtime_error("empty register input array");
+          value = select(0, in.GetRows());
+        }
+      }
+      old->replaceAllUsesWith(value); old->eraseFromParent();
+    }
+    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid register-linkage IR");
+    dm->GetSerializedViewIdState().clear();
+    DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("register-linkage allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected register-linkage exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 extern "C" int ScorpiRetypeShaderOutputs(
     const void *code, size_t size, const uint16_t component_types[32],
     void **binary, size_t *binary_size, char *error, size_t error_size) {
@@ -1317,6 +1717,7 @@ extern "C" int ScorpiRetypeShaderOutputs(
     if (!dm || !(dm->GetShaderModel()->IsVS() || dm->GetShaderModel()->IsDS() ||
                  dm->GetShaderModel()->IsGS()))
       throw std::runtime_error("output linkage requires a rasterizer producer");
+    const bool widened = ScorpiWidenMinimumPrecisionIO(*dm);
     std::map<unsigned, llvm::Type *> types;
     for (auto &element : dm->GetOutputSignature().GetElements()) {
       // System values and non-rasterized streams retain their ABI.
@@ -1347,7 +1748,7 @@ extern "C" int ScorpiRetypeShaderOutputs(
       types[element->GetID()] = selected == 3 ? llvm::Type::getFloatTy(context) :
           llvm::Type::getInt32Ty(context);
     }
-    if (types.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    if (types.empty() && !widened) return SCORPI_DXBC_TO_DXIL_OK;
     std::vector<llvm::CallInst *> stores;
     for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst))
@@ -1722,7 +2123,7 @@ extern "C" int ScorpiLowerTypedBufferViewsWithSamplingPolicy(const void *code, s
   SetError(error, error_size, "");
   if (!binary || !binary_size || !code || !size || (!bindings && binding_count) ||
       (!policy && policy_count) ||
-      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_TYPED_DIMENSIONS_ONLY | SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS | SCORPI_SHADER_FLUSH_FP32_ARITHMETIC)))
+      (options & ~(SCORPI_SHADER_NATIVE_TEXTURES | SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_BINDING_POLICY | SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_TYPED_DIMENSIONS_ONLY | SCORPI_SHADER_FLUSH_FP32_COMPARISON_INPUTS | SCORPI_SHADER_FLUSH_FP32_ARITHMETIC | SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS)))
     return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {

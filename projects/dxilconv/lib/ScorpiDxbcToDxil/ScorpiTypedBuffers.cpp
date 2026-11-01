@@ -6,6 +6,8 @@
 #include "dxc/DXIL/DxilResourceBinding.h"
 #include "dxc/DXIL/DxilResourceProperties.h"
 #include "dxc/DXIL/DxilShaderModel.h"
+#include "dxc/DXIL/DxilSignature.h"
+#include "dxc/DXIL/DxilSignatureElement.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -1358,10 +1360,242 @@ bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
   return inlinedSubroutines;
 }
 
+namespace {
+bool PromoteStaticIndexableTemps(DxilModule &dm) {
+  std::vector<Function *> functions;
+  for (auto &function : *dm.GetModule()) {
+    if (function.isDeclaration()) continue;
+    for (auto &inst : function.getEntryBlock()) {
+      auto *array = dyn_cast<AllocaInst>(&inst);
+      if (!array || !array->getName().startswith("dx.v32.x")) continue;
+      auto *type = dyn_cast<ArrayType>(array->getAllocatedType());
+      if (!type || !type->getElementType()->isIntegerTy(32)) continue;
+      bool promotable = !array->use_empty();
+      for (auto *user : array->users()) {
+        auto *index = dyn_cast<GetElementPtrInst>(user);
+        if (!index || index->getNumIndices() != 2) { promotable = false; break; }
+        auto *first = dyn_cast<ConstantInt>(index->getOperand(1));
+        auto *element = dyn_cast<ConstantInt>(index->getOperand(2));
+        if (!first || !first->isZero() || !element || element->getValue().uge(type->getNumElements())) {
+          promotable = false; break;
+        }
+        for (auto *access : index->users()) {
+          if (auto *load = dyn_cast<LoadInst>(access)) {
+            if (load->isSimple()) continue;
+          } else if (auto *store = dyn_cast<StoreInst>(access)) {
+            if (store->isSimple() && store->getPointerOperand() == index) continue;
+          }
+          promotable = false; break;
+        }
+        if (!promotable) break;
+      }
+      if (promotable) { functions.push_back(&function); break; }
+    }
+  }
+  if (functions.empty()) return false;
+  // Use DXC's DXIL-linker SROA/mem2reg sequence before MSC sees a large
+  // constant-indexed DXBC temporary array. Its alloca instcombine path can
+  // otherwise take minutes walking tens of thousands of uses.
+  legacy::FunctionPassManager passes(dm.GetModule());
+  passes.add(createSROAPass(false, false));
+  passes.add(createPromoteMemoryToRegisterPass());
+  passes.doInitialization();
+  bool changed = false;
+  for (auto *function : functions) changed |= passes.run(*function);
+  passes.doFinalization();
+  return changed;
+}
+
+bool LowerDynamicDomainInputs(DxilModule &dm) {
+  if (!dm.GetShaderModel()->IsDS()) return false;
+  std::vector<CallInst *> loads;
+  for (auto &function : *dm.GetModule()) for (auto &block : function) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst))
+      if (Opcode(call) == OpCode::LoadInput && !isa<ConstantInt>(call->getArgOperand(2)))
+        loads.push_back(call);
+  // MSC emits an ill-typed GEP from the control-point struct for a dynamic
+  // signature row. Constant-row loads keep its native struct addressing valid.
+  // Use balanced selects: native mesh compilation also crashes on the switch
+  // form with a dynamic control-point index. Static-row inputs stay untouched.
+  for (auto *call : loads) {
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic domain input signature ID");
+    const auto &element = dm.GetInputSignature().GetElement(unsigned(id->getZExtValue()));
+    IRBuilder<> at(call);
+    std::vector<Value *> rows;
+    for (unsigned row = 0; row < element.GetRows(); ++row) {
+      auto *load = cast<CallInst>(call->clone());
+      load->setArgOperand(2, at.getInt32(row));
+      load->insertBefore(call);
+      rows.push_back(load);
+    }
+    if (rows.empty()) throw std::runtime_error("empty domain input signature");
+    std::function<Value *(unsigned, unsigned)> select = [&](unsigned first, unsigned end) -> Value * {
+      if (end - first == 1) return rows[first];
+      const unsigned middle = first + (end - first) / 2;
+      auto *left = select(first, middle), *right = select(middle, end);
+      return at.CreateSelect(at.CreateICmpULT(call->getArgOperand(2), at.getInt32(middle)), left, right);
+    };
+    auto *value = at.CreateSelect(at.CreateICmpULT(call->getArgOperand(2), at.getInt32(rows.size())),
+        select(0, rows.size()), Constant::getNullValue(call->getType()));
+    call->replaceAllUsesWith(value);
+    call->eraseFromParent();
+  }
+  return !loads.empty();
+}
+
+bool WidenMinimumPrecisionIO(DxilModule &dm) {
+  // Minimum precision permits a wider interface. MSC's stage-in/position
+  // lowering emits invalid AIR for f16 interfaces and invalid pipelines for
+  // signed i16 interfaces. Keep the shader's arithmetic precision and convert only at
+  // the interface; explicit native 16-bit shaders retain their exact ABI.
+  if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
+      dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
+  using Types = std::map<unsigned, CompType>;
+  Types inputs, outputs, patches;
+  auto widen = [](DxilSignature &signature, Types &types) {
+    for (auto &element : signature.GetElements()) {
+      auto type = element->GetCompType();
+      if (!(type == CompType::getF16()) && !(type == CompType::getI16())) continue;
+      types.emplace(element->GetID(), type);
+      element->SetCompType(type.GetBaseCompType());
+    }
+  };
+  widen(dm.GetInputSignature(), inputs);
+  widen(dm.GetOutputSignature(), outputs);
+  widen(dm.GetPatchConstOrPrimSignature(), patches);
+  if (inputs.empty() && outputs.empty() && patches.empty()) return false;
+  std::vector<CallInst *> calls;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst)) {
+      auto op = Opcode(call);
+      if (op == OpCode::LoadInput || op == OpCode::LoadOutputControlPoint ||
+          op == OpCode::LoadPatchConstant || op == OpCode::StoreOutput ||
+          op == OpCode::StorePatchConstant) calls.push_back(call);
+    }
+  for (auto *call : calls) {
+    auto op = Opcode(call);
+    const auto &types = op == OpCode::LoadInput ? inputs :
+        (op == OpCode::LoadPatchConstant || op == OpCode::StorePatchConstant) ? patches : outputs;
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic minimum-precision signature ID");
+    auto selected = types.find(unsigned(id->getZExtValue()));
+    if (selected == types.end()) continue;
+    IRBuilder<> at(call);
+    bool floating = selected->second == CompType::getF16();
+    Type *wide = floating ? at.getFloatTy() : at.getInt32Ty();
+    SmallVector<Value *, 8> args;
+    for (auto &arg : call->arg_operands()) args.push_back(arg);
+    const bool store = op == OpCode::StoreOutput || op == OpCode::StorePatchConstant;
+    if (store) {
+      auto *value = args[4];
+      args[4] = floating ? at.CreateFPExt(value, wide) : at.CreateSExt(value, wide);
+    }
+    auto *replacement = at.CreateCall(dm.GetOP()->GetOpFunc(op, wide), args);
+    replacement->setDebugLoc(call->getDebugLoc());
+    if (!store) {
+      auto *value = floating ? at.CreateFPTrunc(replacement, call->getType()) :
+          at.CreateTrunc(replacement, call->getType());
+      call->replaceAllUsesWith(value);
+    }
+    call->eraseFromParent();
+  }
+  return true;
+}
+
+bool RoundMinimumPrecisionConversions(DxilModule &dm) {
+  if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
+      dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
+  std::vector<FPTruncInst *> casts;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *cast = dyn_cast<FPTruncInst>(&inst))
+      if (cast->getSrcTy()->isFloatTy() && cast->getDestTy()->isHalfTy()) casts.push_back(cast);
+  // D3D11.3 3.2.2 and 7.20.3.4 require round-to-zero when narrowing.
+  // LLVM fptrunc uses nearest-even; the legacy DXIL conversion carries the
+  // required native rounding mode without changing half arithmetic or native16.
+  for (auto *cast : casts) {
+    IRBuilder<> at(cast);
+    auto *bits = at.CreateCall(dm.GetOP()->GetOpFunc(OpCode::LegacyF32ToF16, at.getFloatTy()),
+        {at.getInt32(unsigned(OpCode::LegacyF32ToF16)), cast->getOperand(0)});
+    auto *value = at.CreateBitCast(at.CreateTrunc(bits, at.getInt16Ty()), at.getHalfTy());
+    cast->replaceAllUsesWith(value);
+    cast->eraseFromParent();
+  }
+  return !casts.empty();
+}
+
+bool PreserveMinimumPrecisionNonfiniteConstants(DxilModule &dm) {
+  if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
+      dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
+  bool changed = false;
+  for (auto &function : *dm.GetModule()) for (auto &block : function) for (auto &inst : block) {
+    auto *math = dyn_cast<FPMathOperator>(&inst);
+    if (!math || !inst.getType()->isHalfTy() ||
+        !(math->hasUnsafeAlgebra() || math->hasNoInfs() || math->hasNoNaNs())) continue;
+    bool nonfinite = false;
+    for (auto &operand : inst.operands())
+      if (auto *constant = dyn_cast<ConstantFP>(operand))
+        nonfinite |= !constant->getValueAPF().isFinite();
+    if (!nonfinite) continue;
+    // Minimum-precision constant folding can introduce infinity. Keeping
+    // nnan/ninf/fast on that operation lets native compilation discard it.
+    // Preserve the other permissions and leave finite operations unchanged.
+    FastMathFlags flags;
+    if (math->hasNoSignedZeros()) flags.setNoSignedZeros();
+    if (math->hasAllowReciprocal()) flags.setAllowReciprocal();
+    inst.copyFastMathFlags(flags);
+    changed = true;
+  }
+  return changed;
+}
+
+bool RetypeFlatFloatInputs(DxilModule &dm) {
+  // Native flat float varyings may clamp infinities during rasterization.
+  // Integer varyings carry the same register bits without interpolation.
+  if (!dm.GetShaderModel()->IsPS()) return false;
+  std::set<unsigned> ids;
+  for (auto &element : dm.GetInputSignature().GetElements()) {
+    if (element->GetKind() == SemanticKind::Arbitrary &&
+        element->GetCompType() == CompType::getF32() &&
+        element->GetInterpolationMode()->IsConstant()) {
+      ids.insert(element->GetID());
+      element->SetCompType(CompType::getU32());
+    }
+  }
+  if (ids.empty()) return false;
+  std::vector<CallInst *> loads;
+  for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst))
+      if (Opcode(call) == OpCode::LoadInput) loads.push_back(call);
+  for (auto *call : loads) {
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic flat input signature ID");
+    if (!ids.count(unsigned(id->getZExtValue()))) continue;
+    IRBuilder<> at(call);
+    SmallVector<Value *, 8> args;
+    for (auto &arg : call->arg_operands()) args.push_back(arg);
+    auto *load = at.CreateCall(dm.GetOP()->GetOpFunc(OpCode::LoadInput, at.getInt32Ty()), args);
+    load->setDebugLoc(call->getDebugLoc());
+    call->replaceAllUsesWith(at.CreateBitCast(load, call->getType()));
+    call->eraseFromParent();
+  }
+  return true;
+}
+
+}
+
+bool ScorpiWidenMinimumPrecisionIO(DxilModule &dm) { return WidenMinimumPrecisionIO(dm); }
+
 bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bindings,
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
+  const bool promotedStaticTemps = PromoteStaticIndexableTemps(dm);
+  const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
+  const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
+  const bool preservedMinimumNonfinite = PreserveMinimumPrecisionNonfiniteConstants(dm);
+  const bool flatFloatInputs = (options & SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS) && RetypeFlatFloatInputs(dm);
+  const bool loweredDomainInputs = LowerDynamicDomainInputs(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1479,7 +1713,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
