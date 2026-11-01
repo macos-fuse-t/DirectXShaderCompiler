@@ -1339,6 +1339,44 @@ bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
 }
 
 namespace {
+bool LowerDynamicDomainInputs(DxilModule &dm) {
+  if (!dm.GetShaderModel()->IsDS()) return false;
+  std::vector<CallInst *> loads;
+  for (auto &function : *dm.GetModule()) for (auto &block : function) for (auto &inst : block)
+    if (auto *call = dyn_cast<CallInst>(&inst))
+      if (Opcode(call) == OpCode::LoadInput && !isa<ConstantInt>(call->getArgOperand(2)))
+        loads.push_back(call);
+  // MSC emits an ill-typed GEP from the control-point struct for a dynamic
+  // signature row. Constant-row loads keep its native struct addressing valid.
+  // Use balanced selects: native mesh compilation also crashes on the switch
+  // form with a dynamic control-point index. Static-row inputs stay untouched.
+  for (auto *call : loads) {
+    auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    if (!id) throw std::runtime_error("dynamic domain input signature ID");
+    const auto &element = dm.GetInputSignature().GetElement(unsigned(id->getZExtValue()));
+    IRBuilder<> at(call);
+    std::vector<Value *> rows;
+    for (unsigned row = 0; row < element.GetRows(); ++row) {
+      auto *load = cast<CallInst>(call->clone());
+      load->setArgOperand(2, at.getInt32(row));
+      load->insertBefore(call);
+      rows.push_back(load);
+    }
+    if (rows.empty()) throw std::runtime_error("empty domain input signature");
+    std::function<Value *(unsigned, unsigned)> select = [&](unsigned first, unsigned end) -> Value * {
+      if (end - first == 1) return rows[first];
+      const unsigned middle = first + (end - first) / 2;
+      auto *left = select(first, middle), *right = select(middle, end);
+      return at.CreateSelect(at.CreateICmpULT(call->getArgOperand(2), at.getInt32(middle)), left, right);
+    };
+    auto *value = at.CreateSelect(at.CreateICmpULT(call->getArgOperand(2), at.getInt32(rows.size())),
+        select(0, rows.size()), Constant::getNullValue(call->getType()));
+    call->replaceAllUsesWith(value);
+    call->eraseFromParent();
+  }
+  return !loads.empty();
+}
+
 bool WidenMinimumPrecisionIO(DxilModule &dm) {
   // Minimum precision permits a wider interface. MSC's stage-in/position
   // lowering emits invalid AIR for f16 interfaces and invalid pipelines for
@@ -1489,6 +1527,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
   const bool preservedMinimumNonfinite = PreserveMinimumPrecisionNonfiniteConstants(dm);
   const bool flatFloatInputs = (options & SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS) && RetypeFlatFloatInputs(dm);
+  const bool loweredDomainInputs = LowerDynamicDomainInputs(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> textureLoads;
@@ -1606,7 +1645,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
