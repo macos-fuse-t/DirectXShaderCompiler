@@ -37,6 +37,9 @@ enum {
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM = 2,
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_SHIFT = 2,
   SCORPI_SHADER_SIGNATURE_RASTERIZED_STREAM_MASK = 12,
+  // Backend metadata v1 only: DX11 DDI stage interfaces link by register and
+  // component. This is not a flag in the v2 DXBC conversion signature dump.
+  SCORPI_SHADER_BACKEND_REGISTER_LINKAGE = 16,
 };
 
 typedef struct ScorpiShaderSignatureMetadata {
@@ -104,6 +107,22 @@ ScorpiInspectShaderLinkage(const void *code, size_t size,
     const void *metadata, size_t metadata_size,
     ScorpiShaderLinkageElement **elements, size_t *count,
     char *error_message, size_t error_message_size);
+
+// Complete register layout for DDI linkage. output bit0 selects outputs;
+// bit1 marks a system-value element. The legacy inspector stays arbitrary-only.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiInspectRegisterLinkage(const void *code, size_t size,
+    const void *metadata, size_t metadata_size,
+    ScorpiShaderLinkageElement **elements, size_t *count,
+    char *error, size_t error_size);
+
+// Link register-mapped DDI inputs to the complete upstream output layout.
+// The caller must select this only for DDI linkage, not API semantic linkage.
+// Geometry shaders retain unused/system fields to match the producer payload.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiLinkRegisterInputs(const void *code, size_t size,
+    const ScorpiShaderLinkageElement *upstream, size_t upstream_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size);
 
 // Retype only exports bound to signed integer RTVs. Float exports are raw
 // register bits, not numeric float-to-int conversions. Null output means the
