@@ -1054,20 +1054,24 @@ public:
 // Root buffer descriptors have no view length and cannot use GetDimensions.
 // Only table/heap descriptors carry the bounds required by this correction.
 static bool RawHandleHasBounds(DxilModule &dm, Value *handle,
-    const ScorpiTypedBufferBinding *bindings, size_t count, std::set<Value *> &seen) {
+    const ScorpiTypedBufferBinding *bindings, size_t count, std::set<Value *> &seen,
+    bool *rootDescriptor = nullptr) {
   if (!seen.insert(handle).second) return true;
   if (auto *phi = dyn_cast<PHINode>(handle)) {
+    bool bounded = true;
     for (auto &v : phi->incoming_values())
-      if (!RawHandleHasBounds(dm, v, bindings, count, seen)) return false;
-    return true;
+      bounded = RawHandleHasBounds(dm, v, bindings, count, seen, rootDescriptor) && bounded;
+    return bounded;
   }
-  if (auto *select = dyn_cast<SelectInst>(handle))
-    return RawHandleHasBounds(dm, select->getTrueValue(), bindings, count, seen) &&
-        RawHandleHasBounds(dm, select->getFalseValue(), bindings, count, seen);
+  if (auto *select = dyn_cast<SelectInst>(handle)) {
+    const bool a = RawHandleHasBounds(dm, select->getTrueValue(), bindings, count, seen, rootDescriptor);
+    const bool b = RawHandleHasBounds(dm, select->getFalseValue(), bindings, count, seen, rootDescriptor);
+    return a && b;
+  }
   auto *call = dyn_cast<CallInst>(handle);
   if (!call) return false;
   if (Opcode(call) == OpCode::AnnotateHandle)
-    return RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen);
+    return RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen, rootDescriptor);
   if (Opcode(call) == OpCode::CreateHandleFromHeap) return true;
   unsigned cls, space, lower;
   if (Opcode(call) == OpCode::CreateHandle) {
@@ -1082,8 +1086,10 @@ static bool RawHandleHasBounds(DxilModule &dm, Value *handle,
   for (size_t i = 0; i < count; ++i) {
     const auto &range = bindings[i];
     if (cls == range.resource_class && space == range.space && lower >= range.base_register &&
-        uint64_t(lower) - range.base_register < range.count)
+        uint64_t(lower) - range.base_register < range.count) {
+      if (rootDescriptor && range.table_offset == UINT32_MAX) *rootDescriptor = true;
       return range.table_offset != UINT32_MAX;
+    }
   }
   return false;
 }
@@ -1645,7 +1651,20 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     if (op != OpCode::BufferLoad && op != OpCode::BufferStore && op != OpCode::GetDimensions &&
         op != OpCode::AtomicBinOp && op != OpCode::AtomicCompareExchange) continue;
     std::set<Value *> seen;
-    if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::TypedBuffer) calls.push_back(call);
+    const auto kind = Kind(call->getArgOperand(1), dm, seen);
+    if (op == OpCode::GetDimensions &&
+        (kind == ResourceKind::RawBuffer || kind == ResourceKind::StructuredBuffer)) {
+      bool rootDescriptor = false;
+      seen.clear();
+      RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen, &rootDescriptor);
+      // Native root descriptors contain only an address. The converter builds
+      // malformed AIR for a size query instead of returning an IRError. Until
+      // explicit root-buffer size metadata is implemented, fail compilation
+      // here without inventing dimensions or crashing the renderer process.
+      if (rootDescriptor)
+        throw std::runtime_error("root-buffer GetDimensions requires unsupported root-buffer size metadata");
+    }
+    if (kind == ResourceKind::TypedBuffer) calls.push_back(call);
   }
   // Do not even generate fallback IR for proven ordinary bindings. A branch
   // around software sampling still bloats Metal compilation and register use.
