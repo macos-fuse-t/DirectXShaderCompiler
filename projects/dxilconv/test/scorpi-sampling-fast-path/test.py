@@ -256,14 +256,19 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 assert status==0 and bool(output.value)==prefix,error.value
                 if output.value:lib.ScorpiFreeDxilBinary(output)
             print('PASS',model,resource,'aligned accesses untouched beside prefixed view')
-            # Apple handles addressing: a special view without GetDimensions
-            # must leave the entire shader byte-for-byte untouched, even with
-            # another (ordinary) view's dimensions query in the same stage.
+            # Native prefix addressing still needs logical bounds: a large
+            # unsigned index must not wrap into the texture. Preserve both
+            # native data loads while adding only the special view's guard.
             for flags in (8,16,24):
                 policy=(Requirement*1)(Requirement(cls,0,0,1,flags))
                 status=specialize(code,len(code),view,1,99,16,4|8|16,policy,1,
                                   C.byref(output),C.byref(size),error,len(error))
-                assert status==0 and not output.value, (model,resource,flags,error.value)
+                assert status==0 and output.value, (model,resource,flags,error.value)
+                (folder/'native-bounds.dxil').write_bytes(C.string_at(output,size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'native-bounds.dxil')],text=True)
+                assert 'icmp ult' in ir
+                assert re.search(r'call .*@dx.op.bufferLoad.i32\(',ir), ir
             (folder/'input.hlsl').write_text(source.replace('aligned.GetDimensions','prefixed.GetDimensions'))
             subprocess.run([dxc,'-T','cs_'+model,'-E','main','-Fo',str(folder/'input.dxil'),str(folder/'input.hlsl')],check=True)
             code=(folder/'input.dxil').read_bytes()
@@ -275,10 +280,12 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 (folder/'dimensions.dxil').write_bytes(C.string_at(output,size.value))
                 lib.ScorpiFreeDxilBinary(output)
                 ir=subprocess.check_output([dxc,'-dumpbin',str(folder/'dimensions.dxil')],text=True)
-                assert len(re.findall(r'call .*@dx.op.getDimensions',ir))==1
-                assert 'icmp ult' not in ir, 'custom typed addressing survived dimensions-only mode'
-                assert ('udiv' in ir)==bool(flags&16), 'RGB32 correction leaked to ordinary prefix'
-            print('PASS',model,resource,'native addressing; dimensions-only correction')
+                # Explicit dimensions plus the native access's bounds query.
+                assert len(re.findall(r'call .*@dx.op.getDimensions',ir))==2
+                assert 'icmp ult' in ir, 'native access lost its logical bounds guard'
+                divisions=re.findall(r'udiv i32 [^,\n]+, ([^\n]+)',ir)
+                assert any(divisor != '1' for divisor in divisions)==bool(flags&16), 'RGB32 correction leaked to ordinary prefix'
+            print('PASS',model,resource,'native addressing; logical bounds and dimensions correction')
             for requested in (False, True):
                 policy=(Requirement*1)(Requirement(cls,0,0,1,8|32))
                 status=specialize(code,len(code),view,1,99,16,4|8|16,policy,1 if requested else 0,

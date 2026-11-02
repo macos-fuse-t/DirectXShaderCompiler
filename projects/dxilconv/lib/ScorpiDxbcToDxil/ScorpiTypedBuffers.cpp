@@ -8,6 +8,7 @@
 #include "dxc/DXIL/DxilShaderModel.h"
 #include "dxc/DXIL/DxilSignature.h"
 #include "dxc/DXIL/DxilSignatureElement.h"
+#include "dxc/DXIL/DxilTypeSystem.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -236,6 +237,7 @@ class Lowering {
 
   CallInst *Call(IRBuilder<> &b, OpCode opcode, Type *type, std::vector<Value *> args) {
     args.insert(args.begin(), b.getInt32(unsigned(opcode)));
+    if (opcode == OpCode::GetDimensions) type = b.getVoidTy();
     return b.CreateCall(dm.GetOP()->GetOpFunc(opcode, type), args);
   }
   Value *MetadataHandle(Function *f) {
@@ -314,8 +316,10 @@ public:
       descriptors->SetLowerBound(i ? SCORPI_METADATA_SAMPLER_REGISTER : SCORPI_METADATA_RESOURCE_REGISTER);
       descriptors->SetRangeSize(i ? SCORPI_METADATA_SAMPLER_DESCRIPTORS : SCORPI_METADATA_RESOURCE_DESCRIPTORS);
       descriptors->SetGlobalName(i ? "ScorpiSamplerMetadata" : "ScorpiResourceMetadata");
-      descriptors->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
-          {Type::getInt32Ty(ctx)}, "ScorpiDescriptorMetadata")->getPointerTo()));
+      auto *element = StructType::create(ctx,
+          {Type::getInt32Ty(ctx)}, "ScorpiDescriptorMetadata");
+      descriptors->SetGlobalSymbol(UndefValue::get(
+          ArrayType::get(element, descriptors->GetRangeSize())->getPointerTo()));
       descriptorResourceIDs[i] = MetadataResource(std::move(descriptors));
     }
   }
@@ -862,7 +866,7 @@ public:
     IRBuilder<> out(empty);
     Value *emptyResult = Call(out,OpCode::TextureLoad,elementType,
         {texture,out.getInt32(0),out.getInt32(UINT32_MAX),out.getInt32(0),out.getInt32(0),
-         out.getInt32(0),out.getInt32(0),out.getInt32(0)});
+         out.getInt32(0),out.getInt32(0),axes == 3 ? static_cast<Value *>(out.getInt32(0)) : UndefValue::get(out.getInt32Ty())});
     // Empty-set comparison sampling compares against the OOB texel value;
     // returning that raw value skips the sampler's comparison function.
     // A gather returns its selected channel for all four OOB taps.
@@ -993,7 +997,8 @@ public:
           coords[2] = b.CreateSelect(b.CreateICmpSGT(layer,last),last,layer);
         }
         Value *loaded = (gather || nativeColor) ? static_cast<Value *>(UndefValue::get(call->getType())) : Call(b,OpCode::TextureLoad,elementType,
-            {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),b.getInt32(0)});
+            {texture,level,coords[0],coords[1],coords[2],b.getInt32(0),b.getInt32(0),
+             axes == 3 ? static_cast<Value *>(b.getInt32(0)) : UndefValue::get(b.getInt32Ty())});
         auto *border = b.CreateAnd(b.CreateLShr(state,b.getInt32(18)),b.getInt32(3));
         for (unsigned c = 0; c < 4; ++c) {
           if(gather||nativeColor){result=b.CreateInsertValue(result,b.CreateExtractValue(call,c),c);continue;}
@@ -1115,7 +1120,7 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
   if (!mask) return;
   std::vector<User *> users(call->user_begin(), call->user_end());
   IRBuilder<> b(call->getNextNode());
-  auto *dimensions = b.CreateCall(dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getInt32Ty()),
+  auto *dimensions = b.CreateCall(dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getVoidTy()),
       {b.getInt32(unsigned(OpCode::GetDimensions)), call->getArgOperand(1), b.getInt32(0)});
   auto *size = b.CreateExtractValue(dimensions, 0);
   auto *offset = call->getArgOperand(2);
@@ -1805,7 +1810,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   // needed. Non-null variants and unrelated handles remain untouched.
   for (auto *call : nullBufferAccesses) {
     IRBuilder<> b(call);
-    auto *dimensionOp = dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getInt32Ty());
+    auto *dimensionOp = dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getVoidTy());
     auto *dimensions = b.CreateCall(dimensionOp, {b.getInt32(unsigned(OpCode::GetDimensions)),
         call->getArgOperand(1), b.getInt32(0)});
     auto *present = b.CreateICmpNE(b.CreateExtractValue(dimensions, 0), b.getInt32(0));
@@ -1835,8 +1840,33 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     cleanup.add(createInstructionCombiningPass());
     cleanup.add(createCFGSimplificationPass());
     cleanup.run(*dm.GetModule());
-    dm.CollectShaderFlagsForModule();
   }
+  // Removed operations must not leave invalid unused intrinsic declarations
+  // or stale feature flags in the executable DXIL handed to native compilers.
+  for (auto it = dm.GetModule()->begin(); it != dm.GetModule()->end();) {
+    auto &function = *it++;
+    if (!function.isDeclaration() || !function.use_empty()) continue;
+    dm.GetOP()->RemoveFunction(&function);
+    dm.GetTypeSystem().EraseFunctionAnnotation(&function);
+    function.eraseFromParent();
+  }
+  for (auto it = dm.GetModule()->global_begin(); it != dm.GetModule()->global_end();) {
+    auto &global = *it++;
+    if (global.hasLocalLinkage() && global.use_empty() && !global.isUsedByMetadata())
+      global.eraseFromParent();
+  }
+  // Collection combines feature bits. Clear only inferred flags so removed
+  // instructions cannot retain requirements; preserve author-specified modes.
+  auto flags = dm.m_ShaderFlags;
+  flags.SetShaderFlagsRaw(flags.GetShaderFlagsRaw() & ~ShaderFlags::GetShaderFlagsRawForCollection());
+  unsigned validatorMajor, validatorMinor;
+  dm.GetValidatorVersion(validatorMajor, validatorMinor);
+  // DXC's validator preserves this legacy bit after DXR subobjects are gone.
+  if (DXIL::CompareVersions(validatorMajor, validatorMinor, 1, 5) >= 0 &&
+      DXIL::CompareVersions(validatorMajor, validatorMinor, 1, 8) < 0)
+    flags.SetRaytracingTier1_1(dm.m_ShaderFlags.GetRaytracingTier1_1());
+  dm.m_ShaderFlags = flags;
+  dm.CollectShaderFlagsForModule();
   return true;
 }
 
