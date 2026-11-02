@@ -1372,6 +1372,25 @@ bool ScorpiInlineDxbcSubroutines(DxilModule &dm) {
 }
 
 namespace {
+bool InlineHullAtomicPatchConstants(DxilModule &dm) {
+  if (!dm.GetShaderModel()->IsHS()) return false;
+  auto *control = dm.GetEntryFunction();
+  auto *patch = dm.GetPatchConstantFunction();
+  if (!control || !patch || patch->hasFnAttribute(Attribute::AlwaysInline)) return false;
+  auto compareExchange = [](Function *function) {
+    for (auto &block : *function) for (auto &inst : block)
+      if (Opcode(dyn_cast<CallInst>(&inst)) == OpCode::AtomicCompareExchange) return true;
+    return false;
+  };
+  if (!compareExchange(control) || !compareExchange(patch)) return false;
+  // MSC caches cmpxchg's private temporary by hull entry, sharing it across
+  // control-point and patch-constant functions. Inline the latter in native
+  // lowering so that storage remains in one function before AIR is written.
+  patch->removeFnAttr(Attribute::NoInline);
+  patch->addFnAttr(Attribute::AlwaysInline);
+  return true;
+}
+
 bool PromoteStaticIndexableTemps(DxilModule &dm) {
   std::vector<Function *> functions;
   for (auto &function : *dm.GetModule()) {
@@ -1601,6 +1620,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     size_t count, uint32_t space, uint32_t selfOffset, uint32_t options,
     const ScorpiSamplingRequirement *policy, size_t policyCount) {
   const bool inlinedSubroutines = ScorpiInlineDxbcSubroutines(dm);
+  const bool inlinedHullAtomics = InlineHullAtomicPatchConstants(dm);
   const bool promotedStaticTemps = PromoteStaticIndexableTemps(dm);
   const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
   const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
@@ -1737,7 +1757,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
