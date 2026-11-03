@@ -7,7 +7,21 @@
 #include "ScorpiTypedBuffers.h"
 #include "ScorpiAtomic64.h"
 
+// The upstream converter headers use Windows anonymous aggregates and raw
+// object copying. Keep their diagnostics local; retain warnings for our code.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#if __has_warning("-Wnontrivial-memcall")
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
+#endif
+#pragma clang diagnostic ignored "-Wextra-semi"
+#endif
 #include "DxbcConverterImpl.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 #include "dxc/DxilHash/DxilHash.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilContainer/DxilContainerAssembler.h"
@@ -47,6 +61,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -293,43 +308,6 @@ bool IsDxilProgram(const void *shader_code, size_t shader_code_size) {
       static_cast<const hlsl::DxilProgramHeader *>(shader_code);
   return hlsl::IsValidDxilProgramHeader(
       program, static_cast<uint32_t>(shader_code_size));
-}
-
-std::vector<uint8_t> WrapDxilProgram(const void *dxil, size_t dxil_size,
-                                     uint32_t source_version_token) {
-  if (IsDxilProgram(dxil, dxil_size)) {
-    const auto *program = static_cast<const hlsl::DxilProgramHeader *>(dxil);
-    const size_t program_size =
-        static_cast<size_t>(program->SizeInUint32) * sizeof(uint32_t);
-    return std::vector<uint8_t>(static_cast<const uint8_t *>(dxil),
-                                static_cast<const uint8_t *>(dxil) +
-                                    program_size);
-  }
-
-  if (dxil_size > std::numeric_limits<uint32_t>::max()) {
-    throw std::runtime_error("DXIL bitcode exceeds 32-bit size");
-  }
-
-  hlsl::DxilProgramHeader header = {};
-  const uint32_t source_type =
-      DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(source_version_token);
-  const uint32_t source_major =
-      DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(source_version_token);
-  const uint32_t source_minor =
-      DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(source_version_token);
-  const uint32_t shader_version =
-      hlsl::EncodeVersion(static_cast<hlsl::DXIL::ShaderKind>(source_type),
-                          source_major, source_minor);
-  const uint32_t dxil_version = hlsl::DXIL::MakeDxilVersion(1, 0);
-  hlsl::InitProgramHeader(header, shader_version, dxil_version,
-                          static_cast<uint32_t>(dxil_size));
-
-  const size_t padded_size =
-      sizeof(header) + ((dxil_size + sizeof(uint32_t) - 1) & ~size_t(3));
-  std::vector<uint8_t> program(padded_size);
-  std::memcpy(program.data(), &header, sizeof(header));
-  std::memcpy(program.data() + sizeof(header), dxil, dxil_size);
-  return program;
 }
 
 std::vector<uint8_t> WrapDxilContainer(const std::vector<uint8_t> &program) {
@@ -1693,6 +1671,94 @@ extern "C" int ScorpiLinkRegisterInputs(
   }
 }
 
+extern "C" int ScorpiRetypePackedUintVertexInputs(
+    const void *code, size_t size, uint32_t register_mask,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  SetError(error, error_size, "");
+  if (!code || !size || !binary || !binary_size)
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  *binary = nullptr; *binary_size = 0;
+  if (!register_mask) return SCORPI_DXBC_TO_DXIL_OK;
+  try {
+    using namespace llvm;
+    using namespace hlsl;
+    DxcMallocScope malloc_scope;
+    auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
+    auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
+    if (!IsValidDxilContainer(container, normalized.size()))
+      throw std::runtime_error("invalid packed vertex input container");
+    auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
+    if (!program) throw std::runtime_error("missing packed vertex input program");
+    LLVMContext context;
+    auto source = MemoryBuffer::getMemBuffer(StringRef(
+        GetDxilBitcodeData(program), GetDxilBitcodeSize(program)), "packed-input", false);
+    auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
+    if (!parsed) throw std::runtime_error("invalid packed vertex input bitcode");
+    auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
+    if (!dm || !dm->GetShaderModel()->IsVS())
+      throw std::runtime_error("packed vertex inputs require a vertex shader");
+    std::set<unsigned> changed;
+    for (auto &e : dm->GetInputSignature().GetElements()) {
+      if (!e->IsAllocated() || e->GetKind() != DXIL::SemanticKind::Arbitrary ||
+          !(e->GetCompType() == CompType::getF32())) continue;
+      bool selected = false, unselected = false;
+      for (unsigned row = 0; row < e->GetRows(); ++row) {
+        const unsigned reg = unsigned(e->GetStartRow()) + row;
+        if (reg < 32 && (register_mask & (uint32_t(1) << reg))) selected = true;
+        else unselected = true;
+      }
+      if (!selected) continue;
+      if (unselected) throw std::runtime_error("mixed packed vertex input array formats");
+      e->SetCompType(CompType::getU32());
+      changed.insert(e->GetID());
+    }
+    if (changed.empty()) return SCORPI_DXBC_TO_DXIL_OK;
+    std::vector<CallInst *> loads;
+    for (auto &f : *parsed.get()) for (auto &block : f) for (auto &inst : block)
+      if (auto *call = dyn_cast<CallInst>(&inst))
+        if (call->getCalledFunction() &&
+            call->getCalledFunction()->getName().startswith("dx.op.loadInput."))
+          loads.push_back(call);
+    for (auto *call : loads) {
+      auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+      if (!id) throw std::runtime_error("dynamic packed vertex input ID");
+      if (!changed.count(unsigned(id->getZExtValue()))) continue;
+      if (!call->getType()->isFloatTy())
+        throw std::runtime_error("packed vertex input load type disagrees with signature");
+      IRBuilder<> at(call);
+      auto *load = at.CreateCall(dm->GetOP()->GetOpFunc(DXIL::OpCode::LoadInput,
+          Type::getInt32Ty(context)), {call->getArgOperand(0), call->getArgOperand(1),
+          call->getArgOperand(2), call->getArgOperand(3), call->getArgOperand(4)});
+      load->setDebugLoc(call->getDebugLoc());
+      call->replaceAllUsesWith(at.CreateBitCast(load, call->getType()));
+      call->eraseFromParent();
+    }
+    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid packed vertex input IR");
+    dm->GetSerializedViewIdState().clear();
+    DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
+    CComPtr<AbstractMemoryStream> bitcode, output;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &bitcode));
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &output));
+    { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
+    SerializeDxilContainerForModule(dm, bitcode, nullptr, output,
+        StringRef(), SerializeDxilFlags::None);
+    auto *result = std::malloc(output->GetPtrSize());
+    if (!result) throw std::runtime_error("packed vertex input allocation failed");
+    std::memcpy(result, output->GetPtr(), output->GetPtrSize());
+    auto *header = static_cast<DxilContainerHeader *>(result);
+    constexpr uint32_t hashOffset = uint32_t(offsetof(DxilContainerHeader, Version));
+    ComputeHashRetail(static_cast<const uint8_t *>(result) + hashOffset,
+        header->ContainerSizeInBytes - hashOffset, header->Hash.Digest);
+    *binary = result; *binary_size = output->GetPtrSize();
+    return SCORPI_DXBC_TO_DXIL_OK;
+  } catch (const std::exception &e) {
+    SetError(error, error_size, e.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
+  } catch (...) {
+    SetError(error, error_size, "unexpected packed vertex input exception");
+    return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
+  }
+}
+
 extern "C" int ScorpiRetypeShaderOutputs(
     const void *code, size_t size, const uint16_t component_types[32],
     void **binary, size_t *binary_size, char *error, size_t error_size) {
@@ -2010,13 +2076,22 @@ static int InspectBindings(const void *code, size_t size,
     auto *dm = hlsl::DxilModule::TryGetDxilModule(parsed.get().get());
     if (!dm) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
     std::vector<Binding> ranges;
+    const auto appendRange = [&](uint32_t resourceClass, uint32_t space,
+                                 uint32_t first, uint32_t count) {
+      Binding range{};
+      range.resource_class = resourceClass;
+      range.space = space;
+      range.base_register = first;
+      range.count = count;
+      ranges.push_back(range);
+    };
     const auto declarations = [&] {
       for (const auto &r : dm->GetSRVs())
-        ranges.push_back({0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+        appendRange(0, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize());
       for (const auto &r : dm->GetUAVs())
-        ranges.push_back({1, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+        appendRange(1, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize());
       for (const auto &r : dm->GetSamplers())
-        ranges.push_back({3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize()});
+        appendRange(3, r->GetSpaceID(), r->GetLowerBound(), r->GetRangeSize());
     };
     if (!access_only) declarations();
     bool unknown_handle = false;
@@ -2060,8 +2135,8 @@ static int InspectBindings(const void *code, size_t size,
           cls = r.resourceClass; space = r.spaceID; first = r.rangeLowerBound;
           end = uint64_t(r.rangeUpperBound) + 1; index = call->getArgOperand(2);
           if (!access_only && (cls == 0 || cls == 1 || cls == 3) && end > first)
-            ranges.push_back({cls, space, uint32_t(first),
-                uint32_t(std::min<uint64_t>(end - first, UINT32_MAX))});
+            appendRange(cls, space, uint32_t(first),
+                uint32_t(std::min<uint64_t>(end - first, UINT32_MAX)));
         } else if (call->getCalledFunction()->getName().startswith("dx.op.createHandle")) {
           // Do not narrow declarations for an unrecognized handle producer.
           unknown_handle = true;
@@ -2070,10 +2145,10 @@ static int InspectBindings(const void *code, size_t size,
         if (!index || (cls != 0 && cls != 1 && cls != 3)) continue;
         const auto before = ranges.size();
         if (constant && constant->getZExtValue() >= first && constant->getZExtValue() < end)
-          ranges.push_back({cls, space, uint32_t(constant->getZExtValue()), 1});
+          appendRange(cls, space, uint32_t(constant->getZExtValue()), 1);
         else if (access_only && end > first)
-          ranges.push_back({cls, space, uint32_t(first),
-              uint32_t(std::min<uint64_t>(end - first, UINT32_MAX))});
+          appendRange(cls, space, uint32_t(first),
+              uint32_t(std::min<uint64_t>(end - first, UINT32_MAX)));
         if (access_only && ranges.size() != before)
           SetSampleOnly(ranges.back(), cls == 0 && SampleOnlyHandle(call));
       }

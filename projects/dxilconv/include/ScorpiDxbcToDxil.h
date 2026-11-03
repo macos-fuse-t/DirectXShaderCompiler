@@ -100,6 +100,14 @@ ScorpiRetypeShaderOutputs(const void *code, size_t size,
     const uint16_t component_types[32], void **binary, size_t *binary_size,
     char *error_message, size_t error_message_size);
 
+// Match native packed UINT vertex fetch to legacy float-bit input registers.
+// The mask selects R10G10B10A2_UINT input registers. Retyping preserves their
+// bits; already-integer inputs and unselected shaders return a null binary.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiRetypePackedUintVertexInputs(const void *code, size_t size,
+    uint32_t register_mask, void **binary, size_t *binary_size,
+    char *error_message, size_t error_message_size);
+
 // Native rasterizer linkage by semantic and semantic index, independent of
 // each stage's register packing. Names point into the returned allocation.
 // Flat float inputs request uint32 bit transport; ordinary inputs retain their
