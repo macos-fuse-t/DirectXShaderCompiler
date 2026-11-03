@@ -463,6 +463,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 #define SCORPI_SAMPLING_TYPED_EXTENDED_PREFIX 32u
 #define SCORPI_SAMPLING_MSAA8 64u
 #define SCORPI_SAMPLING_NULL_BUFFER 128u
+// The native converter omits sampler bias for explicit gradients. Scale only
+// gradients whose bound sampler has nonzero bias; keep native filtering.
+#define SCORPI_SAMPLING_GRADIENT_LOD_BIAS 256u
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
 // Keep native typed addressing, repairing dimensions and logical bounds

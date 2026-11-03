@@ -540,6 +540,18 @@ public:
     return b.CreateUIToFP(result,value->getType());
   }
 
+  void RewriteGradientBias(CallInst *call) {
+    auto *bias = Word(call->getArgOperand(2), 4);
+    IRBuilder<> b(call);
+    auto *scale = Call(b, OpCode::Exp, b.getFloatTy(),
+        {b.CreateBitCast(bias, b.getFloatTy())});
+    // Multiplying both gradients by 2^bias shifts the computed LOD while
+    // preserving anisotropy. Metal still performs the original native sample.
+    for (unsigned i = 10; i < 16; ++i)
+      if (!isa<UndefValue>(call->getArgOperand(i)))
+        call->setArgOperand(i, b.CreateFMul(call->getArgOperand(i), scale));
+  }
+
   void RewriteTextureLoad(CallInst *call) {
     auto *texture = call->getArgOperand(1);
     std::vector<ExtractValueInst*> statuses;
@@ -1649,6 +1661,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   const bool loweredDomainInputs = LowerDynamicDomainInputs(dm);
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
+  std::vector<CallInst *> gradientBiasSamples;
   std::vector<CallInst *> textureLoads;
   std::vector<CallInst *> bufferLoads;
   std::vector<CallInst *> rawLoads;
@@ -1698,6 +1711,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         textureLoads.push_back(call);
     }
     if (op == OpCode::SampleLevel || op == OpCode::SampleGrad || Implicit(op) || Gather(op) || Comparison(op)) {
+      if (op == OpCode::SampleGrad) gradientBiasSamples.push_back(call);
       std::set<Value *> seen;
       auto kind = Kind(call->getArgOperand(1), dm, seen);
       if (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray || kind == ResourceKind::Texture3D || kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray)
@@ -1751,6 +1765,11 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     std::set<Value *> seen;
     return SamplingRequirements(dm, handle, policy, policyCount, seen);
   };
+  gradientBiasSamples.erase(std::remove_if(gradientBiasSamples.begin(), gradientBiasSamples.end(),
+      [&](CallInst *call) {
+        return !(options & SCORPI_SHADER_BINDING_POLICY) ||
+            !(requirements(call->getArgOperand(2)) & SCORPI_SAMPLING_GRADIENT_LOD_BIAS);
+      }), gradientBiasSamples.end());
   bufferLoads.erase(std::remove_if(bufferLoads.begin(), bufferLoads.end(),
       [&](CallInst *call) { return !feedbackUsed(call); }), bufferLoads.end());
   if (options & (SCORPI_SHADER_NATIVE_TYPED_BUFFERS | SCORPI_SHADER_BINDING_POLICY))
@@ -1787,7 +1806,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty() && appendStores.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty() && appendStores.empty() && gradientBiasSamples.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
@@ -1836,7 +1855,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
       Lowering::ReplaceStatus(call, ConstantInt::getTrue(call->getContext()));
       return true;
     }), bufferLoads.end());
-  if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty()) {
+  if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty() || !gradientBiasSamples.empty()) {
     if (!bindings || !count || space == UINT32_MAX)
       throw std::runtime_error("typed-buffer metadata root binding missing");
     Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
@@ -1850,6 +1869,9 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         options & SCORPI_SHADER_TYPED_DIMENSIONS_ONLY);
     for (auto *call : textureLoads) lowering.RewriteTextureLoad(call);
     for (auto &sample : samples) lowering.RewriteSample(sample.first,sample.second);
+    // Form fallback footprints from the original gradients first: their LOD
+    // already includes sampler bias. Repair only the retained native sample.
+    for (auto *call : gradientBiasSamples) lowering.RewriteGradientBias(call);
   }
   for (auto *call : rawLoads) BoundRawLoadComponents(dm, call);
   // The native converter elides constant-offset raw/structured buffer bounds
