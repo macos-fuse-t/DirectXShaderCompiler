@@ -1099,6 +1099,26 @@ static bool RawHandleHasBounds(DxilModule &dm, Value *handle,
   return false;
 }
 
+// Keep counter updates outside the bounds guard: overflowing Append still
+// increments the hidden counter, but must not publish an out-of-view store.
+static void GuardBufferAccess(CallInst *call, Value *condition) {
+  auto *before = call->getParent();
+  auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.buffer.end");
+  before->getTerminator()->eraseFromParent();
+  auto *access = BasicBlock::Create(call->getContext(), "scorpi.buffer.access",
+      before->getParent(), after);
+  call->removeFromParent();
+  access->getInstList().push_back(call);
+  BranchInst::Create(after, access);
+  BranchInst::Create(access, after, condition, before);
+  if (!call->getType()->isVoidTy()) {
+    auto *result = PHINode::Create(call->getType(), 2, "scorpi.buffer.result", &*after->begin());
+    call->replaceAllUsesWith(result);
+    result->addIncoming(call, access);
+    result->addIncoming(Constant::getNullValue(call->getType()), before);
+  }
+}
+
 // Native buffer bounds checks cover the base address, but not the trailing
 // components of a vector raw load. Preserve that native load and mask only
 // live trailing results; scalar loads and all other resource kinds stay native.
@@ -1121,7 +1141,7 @@ static void BoundRawLoadComponents(DxilModule &dm, CallInst *call) {
   std::vector<User *> users(call->user_begin(), call->user_end());
   IRBuilder<> b(call->getNextNode());
   auto *dimensions = b.CreateCall(dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getVoidTy()),
-      {b.getInt32(unsigned(OpCode::GetDimensions)), call->getArgOperand(1), b.getInt32(0)});
+      {b.getInt32(unsigned(OpCode::GetDimensions)), call->getArgOperand(1), UndefValue::get(b.getInt32Ty())});
   auto *size = b.CreateExtractValue(dimensions, 0);
   auto *offset = call->getArgOperand(2);
   auto *inRange = b.CreateICmpULT(offset, size);
@@ -1634,12 +1654,22 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> rawLoads;
   std::vector<CallInst *> feedbackChecks;
   std::vector<CallInst *> nullBufferAccesses;
+  std::vector<CallInst *> appendStores;
   const bool loweredIntegerArithmetic = LowerExtendedIntegerArithmetic(dm);
   const bool fixedTrig = FixNonfiniteTrig(dm);
   const bool flushedMath = FlushFp32Math(dm, options);
   for (auto &f : *dm.GetModule()) for (auto &block : f) for (auto &inst : block) {
     auto *call = dyn_cast<CallInst>(&inst);
     const auto op = Opcode(call);
+    if (op == OpCode::BufferStore || op == OpCode::RawBufferStore) {
+      auto *index = dyn_cast<CallInst>(call->getArgOperand(2));
+      if (Opcode(index) == OpCode::BufferUpdateCounter &&
+          cast<ConstantInt>(index->getArgOperand(2))->getSExtValue() == 1) {
+        std::set<Value *> seen;
+        if (Kind(call->getArgOperand(1), dm, seen) == ResourceKind::StructuredBuffer)
+          appendStores.push_back(call);
+      }
+    }
     if ((options & SCORPI_SHADER_BINDING_POLICY) &&
         (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad ||
          op == OpCode::BufferStore || op == OpCode::RawBufferStore ||
@@ -1757,7 +1787,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty() && appendStores.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
@@ -1832,27 +1862,21 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     IRBuilder<> b(call);
     auto *dimensionOp = dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getVoidTy());
     auto *dimensions = b.CreateCall(dimensionOp, {b.getInt32(unsigned(OpCode::GetDimensions)),
-        call->getArgOperand(1), b.getInt32(0)});
+        call->getArgOperand(1), UndefValue::get(b.getInt32Ty())});
     auto *present = b.CreateICmpNE(b.CreateExtractValue(dimensions, 0), b.getInt32(0));
-    auto *before = call->getParent();
-    auto *after = before->splitBasicBlock(call->getNextNode(), "scorpi.null.buffer.end");
-    before->getTerminator()->eraseFromParent();
-    auto *access = BasicBlock::Create(call->getContext(), "scorpi.buffer.access",
-        before->getParent(), after);
-    call->removeFromParent();
-    access->getInstList().push_back(call);
-    BranchInst::Create(after, access);
-    BranchInst::Create(access, after, present, before);
-    if (!call->getType()->isVoidTy()) {
-      auto *result = PHINode::Create(call->getType(), 2, "scorpi.null.buffer.result", &*after->begin());
-      call->replaceAllUsesWith(result);
-      result->addIncoming(call, access);
-      // A null descriptor has no missing sparse tiles: native opaque status
-      // zero also denotes fully mapped, matching untouched native loads.
-      result->addIncoming(Constant::getNullValue(call->getType()), before);
-    }
+    GuardBufferAccess(call, present);
   }
-  if (!samples.empty() || !feedbackChecks.empty() || !nullBufferAccesses.empty()) {
+  // Native BoundsCheck redirects an overflowing append store to the same
+  // zero-address slot used by later OOB loads. A UAV barrier does not restore
+  // zero there. Guard only stores indexed by an increment-counter operation;
+  // ordinary structured-buffer accesses retain their native fast path.
+  for (auto *call : appendStores) {
+    IRBuilder<> b(call);
+    auto *dimensions = b.CreateCall(dm.GetOP()->GetOpFunc(OpCode::GetDimensions, b.getVoidTy()),
+        {b.getInt32(unsigned(OpCode::GetDimensions)), call->getArgOperand(1), UndefValue::get(b.getInt32Ty())});
+    GuardBufferAccess(call, b.CreateICmpULT(call->getArgOperand(2), b.CreateExtractValue(dimensions, 0)));
+  }
+  if (!samples.empty() || !feedbackChecks.empty() || !nullBufferAccesses.empty() || !appendStores.empty()) {
     // Canonicalize aggregate sample-result PHIs and dead descriptor arithmetic
     // before IR conversion. Conditional multi-sample shaders otherwise produce
     // AIR rejected by the Metal compiler's bitcode reader.
