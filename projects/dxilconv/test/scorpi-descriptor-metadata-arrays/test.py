@@ -75,6 +75,9 @@ with tempfile.TemporaryDirectory(prefix='scorpi-metadata-array-') as folder:
         execution.write_bytes(code)
         ir = subprocess.check_output([str(build / 'bin/dxc'), '-dumpbin', str(execution)], text=True)
         ir = ir.replace('define ', '@unused.debug = internal constant [1 x i32] zeroinitializer\n\ndefine ', 1)
+        # Unannotated declarations may remain after instrumentation/lowering.
+        # Cleanup must remove them without requiring function annotations.
+        ir = ir.replace('define ', 'declare float @llvm.sin.f32(float)\ndeclare void @scorpi.unused.helper()\n\ndefine ', 1)
         assert not original_flags & 4096  # Typed UAV load additional formats.
         ir, count = re.subn(r'(i32 0, i64 )' + str(original_flags) + r'(?=[,}])',
                             lambda m: m[1] + str(original_flags | 4096), ir)
@@ -106,6 +109,8 @@ with tempfile.TemporaryDirectory(prefix='scorpi-metadata-array-') as folder:
         lowered.write_bytes(C.string_at(binary, size.value))
         lib.ScorpiFreeDxilBinary(binary)
         subprocess.run([str(validator), str(build / 'lib/libdxcompiler.dylib'), str(lowered)], check=True)
+        lowered_ir = subprocess.check_output([str(build / 'bin/dxc'), '-dumpbin', str(lowered)], text=True)
+        assert '@llvm.sin.f32' not in lowered_ir and '@scorpi.unused.helper' not in lowered_ir
         assert original_flags and flags(lowered) & original_flags == original_flags
         assert not flags(lowered) & 4096
         print('PASS', stage + '_' + model, 'dynamic metadata indices validate; strict/early-depth modes preserved')

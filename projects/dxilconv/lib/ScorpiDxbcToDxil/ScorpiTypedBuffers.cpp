@@ -1912,8 +1912,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   for (auto it = dm.GetModule()->begin(); it != dm.GetModule()->end();) {
     auto &function = *it++;
     if (!function.isDeclaration() || !function.use_empty()) continue;
-    dm.GetOP()->RemoveFunction(&function);
-    dm.GetTypeSystem().EraseFunctionAnnotation(&function);
+    dm.RemoveFunction(&function);
     function.eraseFromParent();
   }
   for (auto it = dm.GetModule()->global_begin(); it != dm.GetModule()->global_end();) {
