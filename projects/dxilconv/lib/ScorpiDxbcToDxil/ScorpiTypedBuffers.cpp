@@ -77,7 +77,7 @@ bool NeedsClampPrecision(CallInst *call) {
   auto *value = call->getArgOperand(at);
   if (isa<UndefValue>(value)) return false;
   if (auto *constant = dyn_cast<ConstantFP>(value)) {
-    double scaled = constant->getValueAPF().convertToDouble() * 16;
+    double scaled = static_cast<double>(constant->getValueAPF().convertToFloat()) * 16;
     return scaled > 0 && std::isfinite(scaled) && scaled != std::floor(scaled);
   }
   return true;
