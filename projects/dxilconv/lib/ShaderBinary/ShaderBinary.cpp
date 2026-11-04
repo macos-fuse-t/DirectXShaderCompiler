@@ -10,7 +10,21 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 // HLSL change start
+// The upstream converter headers use Windows anonymous aggregates and raw
+// object copying. Keep their diagnostics local; retain warnings for our code.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#if __has_warning("-Wnontrivial-memcall")
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
+#endif
+#pragma clang diagnostic ignored "-Wextra-semi"
+#endif
 #include "ShaderBinaryIncludes.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 #include "llvm/Support/Compiler.h" // for LLVM_FALLTHROUGH
 // HLSL change end
 

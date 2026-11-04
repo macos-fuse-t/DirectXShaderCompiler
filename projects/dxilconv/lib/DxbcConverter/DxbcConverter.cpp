@@ -11,7 +11,21 @@
 
 #include "llvm/Support/Debug.h" // Must be included first.
 
+// The upstream converter headers use Windows anonymous aggregates and raw
+// object copying. Keep their diagnostics local; retain warnings for our code.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#if __has_warning("-Wnontrivial-memcall")
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
+#endif
+#pragma clang diagnostic ignored "-Wextra-semi"
+#endif
 #include "DxbcConverterImpl.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 #include "DxilConvPasses/DxilCleanup.h"
 #include "Tracing/DxcRuntimeEtw.h"
 #include "dxc/DxilContainer/DxilContainer.h"
@@ -1158,8 +1172,8 @@ static bool SignatureRecordCoversUsedElement(
     const SignatureHelper::UsedElement &used) {
   if (record.Stream != used.OutputStream)
     return false;
-  if (record.StartRow == Semantic::kUndefinedRow ||
-      used.Row == Semantic::kUndefinedRow) {
+  if (record.StartRow == static_cast<unsigned>(Semantic::kUndefinedRow) ||
+      used.Row == static_cast<unsigned>(Semantic::kUndefinedRow)) {
     if (record.StartRow != used.Row)
       return false;
   } else if (record.StartRow > used.Row ||
@@ -1259,7 +1273,7 @@ static void AddMissingSignatureRecordsFromDeclarations(
     record.Stream = used.OutputStream;
 
     if (SM != nullptr && SM->IsPS() && SigHelper.IsOutput() &&
-        used.Row == Semantic::kUndefinedRow) {
+        used.Row == static_cast<unsigned>(Semantic::kUndefinedRow)) {
       D3D10_SB_OPERAND_TYPE SpecialRegType = used.SpecialRegType;
       if (SpecialRegType == D3D10_SB_OPERAND_TYPE_NULL) {
         if (HasStencilRef)

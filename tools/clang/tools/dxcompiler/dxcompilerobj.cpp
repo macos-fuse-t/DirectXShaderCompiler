@@ -71,7 +71,17 @@
 #endif // SUPPORT_QUERY_GIT_COMMIT_INFO
 
 #ifdef ENABLE_METAL_CODEGEN
+// Apple's C API header uses #import for its dispatch dependency.
+#ifdef __clang__
+#pragma clang diagnostic push
+#if __has_warning("-Wimport-preprocessor-directive-pedantic")
+#pragma clang diagnostic ignored "-Wimport-preprocessor-directive-pedantic"
+#endif
+#endif
 #include "metal_irconverter.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 #endif
 
 #define CP_UTF16 1200
