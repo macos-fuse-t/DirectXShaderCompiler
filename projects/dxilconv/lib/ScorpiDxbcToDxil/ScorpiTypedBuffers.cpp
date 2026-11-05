@@ -1586,6 +1586,23 @@ bool RoundMinimumPrecisionConversions(DxilModule &dm) {
   return !casts.empty();
 }
 
+bool PreserveHalfRoundingInputs(DxilModule &dm) {
+  bool changed = false;
+  for (auto &function : *dm.GetModule()) for (auto &block : function) for (auto &inst : block) {
+    auto *call = dyn_cast<CallInst>(&inst);
+    if (Opcode(call) != OpCode::Round_ni || !call->getType()->isHalfTy()) continue;
+    auto *input = dyn_cast<Instruction>(call->getArgOperand(1));
+    auto *math = dyn_cast_or_null<FPMathOperator>(input);
+    if (!math || !math->getFastMathFlags().any()) continue;
+    // MSC can reassociate half arithmetic across floor: an input that rounds
+    // to 1.0 then produces 0. Preserve this rounding boundary without changing
+    // unrelated arithmetic or promoting the shader to full precision.
+    input->copyFastMathFlags(FastMathFlags());
+    changed = true;
+  }
+  return changed;
+}
+
 bool PreserveMinimumPrecisionNonfiniteConstants(DxilModule &dm) {
   if (!dm.m_ShaderFlags.GetLowPrecisionPresent() ||
       dm.m_ShaderFlags.GetUseNativeLowPrecision()) return false;
@@ -1656,6 +1673,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   const bool promotedStaticTemps = PromoteStaticIndexableTemps(dm);
   const bool widenedMinimumPrecisionIO = WidenMinimumPrecisionIO(dm);
   const bool roundedMinimumPrecision = RoundMinimumPrecisionConversions(dm);
+  const bool preservedHalfRounding = PreserveHalfRoundingInputs(dm);
   const bool preservedMinimumNonfinite = PreserveMinimumPrecisionNonfiniteConstants(dm);
   const bool flatFloatInputs = (options & SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS) && RetypeFlatFloatInputs(dm);
   const bool loweredDomainInputs = LowerDynamicDomainInputs(dm);
@@ -1806,7 +1824,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty() && appendStores.empty() && gradientBiasSamples.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty() && appendStores.empty() && gradientBiasSamples.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedHalfRounding || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
