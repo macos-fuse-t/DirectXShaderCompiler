@@ -15,6 +15,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -805,4 +806,188 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   if (requirements) *requirements = nativeCoverage ? 0 : SCORPI_MSAA8_REPLAY_COVERAGE;
   return true;
 }
+bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
+    const ScorpiPackedBlendTarget *targets, size_t count, std::string &error) {
+  using namespace hlsl;
+  using namespace llvm;
+  if (!dm.GetShaderModel()->IsPS() || !count || count > 8) {
+    error = "packed blending requires a pixel shader and 1..8 targets"; return false;
+  }
+  auto *entry = dm.GetEntryFunction();
+  auto &ctx = entry->getContext();
+  auto *f32 = Type::getFloatTy(ctx);
+  auto *ops = dm.GetOP();
+  IRBuilder<> start(&*entry->getEntryBlock().getFirstInsertionPt());
+  std::array<std::array<AllocaInst *, 4>, 8> colors{};
+  for (auto &color : colors) for (auto &component : color) {
+    component = start.CreateAlloca(f32);
+    start.CreateStore(UndefValue::get(f32), component);
+  }
+  auto opCall = [&](IRBuilder<> &b, DXIL::OpCode op, Type *type, std::vector<Value *> args) {
+    args.insert(args.begin(), b.getInt32(unsigned(op)));
+    return b.CreateCall(ops->GetOpFunc(op, type), args);
+  };
+  auto handle = [&](DXIL::ResourceClass cls, unsigned id) -> Value * {
+    auto *r = cls == DXIL::ResourceClass::CBuffer ?
+        static_cast<DxilResourceBase *>(&dm.GetCBuffer(id)) : &dm.GetSRV(id);
+    if (dm.GetShaderModel()->GetMinor() >= 6) {
+      auto binding = resource_helper::loadBindingFromResourceBase(r);
+      auto *value = resource_helper::getAsConstant(binding,
+          ops->GetResourceBindingType(), *dm.GetShaderModel());
+      auto *raw = opCall(start, DXIL::OpCode::CreateHandleFromBinding, start.getVoidTy(),
+          {value, start.getInt32(r->GetLowerBound()), start.getFalse()});
+      auto props = resource_helper::loadPropsFromResourceBase(r);
+      return opCall(start, DXIL::OpCode::AnnotateHandle, start.getVoidTy(), {raw,
+          resource_helper::getAsConstant(props, ops->GetResourcePropertiesType(), *dm.GetShaderModel())});
+    }
+    return opCall(start, DXIL::OpCode::CreateHandle, start.getVoidTy(),
+        {start.getInt8(unsigned(cls)), start.getInt32(id), start.getInt32(r->GetLowerBound()), start.getFalse()});
+  };
+  bool constant = false, dual = false;
+  std::array<Value *, 8> fetch{};
+  for (size_t i = 0; i < count; ++i) {
+    const auto &t = targets[i];
+    if (t.target >= 8 || fetch[t.target]) { error = "invalid packed blend target"; return false; }
+    for (uint32_t f : {t.src, t.dst, t.src_alpha, t.dst_alpha}) {
+      if (!((f >= 1 && f <= 11) || (f >= 14 && f <= 19))) {
+        error = "invalid packed blend factor"; return false;
+      }
+    }
+    if (!t.op || t.op > 5 || !t.op_alpha || t.op_alpha > 5) {
+      error = "invalid packed blend operation"; return false;
+    }
+    const auto inspect = [&](uint32_t f) { constant |= f == 14 || f == 15; dual |= f >= 16; };
+    if (t.op < 4) { inspect(t.src); inspect(t.dst); }
+    if (t.op_alpha < 4) { inspect(t.src_alpha); inspect(t.dst_alpha); }
+    for (auto bits : t.component_bits) if (!bits || bits > 16) {
+      error = "invalid packed UNORM precision"; return false;
+    }
+    auto srv = std::make_unique<DxilResource>();
+    srv->SetID(unsigned(dm.GetSRVs().size())); srv->SetRW(false);
+    srv->SetKind(DXIL::ResourceKind::Texture2D); srv->SetCompType(CompType::getF32());
+    srv->SetSpaceID(space); srv->SetLowerBound(t.target); srv->SetRangeSize(1);
+    srv->SetGlobalName("ScorpiPackedBlendDestination");
+    srv->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
+        {VectorType::get(f32, 4)}, "ScorpiPackedBlendDestination")->getPointerTo()));
+    fetch[t.target] = handle(DXIL::ResourceClass::SRV, dm.AddSRV(std::move(srv)));
+  }
+  Value *blendConstant = nullptr;
+  if (constant) {
+    auto cb = std::make_unique<DxilCBuffer>();
+    cb->SetID(unsigned(dm.GetCBuffers().size())); cb->SetSpaceID(space);
+    cb->SetLowerBound(0); cb->SetRangeSize(1); cb->SetSize(16);
+    cb->SetGlobalName("ScorpiBlendFactor");
+    cb->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
+        {VectorType::get(f32, 4)}, "ScorpiBlendFactor")->getPointerTo()));
+    blendConstant = handle(DXIL::ResourceClass::CBuffer, dm.AddCBuffer(std::move(cb)));
+  }
+  // Collect original exports before adding the epilogue. Use allocas across
+  // branches and early returns; mem2reg below restores SSA without GPU storage.
+  struct Export { unsigned target, row, col; CallInst *call; };
+  std::vector<Export> exports;
+  std::vector<ReturnInst *> returns;
+  for (auto &block : *entry) {
+    if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) returns.push_back(ret);
+    for (auto &inst : block) if (auto *call = dyn_cast<CallInst>(&inst)) {
+      if (!call->getCalledFunction() || !call->getCalledFunction()->getName().startswith("dx.op.storeOutput")) continue;
+      auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+      auto *row = dyn_cast<ConstantInt>(call->getArgOperand(2));
+      auto *col = dyn_cast<ConstantInt>(call->getArgOperand(3));
+      if (!id || !row || !col) { error = "dynamic packed color export"; return false; }
+      for (auto &e : dm.GetOutputSignature().GetElements()) {
+        if (e->GetID() != id->getZExtValue() || e->GetKind() != DXIL::SemanticKind::Target) continue;
+        const unsigned r = unsigned(row->getZExtValue()), c = unsigned(col->getZExtValue());
+        if (r >= e->GetSemanticIndexVec().size() || c >= 4) { error = "invalid packed color signature"; return false; }
+        unsigned target = e->GetSemanticIndexVec()[r];
+        if (target >= 8 || (!fetch[target] && !(dual && target == 1))) continue;
+        auto *value = call->getArgOperand(4); IRBuilder<> at(call);
+        if (value->getType()->isHalfTy()) value = at.CreateFPExt(value, f32);
+        if (value->getType() != f32) { error = "packed blending requires float exports"; return false; }
+        at.CreateStore(value, colors[target][c]);
+        if (fetch[target]) e->SetCompType(CompType::getF32());
+        exports.push_back({target, r, c, call});
+      }
+    }
+  }
+  for (auto *ret : returns) {
+    IRBuilder<> b(ret);
+    auto saturate = [&](Value *v) { return opCall(b, DXIL::OpCode::Saturate, f32, {v}); };
+    auto quantize = [&](Value *v, unsigned bits) {
+      auto *scale = ConstantFP::get(f32, (1u << bits) - 1);
+      // FLOAT->UNORM uses round-to-nearest (ties may go either way), rather
+      // than quantizing the source before the blend operation.
+      return b.CreateFDiv(opCall(b, DXIL::OpCode::Round_ne, f32,
+          {b.CreateFMul(saturate(v), scale)}), scale);
+    };
+    std::array<Value *, 4> src1{}, factors{};
+    for (unsigned c = 0; c < 4; ++c) {
+      if (dual) src1[c] = saturate(b.CreateLoad(colors[1][c]));
+    }
+    if (constant) {
+      auto *loaded = opCall(b, DXIL::OpCode::CBufferLoadLegacy, f32, {blendConstant, b.getInt32(0)});
+      for (unsigned c = 0; c < 4; ++c) factors[c] = saturate(b.CreateExtractValue(loaded, c));
+    }
+    for (size_t i = 0; i < count; ++i) {
+      const auto &t = targets[i];
+      std::array<Value *, 4> src{}, dst{}, result{};
+      auto *loaded = opCall(b, DXIL::OpCode::TextureLoad, f32,
+          {fetch[t.target], b.getInt32(0), b.getInt32(0), b.getInt32(0),
+           UndefValue::get(b.getInt32Ty()), b.getInt32(0), b.getInt32(0), UndefValue::get(b.getInt32Ty())});
+      for (unsigned c = 0; c < 4; ++c) {
+        src[c] = saturate(b.CreateLoad(colors[t.target][c]));
+        dst[c] = quantize(b.CreateExtractValue(loaded, c), t.component_bits[c]);
+      }
+      auto factor = [&](uint32_t f, unsigned c) -> Value * {
+        Value *one = ConstantFP::get(f32, 1.0), *zero = ConstantFP::get(f32, 0.0);
+        auto inverse = [&](Value *v) { return b.CreateFSub(one, v); };
+        switch (f) {
+        case 1: return zero; case 2: return one;
+        case 3: return src[c]; case 4: return inverse(src[c]);
+        case 5: return src[3]; case 6: return inverse(src[3]);
+        case 7: return dst[3]; case 8: return inverse(dst[3]);
+        case 9: return dst[c]; case 10: return inverse(dst[c]);
+        case 11: return c == 3 ? one : opCall(b, DXIL::OpCode::FMin, f32, {src[3], inverse(dst[3])});
+        case 14: return factors[c]; case 15: return inverse(factors[c]);
+        case 16: return src1[c]; case 17: return inverse(src1[c]);
+        case 18: return src1[3]; case 19: return inverse(src1[3]);
+        }
+        llvm_unreachable("validated blend factor");
+      };
+      for (unsigned c = 0; c < 4; ++c) {
+        const auto op = c == 3 ? t.op_alpha : t.op;
+        Value *v;
+        if (op >= 4) v = opCall(b, op == 4 ? DXIL::OpCode::FMin : DXIL::OpCode::FMax, f32, {src[c], dst[c]});
+        else {
+          auto *s = b.CreateFMul(src[c], factor(c == 3 ? t.src_alpha : t.src, c));
+          auto *d = b.CreateFMul(dst[c], factor(c == 3 ? t.dst_alpha : t.dst, c));
+          v = op == 1 ? b.CreateFAdd(s, d) : op == 2 ? b.CreateFSub(s, d) : b.CreateFSub(d, s);
+        }
+        result[c] = quantize(v, t.component_bits[c]);
+      }
+      // One export per declared component, rather than one per original store
+      // site: the captured SSA value already selects the executed branch.
+      std::array<bool, 4> emitted{};
+      for (const auto &e : exports) if (e.target == t.target && !emitted[e.col]) {
+        emitted[e.col] = true;
+        b.CreateCall(ops->GetOpFunc(DXIL::OpCode::StoreOutput, f32),
+            {b.getInt32(unsigned(DXIL::OpCode::StoreOutput)), e.call->getArgOperand(1),
+             b.getInt32(e.row), b.getInt8(e.col), result[e.col]});
+      }
+    }
+  }
+  for (const auto &e : exports) e.call->eraseFromParent();
+  DominatorTree dominators; dominators.recalculate(*entry);
+  std::vector<AllocaInst *> allocas;
+  for (auto &color : colors) for (auto *v : color) allocas.push_back(v);
+  PromoteMemToReg(allocas, dominators);
+  for (auto it = dm.GetModule()->begin(); it != dm.GetModule()->end();) {
+    auto &fn = *it++;
+    if (fn.isDeclaration() && fn.getName().startswith("dx.op.") && fn.use_empty()) {
+      dm.RemoveFunction(&fn); fn.eraseFromParent();
+    }
+  }
+  dm.CollectShaderFlagsForModule();
+  return true;
+}
+
 } // namespace scorpi

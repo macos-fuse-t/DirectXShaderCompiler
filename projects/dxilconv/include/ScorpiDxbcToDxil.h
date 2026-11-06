@@ -154,6 +154,19 @@ ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
     uint32_t sample_count, void **binary, size_t *binary_size,
     char *error, size_t error_size);
 
+// Per-fragment blending for packed UNORM targets. The caller disables native
+// blending for these slots and maps Texture2D SRVs in register_space to Metal
+// framebuffer fetch. Constant blend factors use cbuffer b0 in that space.
+struct ScorpiPackedBlendTarget {
+  uint32_t target, src, dst, op, src_alpha, dst_alpha, op_alpha;
+  uint32_t component_bits[4];
+};
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreatePackedBlendShader(const void *code, size_t size,
+    uint32_t register_space, const ScorpiPackedBlendTarget *targets,
+    size_t target_count, void **binary, size_t *binary_size,
+    char *error, size_t error_size);
+
 // Inspect the original output signature, before backend-generated masks.
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectOutputCoverage(const void *code, size_t size,
