@@ -494,7 +494,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 #define SCORPI_SAMPLING_GRADIENT_LOD_BIAS 256u
 // Only accesses reaching a custom-border sampler need its filtered fallback.
 #define SCORPI_SAMPLING_CUSTOM_BORDER 512u
+#define SCORPI_SAMPLING_PIXEL_COORDINATES 1024u
 #define SCORPI_SAMPLER_CUSTOM_BORDER_BIT (1u << 28)
+#define SCORPI_SAMPLER_NON_NORMALIZED_BIT (1u << 29)
 // Private sampler metadata stores RGBA in words 0, 1, 6, 7. Native descriptor
 // bytes remain unchanged; these words are unused by ordinary sampler lowering.
 // Renderer selection must account for every reachable typed SRV/UAV prefix.

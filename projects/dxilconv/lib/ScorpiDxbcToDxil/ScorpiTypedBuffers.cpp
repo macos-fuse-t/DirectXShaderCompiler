@@ -770,6 +770,9 @@ public:
     policySeen.clear();
     const bool customBorder = bindingPolicy &&
         (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, policySeen) & SCORPI_SAMPLING_CUSTOM_BORDER);
+    policySeen.clear();
+    const bool pixelCoordinates = bindingPolicy &&
+        (SamplingRequirements(dm, call->getArgOperand(2), policy, policyCount, policySeen) & SCORPI_SAMPLING_PIXEL_COORDINATES);
     if(kind==ResourceKind::TextureCube || kind==ResourceKind::TextureCubeArray){RewriteCubeSample(call,kind);return;}
     std::vector<User*> originalUsers(call->user_begin(),call->user_end());
     const auto opcode = Opcode(call);
@@ -798,6 +801,8 @@ public:
       Value *gradientX[3], *gradientY[3];
       for (unsigned axis=0;axis<axes;++axis) {
         auto *n = b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy());
+        if (pixelCoordinates) n = b.CreateSelect(b.CreateICmpNE(b.CreateAnd(state,b.getInt32(SCORPI_SAMPLER_NON_NORMALIZED_BIT)),b.getInt32(0)),
+            ConstantFP::get(b.getFloatTy(),1), n);
         // Derivatives must execute before the sampler-mode branch: descriptor
         // indexing can make that branch non-uniform within a pixel quad.
         auto *gx = implicit ? Call(b,OpCode::DerivCoarseX,b.getFloatTy(),{call->getArgOperand(3+axis)}) : call->getArgOperand(10+axis);
@@ -950,7 +955,9 @@ public:
         Value *valid = b.getTrue();
         for (unsigned axis = 0; axis < axes; ++axis) {
           auto *n = b.CreateUIToFP(b.CreateExtractValue(size,axis),b.getFloatTy());
-          auto *coordinate = b.CreateFSub(b.CreateFMul(call->getArgOperand(3+axis),n),b.CreateSelect(linear,f(.5),f(0)));
+          Value *scale = n;
+          if (pixelCoordinates) scale = b.CreateSelect(b.CreateICmpNE(b.CreateAnd(state,b.getInt32(SCORPI_SAMPLER_NON_NORMALIZED_BIT)),b.getInt32(0)), f(1), n);
+          auto *coordinate = b.CreateFSub(b.CreateFMul(call->getArgOperand(3+axis),scale),b.CreateSelect(linear,f(.5),f(0)));
           if (!isa<UndefValue>(call->getArgOperand(7+axis)))
             coordinate=b.CreateFAdd(coordinate,b.CreateSIToFP(call->getArgOperand(7+axis),b.getFloatTy()));
           auto *first = unary(OpCode::Round_ni,coordinate);
@@ -1000,7 +1007,9 @@ public:
         length[axis] = b.CreateExtractValue(size, axis);
         Value *normalized=call->getArgOperand(3+axis);
         if(anisoPosition)normalized=b.CreateFAdd(normalized,b.CreateFMul(anisoPosition,anisoDirection[axis]));
-        auto *coord = b.CreateFMul(normalized, b.CreateUIToFP(length[axis], b.getFloatTy()));
+        Value *scale = b.CreateUIToFP(length[axis], b.getFloatTy());
+        if (pixelCoordinates) scale = b.CreateSelect(b.CreateICmpNE(b.CreateAnd(state,b.getInt32(SCORPI_SAMPLER_NON_NORMALIZED_BIT)),b.getInt32(0)), f(1), scale);
+        auto *coord = b.CreateFMul(normalized, scale);
         coord = b.CreateFSub(coord, b.CreateSelect(linear, f(.5), f(0)));
         auto *floor = unary(OpCode::Round_ni, coord);
         fraction[axis] = b.CreateSelect(linear,b.CreateFSub(coord,floor),f(0));
