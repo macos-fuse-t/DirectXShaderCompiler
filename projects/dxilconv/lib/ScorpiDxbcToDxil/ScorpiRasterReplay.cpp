@@ -347,7 +347,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
                                     uint32_t registerSpace,
                                     uint32_t sampleCount, uint32_t sampleMask,
                                     std::string &error, bool generated, bool attachments, bool alphaToCoverage,
-                                    uint32_t *requirements) {
+                                    uint32_t *requirements, bool colorReplay) {
   using namespace llvm;
   using namespace hlsl;
   auto fail = [&](const char *why) {
@@ -366,8 +366,8 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       for (unsigned row = 0; row < e->GetSemanticIndexVec().size(); ++row)
         if (e->GetSemanticIndexVec()[row] == 0) { alphaID = e->GetID(); alphaRow = row; }
   }
-  alphaToCoverage &= attachments && alphaID != UINT32_MAX;
-  if (alphaToCoverage && dm.m_ShaderFlags.GetForceEarlyDepthStencil())
+  alphaToCoverage &= (attachments || colorReplay) && alphaID != UINT32_MAX;
+  if (attachments && alphaToCoverage && dm.m_ShaderFlags.GetForceEarlyDepthStencil())
     return fail("8x early-depth/stencil with alpha-to-coverage requires pre-test masking");
   if (attachments && dm.m_ShaderFlags.GetForceEarlyDepthStencil() && sampleMask != 255)
     return fail("8x early-depth/stencil with partial OM sample mask requires pre-test masking");
@@ -423,6 +423,8 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       originalCalls.push_back(call);
     }
 
+  if (colorReplay && sampleFrequency)
+    return fail("forced-sample attachment replay requires a pixel-frequency shader");
   auto &ctx = entry->getContext();
   // Pixel-frequency UAV values cannot be independently recomputed for each
   // physical sample group. Until result broadcast is available, reject those
@@ -436,6 +438,14 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   auto *i32 = Type::getInt32Ty(ctx);
   auto *f32 = Type::getFloatTy(ctx);
   IRBuilder<> b(&*entry->getEntryBlock().getFirstInsertionPt());
+  std::vector<AllocaInst *> colorValues;
+  if (colorReplay) {
+    for (unsigned i = 0; i < 32; ++i)
+      colorValues.push_back(b.CreateAlloca(i32, nullptr, "replay.color"));
+    for (const auto &e : dm.GetOutputSignature().GetElements())
+      if (e->GetKind() != DXIL::SemanticKind::Target && e->GetKind() != DXIL::SemanticKind::Coverage)
+        return fail("forced-sample replay cannot export depth or stencil");
+  }
   auto *alpha = alphaToCoverage ? b.CreateAlloca(f32, nullptr, "scorpi.alpha") : nullptr;
   if (alpha) b.CreateStore(ConstantFP::get(f32, 1.0), alpha);
   auto opCall = [&](OpCode op, Type *type, std::vector<Value *> args) {
@@ -657,37 +667,40 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   for (auto *call : originalCalls) {
     auto op = static_cast<OpCode>(
         cast<ConstantInt>(call->getArgOperand(0))->getZExtValue());
-    bool centroidLoad = false, primitiveLoad = false;
+    bool centroidLoad = false, primitiveLoad = false, centerLoad = false, positionLoad = false;
     if (op == OpCode::LoadInput) {
       auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
       if (id)
         for (const auto &e : dm.GetInputSignature().GetElements())
           if (e->GetID() == id->getZExtValue()) {
             centroidLoad = e->GetInterpolationMode()->IsAnyCentroid();
+            centerLoad = colorReplay && !centroidLoad && e->GetKind() == DXIL::SemanticKind::Arbitrary &&
+                e->GetInterpolationMode()->GetKind() != DXIL::InterpolationMode::Constant;
+            positionLoad = colorReplay && e->GetKind() == DXIL::SemanticKind::Position;
             primitiveLoad = e->GetKind() == DXIL::SemanticKind::PrimitiveID;
           }
     }
-    if (attachments && op == OpCode::RenderTargetGetSampleCount) {
-      call->replaceAllUsesWith(b.getInt32(sampleCount));
+    if ((attachments || colorReplay) && op == OpCode::RenderTargetGetSampleCount) {
+      call->replaceAllUsesWith(b.getInt32(colorReplay ? 1 : sampleCount));
       call->eraseFromParent();
-    } else if (attachments && op == OpCode::RenderTargetGetSamplePosition) {
+    } else if ((attachments || colorReplay) && op == OpCode::RenderTargetGetSamplePosition) {
       IRBuilder<> at(call);
       Value *position = UndefValue::get(call->getType());
       for (unsigned axis=0; axis<2; ++axis)
         position = at.CreateInsertValue(position,
-            at.CreateFMul(at.CreateSIToFP(offsetAtSample(at,call->getArgOperand(1),axis),f32),
+            at.CreateFMul(at.CreateSIToFP(colorReplay ? at.getInt32(0) : offsetAtSample(at,call->getArgOperand(1),axis),f32),
                 ConstantFP::get(f32,1.0/16)),axis);
       call->replaceAllUsesWith(position);
       call->eraseFromParent();
     } else if (op == OpCode::EvalSampleIndex || op == OpCode::EvalCentroid ||
-        centroidLoad) {
+        centroidLoad || centerLoad) {
       IRBuilder<> at(call);
       auto *ox = op == OpCode::EvalSampleIndex
                      ? offsetAtSample(at, call->getArgOperand(4), 0)
-                     : centroidOffset[0];
+                     : centerLoad ? b.getInt32(0) : centroidOffset[0];
       auto *oy = op == OpCode::EvalSampleIndex
                      ? offsetAtSample(at, call->getArgOperand(4), 1)
-                     : centroidOffset[1];
+                     : centerLoad ? b.getInt32(0) : centroidOffset[1];
       auto *value = at.CreateCall(
           ops->GetOpFunc(OpCode::EvalSnapped, call->getType()),
           {at.getInt32(static_cast<unsigned>(OpCode::EvalSnapped)),
@@ -695,6 +708,20 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
            call->getArgOperand(3), ox, oy});
       call->replaceAllUsesWith(value);
       call->eraseFromParent();
+    } else if (positionLoad) {
+      auto *component = dyn_cast<ConstantInt>(call->getArgOperand(3));
+      if (!component) return fail("dynamic position component in forced-sample replay");
+      // Metal keeps position Z/W at pixel frequency even when SampleIndex
+      // selects the replay lane. Only XY needs an explicit pixel center.
+      if (component->getZExtValue() < 2) {
+        std::vector<Use *> users;
+        for (auto &use : call->uses()) users.push_back(&use);
+        IRBuilder<> at(call->getNextNode());
+        auto *floor = at.CreateCall(ops->GetOpFunc(OpCode::Round_ni, f32),
+            {at.getInt32(unsigned(OpCode::Round_ni)), call});
+        auto *value = at.CreateFAdd(floor, ConstantFP::get(f32, 0.5));
+        for (auto *use : users) use->set(value);
+      }
     } else if (op == OpCode::PrimitiveID || primitiveLoad) {
       call->replaceAllUsesWith(primitiveID);
       call->eraseFromParent();
@@ -725,6 +752,27 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
             IRBuilder<> at(call);
             at.CreateStore(call->getArgOperand(4), outputCoverage);
           }
+      if (colorReplay) {
+        auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+        auto *row = dyn_cast<ConstantInt>(call->getArgOperand(2));
+        auto *column = dyn_cast<ConstantInt>(call->getArgOperand(3));
+        if (!id || !row || !column) return fail("dynamic output in forced-sample replay");
+        for (const auto &e : dm.GetOutputSignature().GetElements())
+          if (e->GetID() == id->getZExtValue() && e->GetKind() == DXIL::SemanticKind::Target) {
+            if (row->getZExtValue() >= e->GetSemanticIndexVec().size() || column->getZExtValue() >= 4)
+              return fail("invalid forced-sample output signature");
+            unsigned target = e->GetSemanticIndexVec()[row->getZExtValue()];
+            if (target >= 8) return fail("forced-sample target index exceeds eight");
+            IRBuilder<> at(call);
+            Value *value = call->getArgOperand(4);
+            if (value->getType()->isHalfTy()) value = at.CreateFPExt(value, f32);
+            if (value->getType()->isFloatTy()) value = at.CreateBitCast(value, i32);
+            if (value->getType()->isIntegerTy(16)) value = e->GetCompType().IsSIntTy()
+                ? at.CreateSExt(value, i32) : at.CreateZExt(value, i32);
+            if (value->getType() != i32) return fail("unsupported forced-sample output type");
+            at.CreateStore(value, colorValues[target*4+column->getZExtValue()]);
+          }
+      }
       // This variant is used only with no color or depth/stencil attachments.
       // Outputs are discarded, but computations leading to them (including
       // UAV side effects) remain subject to the normal replay predicates.
@@ -734,7 +782,33 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
       PredicateWrite(call, at.CreateLoad(alive));
     }
   }
-  if (!attachments && earlyDepth) {
+  if (colorReplay) {
+    std::vector<ReturnInst *> returns;
+    for (auto &block : *entry)
+      if (auto *ret = dyn_cast<ReturnInst>(block.getTerminator())) returns.push_back(ret);
+    for (auto *ret : returns) {
+      IRBuilder<> at(ret);
+      auto *valid = at.CreateAnd(at.CreateLoad(alive),
+          at.CreateICmpNE(at.CreateAnd(at.CreateLoad(outputCoverage), at.getInt32(1)), at.getInt32(0)));
+      // A forced-sample RTV has one output sample. Use a monotonic half-alpha
+      // threshold, after PS effects/discard; explicit SV_Coverage disables A2C.
+      if (alpha) valid = at.CreateAnd(valid,
+          at.CreateFCmpOGE(at.CreateLoad(alpha), ConstantFP::get(f32, 0.5)));
+      auto *base = at.CreateMul(element, at.getInt32(132));
+      auto store = [&](unsigned offset, Value *v0, Value *v1, Value *v2, Value *v3, unsigned mask) {
+        auto *write = at.CreateCall(ops->GetOpFunc(OpCode::BufferStore, i32),
+            {at.getInt32(unsigned(OpCode::BufferStore)), visibilityHandle,
+             at.CreateAdd(base, at.getInt32(offset)), UndefValue::get(i32),
+             v0, v1, v2, v3, at.getInt8(mask)});
+        PredicateWrite(write, valid);
+        at.SetInsertPoint(ret);
+      };
+      for (unsigned target = 0; target < 8; ++target)
+        store(4+target*16, at.CreateLoad(colorValues[target*4]), at.CreateLoad(colorValues[target*4+1]),
+            at.CreateLoad(colorValues[target*4+2]), at.CreateLoad(colorValues[target*4+3]), 15);
+      store(0, at.getInt32(1), UndefValue::get(i32), UndefValue::get(i32), UndefValue::get(i32), 1);
+    }
+  } else if (!attachments && earlyDepth) {
     // Insert before original shader work, so neither discard nor output
     // coverage can reduce a FORCE_EARLY_DEPTH_STENCIL query.
     IRBuilder<> at(queryStart);
@@ -792,6 +866,7 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   dominators.recalculate(*entry);
   PromoteMemToReg({alive, outputCoverage}, dominators);
   if (alpha) PromoteMemToReg({alpha}, dominators);
+  if (!colorValues.empty()) PromoteMemToReg(colorValues, dominators);
   dm.CollectShaderFlagsForModule();
   // DXIL rejects declarations left behind after replacing an intrinsic.
   for (auto it = module->begin(); it != module->end();) {

@@ -248,6 +248,19 @@ ScorpiCreateRasterReplayPixelShader(const void *code, size_t size,
                                   size_t *binary_size, char *error_message,
                                   size_t error_message_size);
 
+// Forced-sample attachment replay: one selected covered lane writes a per-pixel
+// record to private u1. Each record has a validity word followed by eight uint4
+// target values (132 bytes). The caller clears records, completes every sample
+// group, then composites the records to single-sample attachments in order.
+enum {
+  SCORPI_FORCED_SAMPLE_GENERATED = 1,
+  SCORPI_FORCED_SAMPLE_ALPHA_TO_COVERAGE = 2
+};
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateForcedSamplePixelShader(const void *code, size_t size,
+    uint32_t register_space, uint32_t sample_count, uint32_t options, void **binary,
+    size_t *binary_size, char *error_message, size_t error_message_size);
+
 // Private tessellation capture linkage. mode 1 rewrites DS outputs to uint4
 // key/payload rows; mode 2 produces the matching ordered capture GS;
 // mode 3 replays compacted capture through a VS with the original DS signature;

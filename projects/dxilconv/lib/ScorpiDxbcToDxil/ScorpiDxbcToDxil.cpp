@@ -1175,7 +1175,7 @@ extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
 static int CreateRasterReplayShader(
     const void *code, size_t size, uint32_t register_space,
     uint32_t sample_count, uint32_t sample_mask, void **binary,
-    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false, bool attachments = false, bool alpha_to_coverage = false, uint32_t *requirements = nullptr, bool pixel_draw_ids = false) {
+    size_t *binary_size, char *error_message, size_t error_message_size, bool vertex, bool generated = false, bool geometry_link = false, bool attachments = false, bool alpha_to_coverage = false, uint32_t *requirements = nullptr, bool pixel_draw_ids = false, bool color_replay = false) {
   SetError(error_message, error_message_size, "");
   if (!binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr;
@@ -1198,7 +1198,7 @@ static int CreateRasterReplayShader(
     std::string error;
     if (!dxil || !(geometry_link ? scorpi::LowerGeometryPrimitiveId(*dxil, error)
         : (vertex || pixel_draw_ids) ? scorpi::PrepareRasterReplayDrawIds(*dxil, register_space, error)
-        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated, attachments, alpha_to_coverage, requirements)))
+        : scorpi::PrepareRasterReplayPixelShader(*dxil, register_space, sample_count, sample_mask, error, generated, attachments, alpha_to_coverage, requirements, color_replay)))
       throw std::runtime_error(error.empty() ? "missing DXIL module" : error);
     // The replay transforms change signatures. Serialized ViewID state still
     // describes the source signature and cannot be reused for the new PSV.
@@ -1239,6 +1239,16 @@ extern "C" int ScorpiCreateRasterReplayPixelShader(
     uint32_t mask, void **binary, size_t *binary_size, char *error, size_t error_size) {
   return CreateRasterReplayShader(code, size, space, samples, mask, binary,
       binary_size, error, error_size, false);
+}
+
+extern "C" int ScorpiCreateForcedSamplePixelShader(
+    const void *code, size_t size, uint32_t space, uint32_t samples, uint32_t options,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (options & ~(SCORPI_FORCED_SAMPLE_GENERATED | SCORPI_FORCED_SAMPLE_ALPHA_TO_COVERAGE))
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  return CreateRasterReplayShader(code, size, space, samples, UINT32_MAX, binary,
+      binary_size, error, error_size, false, (options & SCORPI_FORCED_SAMPLE_GENERATED) != 0,
+      false, false, (options & SCORPI_FORCED_SAMPLE_ALPHA_TO_COVERAGE) != 0, nullptr, false, true);
 }
 
 extern "C" int ScorpiCreateRasterReplayVertexShader(
