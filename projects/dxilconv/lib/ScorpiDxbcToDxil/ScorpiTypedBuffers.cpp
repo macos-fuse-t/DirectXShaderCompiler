@@ -540,6 +540,107 @@ public:
     return b.CreateUIToFP(result,value->getType());
   }
 
+  // Metal's texture LOD query is fragment-only. Keep the workaround local to
+  // CalculateLOD in compute: native quad derivatives and texture dimensions
+  // form the footprint, while the existing sampler metadata supplies D3D's
+  // bias, clamps and mip-filter rounding. Ordinary sample instructions stay
+  // native and shaders without this query acquire no extra instructions.
+  void RewriteComputeLOD(CallInst *call, ResourceKind kind) {
+    auto *texture = call->getArgOperand(1);
+    auto *sampler = call->getArgOperand(2);
+    auto *state = Word(sampler, 2);
+    auto *bias = Word(sampler, 4);
+    auto *minimum = Word(sampler, 5);
+    auto *maximum = Word(sampler, 3);
+    auto *resourceMinimum = Word(texture, 4);
+    IRBuilder<> b(call);
+    auto f = [&](double x) { return ConstantFP::get(b.getFloatTy(), x); };
+    auto op = [&](OpCode code, Value *x) { return Call(b, code, b.getFloatTy(), {x}); };
+    auto max = [&](Value *x, Value *y) { return Call(b, OpCode::FMax, b.getFloatTy(), {x, y}); };
+    auto min = [&](Value *x, Value *y) { return Call(b, OpCode::FMin, b.getFloatTy(), {x, y}); };
+    auto *dimensions = Call(b, OpCode::GetDimensions, b.getVoidTy(), {texture, b.getInt32(0)});
+    const bool cube = kind == ResourceKind::TextureCube || kind == ResourceKind::TextureCubeArray;
+    const unsigned axes = cube || kind == ResourceKind::Texture3D                                   ? 3
+                          : kind == ResourceKind::Texture1D || kind == ResourceKind::Texture1DArray ? 1
+                                                                                                    : 2;
+    Value *coord[3]{}, *gradient[2][3]{};
+    for (unsigned c = 0; c < axes; ++c) {
+      coord[c] = call->getArgOperand(3 + c);
+      gradient[0][c] = op(OpCode::DerivCoarseX, coord[c]);
+      gradient[1][c] = op(OpCode::DerivCoarseY, coord[c]);
+    }
+    Value *length[2] = {f(0), f(0)};
+    Value *scaled[2][3] = {{f(0), f(0), f(0)}, {f(0), f(0), f(0)}};
+    if (cube) {
+      auto *ax = op(OpCode::FAbs, coord[0]), *ay = op(OpCode::FAbs, coord[1]), *az = op(OpCode::FAbs, coord[2]);
+      auto *z = b.CreateAnd(b.CreateFCmpOGE(az, ax), b.CreateFCmpOGE(az, ay));
+      auto *y = b.CreateAnd(b.CreateNot(z), b.CreateFCmpOGE(ay, ax));
+      auto choose = [&](Value **v) { return b.CreateSelect(z, v[2], b.CreateSelect(y, v[1], v[0])); };
+      auto *major = op(OpCode::FAbs, choose(coord));
+      auto *sign = b.CreateSelect(b.CreateFCmpOLT(choose(coord), f(0)), f(-1), f(1));
+      Value *uv[2] = {b.CreateSelect(b.CreateOr(z, y), coord[0], coord[2]), b.CreateSelect(y, coord[2], coord[1])};
+      auto *scale = b.CreateFMul(b.CreateUIToFP(b.CreateExtractValue(dimensions, 0), b.getFloatTy()), f(.5));
+      auto *denominator = max(b.CreateFMul(major, major), f(1e-30));
+      for (unsigned axis = 0; axis < 2; ++axis) {
+        auto *dm = b.CreateFMul(choose(gradient[axis]), sign);
+        Value *g[2] = {b.CreateSelect(b.CreateOr(z, y), gradient[axis][0], gradient[axis][2]),
+                       b.CreateSelect(y, gradient[axis][2], gradient[axis][1])};
+        for (unsigned c = 0; c < 2; ++c) {
+          auto *d = b.CreateFMul(
+              scale, b.CreateFDiv(b.CreateFSub(b.CreateFMul(g[c], major), b.CreateFMul(uv[c], dm)), denominator));
+          scaled[axis][c] = d;
+          length[axis] = b.CreateFAdd(length[axis], b.CreateFMul(d, d));
+        }
+      }
+    } else {
+      for (unsigned axis = 0; axis < 2; ++axis)
+        for (unsigned c = 0; c < axes; ++c) {
+          auto *size = b.CreateUIToFP(b.CreateExtractValue(dimensions, c), b.getFloatTy());
+          auto *d = b.CreateFMul(gradient[axis][c], size);
+          scaled[axis][c] = d;
+          length[axis] = b.CreateFAdd(length[axis], b.CreateFMul(d, d));
+        }
+    }
+    Value *squaredFootprint = max(length[0], length[1]);
+    if (!cube) {
+      // The eigenvalues of J*J^T are the squared principal ellipse axes.
+      // This also covers nonorthogonal and volume gradients without changing
+      // native sample filtering. Cube anisotropy may use trilinear LOD.
+      Value *dot = f(0);
+      for (unsigned c = 0; c < 3; ++c)
+        dot = b.CreateFAdd(dot, b.CreateFMul(scaled[0][c], scaled[1][c]));
+      auto *delta = b.CreateFSub(length[0], length[1]);
+      auto *discriminant =
+          op(OpCode::Sqrt, b.CreateFAdd(b.CreateFMul(delta, delta), b.CreateFMul(f(4), b.CreateFMul(dot, dot))));
+      auto *sum = b.CreateFAdd(length[0], length[1]);
+      auto *major = b.CreateFMul(f(.5), b.CreateFAdd(sum, discriminant));
+      auto *minor = max(f(0), b.CreateFMul(f(.5), b.CreateFSub(sum, discriminant)));
+      auto *anisotropy = b.CreateUIToFP(
+          b.CreateAdd(b.CreateAnd(b.CreateLShr(state, b.getInt32(20)), b.getInt32(15)), b.getInt32(1)), b.getFloatTy());
+      auto *anisoFootprint = max(minor, b.CreateFDiv(major, b.CreateFMul(anisotropy, anisotropy)));
+      squaredFootprint = b.CreateSelect(b.CreateICmpNE(b.CreateAnd(state, b.getInt32(0x40)), b.getInt32(0)),
+                                        anisoFootprint, squaredFootprint);
+    }
+    Value *rawLOD =
+        b.CreateFAdd(b.CreateFMul(op(OpCode::Log, squaredFootprint), f(.5)), b.CreateBitCast(bias, b.getFloatTy()));
+    Value *lod = rawLOD;
+    auto *clamped = call->getArgOperand(6);
+    auto *last = b.CreateUIToFP(b.CreateSub(b.CreateExtractValue(dimensions, 3), b.getInt32(1)), b.getFloatTy());
+    auto *limited =
+        min(max(max(min(lod, b.CreateBitCast(maximum, b.getFloatTy())), b.CreateBitCast(minimum, b.getFloatTy())),
+                b.CreateBitCast(resourceMinimum, b.getFloatTy())),
+            last);
+    lod = max(limited, f(0));
+    auto *mipLinear = b.CreateICmpNE(b.CreateAnd(state, b.getInt32(1)), b.getInt32(0));
+    lod = b.CreateSelect(mipLinear, lod, op(OpCode::Round_ni, b.CreateFAdd(lod, f(.5))));
+    auto *empty = b.CreateFCmpOGT(b.CreateBitCast(resourceMinimum, b.getFloatTy()), last);
+    lod = b.CreateSelect(empty, f(0), lod);
+    lod = b.CreateSelect(clamped, lod, rawLOD);
+    lod = b.CreateSelect(b.CreateICmpEQ(b.CreateExtractValue(dimensions, 0), b.getInt32(0)), f(0), lod);
+    call->replaceAllUsesWith(lod);
+    call->eraseFromParent();
+  }
+
   void RewriteGradientBias(CallInst *call) {
     auto *bias = Word(call->getArgOperand(2), 4);
     IRBuilder<> b(call);
@@ -1744,6 +1845,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
   std::vector<CallInst *> calls;
   std::vector<std::pair<CallInst *, ResourceKind>> samples;
   std::vector<CallInst *> gradientBiasSamples;
+  std::vector<std::pair<CallInst *, ResourceKind>> computeLODs;
   std::vector<CallInst *> textureLoads;
   std::vector<CallInst *> bufferLoads;
   std::vector<CallInst *> rawLoads;
@@ -1783,6 +1885,10 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         if (RawHandleHasBounds(dm, call->getArgOperand(1), bindings, count, seen))
           rawLoads.push_back(call);
       }
+    }
+    if (op == OpCode::CalculateLOD && dm.GetShaderModel()->IsCS()) {
+      std::set<Value *> seen;
+      computeLODs.emplace_back(call, Kind(call->getArgOperand(1),dm,seen));
     }
     if(op==OpCode::CheckAccessFullyMapped)feedbackChecks.push_back(call);
     if (op == OpCode::BufferLoad || op == OpCode::RawBufferLoad) bufferLoads.push_back(call);
@@ -1889,7 +1995,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
         }), textureLoads.end());
   }
   if (rawLoads.empty() && calls.empty() && samples.empty() && textureLoads.empty() && bufferLoads.empty() &&
-      nullBufferAccesses.empty() && appendStores.empty() && gradientBiasSamples.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedHalfRounding || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
+      nullBufferAccesses.empty() && appendStores.empty() && gradientBiasSamples.empty() && computeLODs.empty()) return inlinedSubroutines || inlinedHullAtomics || promotedStaticTemps || widenedMinimumPrecisionIO || roundedMinimumPrecision || preservedHalfRounding || preservedMinimumNonfinite || flatFloatInputs || loweredDomainInputs || flushedMath || fixedTrig || loweredIntegerArithmetic;
   // Only statuses whose producers are replaced use our canonical 0/1 ABI.
   // Leave unrelated instructions' opaque statuses to the native converter.
   for(auto *check:feedbackChecks){
@@ -1938,7 +2044,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
       Lowering::ReplaceStatus(call, ConstantInt::getTrue(call->getContext()));
       return true;
     }), bufferLoads.end());
-  if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty() || !gradientBiasSamples.empty()) {
+  if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty() || !gradientBiasSamples.empty() || !computeLODs.empty()) {
     if (!bindings || !count || space == UINT32_MAX)
       throw std::runtime_error("typed-buffer metadata root binding missing");
     Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
@@ -1955,6 +2061,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
     // Form fallback footprints from the original gradients first: their LOD
     // already includes sampler bias. Repair only the retained native sample.
     for (auto *call : gradientBiasSamples) lowering.RewriteGradientBias(call);
+    for (auto &query : computeLODs) lowering.RewriteComputeLOD(query.first,query.second);
   }
   for (auto *call : rawLoads) BoundRawLoadComponents(dm, call);
   // The native converter elides constant-offset raw/structured buffer bounds
