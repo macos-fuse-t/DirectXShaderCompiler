@@ -466,6 +466,11 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // The native converter omits sampler bias for explicit gradients. Scale only
 // gradients whose bound sampler has nonzero bias; keep native filtering.
 #define SCORPI_SAMPLING_GRADIENT_LOD_BIAS 256u
+// Only accesses reaching a custom-border sampler need its filtered fallback.
+#define SCORPI_SAMPLING_CUSTOM_BORDER 512u
+#define SCORPI_SAMPLER_CUSTOM_BORDER_BIT (1u << 28)
+// Private sampler metadata stores RGBA in words 0, 1, 6, 7. Native descriptor
+// bytes remain unchanged; these words are unused by ordinary sampler lowering.
 // Renderer selection must account for every reachable typed SRV/UAV prefix.
 #define SCORPI_SHADER_NATIVE_TYPED_BUFFERS 8u
 // Keep native typed addressing, repairing dimensions and logical bounds
