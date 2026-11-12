@@ -227,6 +227,7 @@ class Lowering {
   uint32_t descriptorResourceIDs[2];
   bool minmaxFiltering;
   bool nativeTextures;
+  bool nativeLinearBorder;
   bool bindingPolicy;
   const ScorpiSamplingRequirement *policy;
   size_t policyCount;
@@ -298,6 +299,7 @@ public:
       const ScorpiSamplingRequirement *p, size_t pn) : dm(module), bindings(ranges), count(n), space(s),
       minmaxFiltering(!(options & (SCORPI_SHADER_NO_MINMAX_FILTERING | SCORPI_SHADER_NATIVE_TEXTURES))),
       nativeTextures(options & SCORPI_SHADER_NATIVE_TEXTURES),
+      nativeLinearBorder(options & SCORPI_SHADER_NATIVE_LINEAR_BORDER),
       bindingPolicy(options & SCORPI_SHADER_BINDING_POLICY), policy(p), policyCount(pn) {
     (void)self; // ABI v3 never subtracts GPU addresses.
     auto &ctx = dm.GetModule()->getContext();
@@ -1044,6 +1046,126 @@ public:
     auto *mip0 = b.CreateFPToUI(b.CreateSelect(mipLinear, base, unary(OpCode::Round_ni, b.CreateFAdd(lod,f(.5)))), b.getInt32Ty());
     auto *useMip1 = b.CreateAnd(mipLinear, b.CreateFCmpONE(lod, base));
     const bool array = kind == ResourceKind::Texture2DArray;
+    BasicBlock *borderFilterExit = nullptr;
+    Value *borderFilterResult = nullptr;
+    // Ordinary linear filtering is linear in the border color as well as in
+    // the texels. Keep each mip's filtering in the texture unit and add only
+    // the custom border's weighted contribution. The native custom-color
+    // sampler uses transparent black; format defaults and SRV swizzles must
+    // be applied to both that color and the requested color.
+    //
+    // Sample the integer mips separately: native fractional-LOD precision
+    // must not disagree with the software border-weight blend. Keep the
+    // existing path for sparse views, pixel coordinates, nonzero bias, mixed
+    // min/mag modes and sampler clamps that could alter those integer levels.
+    auto *sparse = Word(texture, 0);
+    if (nativeLinearBorder && customBorder && opcode == OpCode::SampleLevel && !pixelCoordinates &&
+        (kind == ResourceKind::Texture2D || kind == ResourceKind::Texture2DArray ||
+         kind == ResourceKind::Texture3D) &&
+        !minmaxFiltering && isa<ConstantInt>(sparse) &&
+        cast<ConstantInt>(sparse)->isZero()) {
+      auto *eligible = b.CreateAnd(custom, b.CreateNot(otherFallback));
+      eligible = b.CreateAnd(eligible, b.CreateICmpEQ(
+          b.CreateAnd(state, b.getInt32(0x1d4)), b.getInt32(0x14)));
+      eligible = b.CreateAnd(eligible, b.CreateFCmpOEQ(
+          b.CreateBitCast(bias, b.getFloatTy()), f(0)));
+      eligible = b.CreateAnd(eligible, b.CreateFCmpOLE(
+          b.CreateBitCast(minimum, b.getFloatTy()), f(0)));
+      eligible = b.CreateAnd(eligible, b.CreateFCmpOGE(
+          b.CreateBitCast(maximum, b.getFloatTy()), lastMip));
+      auto *filtered = BasicBlock::Create(call->getContext(),
+          "scorpi.sample.border.filtered", fn, after);
+      auto *fallback = BasicBlock::Create(call->getContext(),
+          "scorpi.sample.border.fallback", fn, after);
+      b.CreateCondBr(eligible, filtered, fallback);
+      b.SetInsertPoint(filtered);
+
+      Value *delta[4];
+      for (unsigned c = 0; c < 4; ++c) {
+        auto *selector = b.CreateAnd(b.CreateLShr(borderMapping,
+            b.getInt32(c * 3)), b.getInt32(7));
+        Value *color = f(0);
+        for (unsigned component = 0; component < 4; ++component)
+          color = b.CreateSelect(b.CreateICmpEQ(selector, b.getInt32(component)),
+              b.CreateBitCast(customColor[component], b.getFloatTy()), color);
+        // Constant-zero/one components are the same for either border.
+        delta[c] = b.CreateFPCast(color, elementType);
+      }
+      auto filterMip = [&](Value *level) -> Value * {
+        auto *size = Call(b, OpCode::GetDimensions, b.getInt32Ty(), {texture, level});
+        Value *inside = f(1);
+        Value *coordinates[3] = {};
+        for (unsigned axis = 0; axis < axes; ++axis) {
+          auto *n = b.CreateUIToFP(b.CreateExtractValue(size, axis), b.getFloatTy());
+          auto *coordinate = b.CreateFSub(
+              b.CreateFMul(call->getArgOperand(3 + axis), n), f(.5));
+          Value *offset = f(0);
+          if (!isa<UndefValue>(call->getArgOperand(7 + axis))) {
+            offset = b.CreateSIToFP(call->getArgOperand(7 + axis), b.getFloatTy());
+            coordinate = b.CreateFAdd(coordinate, offset);
+          }
+          // Snap both coverage and the native sampling position, not just
+          // coverage: a half-subtexel tie must select the same footprint.
+          coordinate = b.CreateFMul(unary(OpCode::Round_ne,
+              b.CreateFMul(coordinate, f(256))), f(1.0 / 256));
+          auto *coverage = min(max(min(b.CreateFAdd(coordinate, f(1)),
+              b.CreateFSub(n, coordinate)), f(0)), f(1));
+          auto *mode = b.CreateAnd(b.CreateLShr(state,
+              b.getInt32(9 + axis * 3)), b.getInt32(7));
+          auto *borderAxis = b.CreateICmpEQ(mode, b.getInt32(4));
+          inside = b.CreateFMul(inside, b.CreateSelect(
+              borderAxis, coverage, f(1)));
+          coordinates[axis] = b.CreateSelect(borderAxis,
+              b.CreateFDiv(b.CreateFSub(b.CreateFAdd(coordinate, f(.5)), offset), n),
+              call->getArgOperand(3 + axis));
+        }
+        auto *sample = cast<CallInst>(call->clone());
+        sample->setArgOperand(10, b.CreateUIToFP(level, b.getFloatTy()));
+        for (unsigned axis = 0; axis < axes; ++axis)
+          sample->setArgOperand(3 + axis, coordinates[axis]);
+        b.Insert(sample);
+        auto *weight = b.CreateFPCast(b.CreateFSub(f(1), inside), elementType);
+        Value *value = UndefValue::get(call->getType());
+        for (unsigned c = 0; c < 4; ++c)
+          value = b.CreateInsertValue(value, b.CreateFAdd(
+              b.CreateExtractValue(sample, c), b.CreateFMul(weight, delta[c])), c);
+        return b.CreateInsertValue(value, b.getInt32(1), 4);
+      };
+      auto *first = filterMip(mip0);
+      auto *firstExit = b.GetInsertBlock();
+      auto *second = BasicBlock::Create(call->getContext(),
+          "scorpi.sample.border.mip1", fn, after);
+      borderFilterExit = BasicBlock::Create(call->getContext(),
+          "scorpi.sample.border.filtered.end", fn, after);
+      b.CreateCondBr(useMip1, second, borderFilterExit);
+      b.SetInsertPoint(second);
+      auto *next = filterMip(b.CreateAdd(mip0, b.getInt32(1)));
+      Value *blend = UndefValue::get(call->getType());
+      auto *fraction = b.CreateFPCast(mipFraction, elementType);
+      for (unsigned c = 0; c < 4; ++c) {
+        auto *a = b.CreateExtractValue(first, c);
+        auto *z = b.CreateExtractValue(next, c);
+        blend = b.CreateInsertValue(blend, b.CreateFAdd(a,
+            b.CreateFMul(b.CreateFSub(z, a), fraction)), c);
+      }
+      blend = b.CreateInsertValue(blend, b.getInt32(1), 4);
+      auto *secondExit = b.GetInsertBlock();
+      b.CreateBr(borderFilterExit);
+      b.SetInsertPoint(borderFilterExit);
+      borderFilterResult = UndefValue::get(call->getType());
+      PHINode *filteredComponents[5];
+      for (unsigned c = 0; c < 5; ++c) {
+        auto *phi = b.CreatePHI(call->getType()->getStructElementType(c), 2);
+        IRBuilder<> firstResult(firstExit->getTerminator()), secondResult(secondExit->getTerminator());
+        phi->addIncoming(firstResult.CreateExtractValue(first, c), firstExit);
+        phi->addIncoming(secondResult.CreateExtractValue(blend, c), secondExit);
+        filteredComponents[c] = phi;
+      }
+      for (unsigned c = 0; c < 5; ++c)
+        borderFilterResult = b.CreateInsertValue(borderFilterResult, filteredComponents[c], c);
+      b.CreateBr(after);
+      b.SetInsertPoint(fallback);
+    }
     if (customBorder) {
       // Ordinary interior samples keep native texture filtering. Check both
       // contributing mip footprints, including integer offsets and half-texel
@@ -1226,6 +1348,10 @@ public:
       phi->addIncoming(reducedResult.CreateExtractValue(nativeColor && c < 4 ? static_cast<Value *>(call) : result,c),reducedExit);
       phi->addIncoming(c==4?static_cast<Value*>(b.getInt32(1)):Constant::getNullValue(type),missing);
       phi->addIncoming(c==4?outResult.getInt32(1):outResult.CreateExtractValue(emptyResult,c),empty);
+      if (borderFilterExit) {
+        IRBuilder<> filteredResult(borderFilterExit->getTerminator());
+        phi->addIncoming(filteredResult.CreateExtractValue(borderFilterResult,c),borderFilterExit);
+      }
       assembled = merged.CreateInsertValue(assembled,phi,c);
     }
     for (auto *user : originalUsers) user->replaceUsesOfWith(call,assembled);

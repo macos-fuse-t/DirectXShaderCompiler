@@ -76,6 +76,34 @@ with tempfile.TemporaryDirectory(prefix='scorpi-sampling-native-') as folder:
                 assert (1, 0, 5, 1, 0) in reflected, reflected
                 assert all(not r[4] for r in reflected if r[0] != 0), reflected
         print('PASS', model, 'descriptor access: constant/dynamic indices, nonzero base/space, sample versus load')
+        # A measured native filter can correct the border without expanding
+        # ordinary linear filtering into per-texel loads. Sparse/pixel-coordinate
+        # views and devices without that proof must keep the established path.
+        for volume in (False, True):
+            texture = 'Texture3D' if volume else 'Texture2D'
+            coord = 'p.xyz' if volume else 'p.xy'
+            offset = 'int3(-3,2,-1)' if volume else 'int2(-3,2)'
+            source = (f'{texture}<float4> t:register(t0); SamplerState s:register(s0);\n'
+                      'float4 main(float4 p:SV_Position):SV_Target { '
+                      f'return t.SampleLevel(s,{coord},.5,{offset}); }}')
+            (folder/'border.hlsl').write_text(source)
+            subprocess.run([dxc, '-T', 'ps_'+model, '-E', 'main', '-Fo',
+                            str(folder/'border.dxil'), str(folder/'border.hlsl')], check=True)
+            code = (folder/'border.dxil').read_bytes()
+            for enabled, sparse, pixel in ((False, False, False), (True, False, False),
+                                          (True, True, False), (True, False, True)):
+                policy = (Requirement*2)(Requirement(3,0,0,1,512 | (1024 if pixel else 0)),
+                                         Requirement(0,0,0,1,1 if sparse else 0))
+                output, size, error = C.c_void_p(), C.c_size_t(), C.create_string_buffer(4096)
+                status = specialize(code,len(code),bindings,len(bindings),99,16,
+                                    2|4|8|(256 if enabled else 0),policy,2,
+                                    C.byref(output),C.byref(size),error,len(error))
+                assert status == 0 and output.value, error.value
+                (folder/'border-lowered.dxil').write_bytes(C.string_at(output,size.value))
+                lib.ScorpiFreeDxilBinary(output)
+                ir = subprocess.check_output([dxc,'-dumpbin',str(folder/'border-lowered.dxil')],text=True)
+                assert ('scorpi.sample.border.filtered' in ir) == (enabled and not sparse and not pixel)
+            print('PASS', model, texture, 'measured native border filtering; sparse/pixel/device fallbacks')
         for structured in (False, True):
             resource = 'RWStructuredBuffer<uint>' if structured else 'RWByteAddressBuffer'
             accesses = ('uint a = input[0]; input[0] = a + 1; '

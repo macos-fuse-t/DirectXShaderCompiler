@@ -513,6 +513,9 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // Match a rasterizer producer retyped with ScorpiRetypeShaderOutputs.
 // Transport only flat FP32 varyings as integer bits; interpolation is unchanged.
 #define SCORPI_SHADER_FLAT_FLOAT_INPUT_BITS 128u
+// The renderer has verified native 8-bit spatial border-filter precision on
+// this device. Enable the linear SampleLevel border-correction fast path.
+#define SCORPI_SHADER_NATIVE_LINEAR_BORDER 256u
 typedef struct ScorpiSamplingRequirement {
   uint32_t resource_class, space, base_register, count, requirements;
 } ScorpiSamplingRequirement;
