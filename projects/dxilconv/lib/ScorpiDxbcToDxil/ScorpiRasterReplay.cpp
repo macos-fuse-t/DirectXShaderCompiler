@@ -881,6 +881,196 @@ bool PrepareRasterReplayPixelShader(hlsl::DxilModule &dm,
   if (requirements) *requirements = nativeCoverage ? 0 : SCORPI_MSAA8_REPLAY_COVERAGE;
   return true;
 }
+namespace {
+
+Value *CreateFramebufferFetchHandle(hlsl::DxilModule &dm, IRBuilder<> &entry,
+                                    unsigned target, uint32_t space,
+                                    hlsl::CompType compType, Type *scalarType) {
+  using namespace hlsl;
+  auto srv = std::make_unique<DxilResource>();
+  srv->SetID(unsigned(dm.GetSRVs().size()));
+  srv->SetRW(false);
+  srv->SetKind(DXIL::ResourceKind::Texture2D);
+  srv->SetCompType(compType);
+  srv->SetSpaceID(space);
+  srv->SetLowerBound(target);
+  srv->SetRangeSize(1);
+  srv->SetGlobalName("ScorpiFramebufferDestination");
+  auto *resourceType = StructType::create(entry.getContext(),
+      {VectorType::get(scalarType, 4)}, "ScorpiFramebufferDestination");
+  srv->SetGlobalSymbol(UndefValue::get(resourceType->getPointerTo()));
+  const unsigned id = dm.AddSRV(std::move(srv));
+  auto *ops = dm.GetOP();
+  if (dm.GetShaderModel()->GetMinor() >= 6) {
+    auto &resource = dm.GetSRV(id);
+    auto binding = resource_helper::loadBindingFromResourceBase(&resource);
+    auto props = resource_helper::loadPropsFromResourceBase(&resource);
+    auto *handle = entry.CreateCall(ops->GetOpFunc(OpCode::CreateHandleFromBinding, entry.getVoidTy()),
+        {entry.getInt32(unsigned(OpCode::CreateHandleFromBinding)),
+         resource_helper::getAsConstant(binding, ops->GetResourceBindingType(), *dm.GetShaderModel()),
+         entry.getInt32(target), entry.getFalse()});
+    return entry.CreateCall(ops->GetOpFunc(OpCode::AnnotateHandle, entry.getVoidTy()),
+        {entry.getInt32(unsigned(OpCode::AnnotateHandle)), handle,
+         resource_helper::getAsConstant(props, ops->GetResourcePropertiesType(), *dm.GetShaderModel())});
+  }
+  return entry.CreateCall(ops->GetOpFunc(OpCode::CreateHandle, entry.getVoidTy()),
+      {entry.getInt32(unsigned(OpCode::CreateHandle)),
+       entry.getInt8(unsigned(DXIL::ResourceClass::SRV)), entry.getInt32(id),
+       entry.getInt32(target), entry.getFalse()});
+}
+
+Value *BuildLogicOp(IRBuilder<> &b, unsigned operation, Value *src, Value *dst) {
+  switch (operation) {
+  case 0: return b.getInt32(0);                     // CLEAR
+  case 1: return b.getInt32(UINT32_MAX);            // SET
+  case 2: return src;                              // COPY
+  case 3: return b.CreateNot(src);                 // COPY_INVERTED
+  case 4: return dst;                              // NOOP
+  case 5: return b.CreateNot(dst);                 // INVERT
+  case 6: return b.CreateAnd(src, dst);            // AND
+  case 7: return b.CreateNot(b.CreateAnd(src, dst)); // NAND
+  case 8: return b.CreateOr(src, dst);             // OR
+  case 9: return b.CreateNot(b.CreateOr(src, dst)); // NOR
+  case 10: return b.CreateXor(src, dst);           // XOR
+  case 11: return b.CreateNot(b.CreateXor(src, dst)); // EQUIV
+  case 12: return b.CreateAnd(src, b.CreateNot(dst)); // AND_REVERSE
+  case 13: return b.CreateAnd(b.CreateNot(src), dst); // AND_INVERTED
+  case 14: return b.CreateOr(src, b.CreateNot(dst)); // OR_REVERSE
+  case 15: return b.CreateOr(b.CreateNot(src), dst); // OR_INVERTED
+  }
+  llvm_unreachable("validated logic operation");
+}
+
+} // namespace
+
+bool LowerLogicOp(hlsl::DxilModule &dm, uint32_t space, uint32_t operation,
+                  const uint8_t componentBits[8][4], std::string &error) {
+  using namespace hlsl;
+  if (!dm.GetShaderModel()->IsPS() || !dm.GetEntryFunction() || operation > 15) {
+    error = "logic-op lowering requires a pixel shader and a valid operation";
+    return false;
+  }
+  std::array<bool, 8> targets{};
+  for (unsigned slot = 0; slot < targets.size(); ++slot) {
+    for (unsigned component = 0; component < 4; ++component) {
+      const auto bits = componentBits[slot][component];
+      if (bits > 32) {
+        error = "invalid UINT render-target precision";
+        return false;
+      }
+      targets[slot] |= bits != 0;
+    }
+  }
+
+  // DXIL color stores can appear on any return branch. Modify only the
+  // exports. Keep shader side effects, sample coverage, and depth unchanged.
+  struct Export {
+    CallInst *call;
+    unsigned slot;
+    unsigned component;
+    unsigned bits;
+  };
+  auto &signature = dm.GetOutputSignature().GetElements();
+  std::vector<DxilSignatureElement *> affected(signature.size());
+  for (auto &element : signature) {
+    if (element->GetKind() != DXIL::SemanticKind::Target)
+      continue;
+    for (unsigned slot : element->GetSemanticIndexVec()) {
+      if (slot < targets.size() && targets[slot]) {
+        if (element->GetID() >= affected.size()) {
+          error = "invalid logic-op output signature";
+          return false;
+        }
+        affected[element->GetID()] = element.get();
+        break;
+      }
+    }
+  }
+  std::vector<Export> exports;
+  auto *entry = dm.GetEntryFunction();
+  for (auto &block : *entry) {
+    for (auto &instruction : block) {
+      auto *call = dyn_cast<CallInst>(&instruction);
+      if (!call || !call->getCalledFunction() ||
+          !call->getCalledFunction()->getName().startswith("dx.op.storeOutput."))
+        continue;
+      auto *id = dyn_cast<ConstantInt>(call->getArgOperand(1));
+      if (!id || id->getZExtValue() >= affected.size()) {
+        error = "invalid logic-op output store";
+        return false;
+      }
+      const auto *element = affected[id->getZExtValue()];
+      if (!element)
+        continue;
+      auto *row = dyn_cast<ConstantInt>(call->getArgOperand(2));
+      auto *col = dyn_cast<ConstantInt>(call->getArgOperand(3));
+      const auto &indices = element->GetSemanticIndexVec();
+      if (!row || !col || row->getZExtValue() >= indices.size() ||
+          col->getZExtValue() >= 4) {
+        error = "invalid logic-op color export";
+        return false;
+      }
+      const unsigned slot = indices[row->getZExtValue()];
+      const unsigned component = col->getZExtValue();
+      const unsigned bits = slot < targets.size() ? componentBits[slot][component] : 0;
+      exports.push_back({call, slot, component, bits});
+    }
+  }
+
+  std::array<Value *, 8> destinations{};
+  IRBuilder<> prologue(&*entry->getEntryBlock().getFirstInsertionPt());
+  auto *i32 = prologue.getInt32Ty();
+  auto *ops = dm.GetOP();
+  for (const auto &exported : exports) {
+    auto *original = exported.call;
+    IRBuilder<> b(original);
+    Value *src = original->getArgOperand(4);
+    auto *type = src->getType();
+    if (type->isFloatTy())
+      src = b.CreateBitCast(src, i32);
+    else if (type->isHalfTy())
+      src = b.CreateZExt(b.CreateBitCast(src, b.getInt16Ty()), i32);
+    else if (type->isIntegerTy(16))
+      src = b.CreateZExt(src, i32);
+    else if (type != i32) {
+      error = "unsupported logic-op color export type";
+      return false;
+    }
+    Value *value = src;
+    if (exported.bits) {
+      Value *dst = nullptr;
+      if (operation >= 4) {
+        auto *&loaded = destinations[exported.slot];
+        if (!loaded) {
+          auto *handle = CreateFramebufferFetchHandle(dm, prologue, exported.slot,
+              space, CompType::getU32(), i32);
+          auto *zero = prologue.getInt32(0);
+          auto *undef = UndefValue::get(i32);
+          loaded = prologue.CreateCall(ops->GetOpFunc(OpCode::TextureLoad, i32),
+              {prologue.getInt32(unsigned(OpCode::TextureLoad)), handle,
+               zero, zero, zero, undef, zero, zero, undef});
+        }
+        dst = b.CreateExtractValue(loaded, exported.component);
+      }
+      // Use the low bits of each D3D register. Truncate after the operation
+      // so an inversion cannot overflow and saturate on the Metal export.
+      const uint32_t mask = UINT32_MAX >> (32 - exported.bits);
+      value = b.CreateAnd(BuildLogicOp(b, operation, src, dst), b.getInt32(mask));
+    }
+    auto *store = b.CreateCall(ops->GetOpFunc(OpCode::StoreOutput, i32),
+        {original->getArgOperand(0), original->getArgOperand(1),
+         original->getArgOperand(2), original->getArgOperand(3), value});
+    store->setDebugLoc(original->getDebugLoc());
+  }
+  for (const auto &exported : exports)
+    exported.call->eraseFromParent();
+  for (auto *element : affected)
+    if (element)
+      element->SetCompType(CompType::getU32());
+  dm.CollectShaderFlagsForModule();
+  return true;
+}
+
 bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
     const ScorpiPackedBlendTarget *targets, size_t count, std::string &error) {
   using namespace hlsl;
@@ -902,9 +1092,8 @@ bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
     args.insert(args.begin(), b.getInt32(unsigned(op)));
     return b.CreateCall(ops->GetOpFunc(op, type), args);
   };
-  auto handle = [&](DXIL::ResourceClass cls, unsigned id) -> Value * {
-    auto *r = cls == DXIL::ResourceClass::CBuffer ?
-        static_cast<DxilResourceBase *>(&dm.GetCBuffer(id)) : &dm.GetSRV(id);
+  auto handleCBuffer = [&](unsigned id) -> Value * {
+    auto *r = &dm.GetCBuffer(id);
     if (dm.GetShaderModel()->GetMinor() >= 6) {
       auto binding = resource_helper::loadBindingFromResourceBase(r);
       auto *value = resource_helper::getAsConstant(binding,
@@ -916,7 +1105,8 @@ bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
           resource_helper::getAsConstant(props, ops->GetResourcePropertiesType(), *dm.GetShaderModel())});
     }
     return opCall(start, DXIL::OpCode::CreateHandle, start.getVoidTy(),
-        {start.getInt8(unsigned(cls)), start.getInt32(id), start.getInt32(r->GetLowerBound()), start.getFalse()});
+        {start.getInt8(unsigned(DXIL::ResourceClass::CBuffer)), start.getInt32(id),
+         start.getInt32(r->GetLowerBound()), start.getFalse()});
   };
   bool constant = false, dual = false;
   std::array<Value *, 8> fetch{};
@@ -937,14 +1127,8 @@ bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
     for (auto bits : t.component_bits) if (!bits || bits > 16) {
       error = "invalid packed UNORM precision"; return false;
     }
-    auto srv = std::make_unique<DxilResource>();
-    srv->SetID(unsigned(dm.GetSRVs().size())); srv->SetRW(false);
-    srv->SetKind(DXIL::ResourceKind::Texture2D); srv->SetCompType(CompType::getF32());
-    srv->SetSpaceID(space); srv->SetLowerBound(t.target); srv->SetRangeSize(1);
-    srv->SetGlobalName("ScorpiPackedBlendDestination");
-    srv->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
-        {VectorType::get(f32, 4)}, "ScorpiPackedBlendDestination")->getPointerTo()));
-    fetch[t.target] = handle(DXIL::ResourceClass::SRV, dm.AddSRV(std::move(srv)));
+    fetch[t.target] = CreateFramebufferFetchHandle(dm, start, t.target, space,
+                                                   CompType::getF32(), f32);
   }
   Value *blendConstant = nullptr;
   if (constant) {
@@ -954,7 +1138,7 @@ bool LowerPackedBlending(hlsl::DxilModule &dm, uint32_t space,
     cb->SetGlobalName("ScorpiBlendFactor");
     cb->SetGlobalSymbol(UndefValue::get(StructType::create(ctx,
         {VectorType::get(f32, 4)}, "ScorpiBlendFactor")->getPointerTo()));
-    blendConstant = handle(DXIL::ResourceClass::CBuffer, dm.AddCBuffer(std::move(cb)));
+    blendConstant = handleCBuffer(dm.AddCBuffer(std::move(cb)));
   }
   // Collect original exports before adding the epilogue. Use allocas across
   // branches and early returns; mem2reg below restores SSA without GPU storage.

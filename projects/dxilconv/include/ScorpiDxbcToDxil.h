@@ -167,6 +167,14 @@ ScorpiCreatePackedBlendShader(const void *code, size_t size,
     size_t target_count, void **binary, size_t *binary_size,
     char *error, size_t error_size);
 
+// Apply an output-merger logic operation in a pixel shader. The caller maps
+// the private UINT Texture2D SRVs to framebuffer fetch. Zero component width
+// denotes an absent channel or attachment.
+SCORPI_DXBC_TO_DXIL_EXPORT int
+ScorpiCreateLogicOpShader(const void *code, size_t size,
+    uint32_t register_space, uint32_t operation, const uint8_t component_bits[8][4],
+    void **binary, size_t *binary_size, char *error, size_t error_size);
+
 // Inspect the original output signature, before backend-generated masks.
 SCORPI_DXBC_TO_DXIL_EXPORT int
 ScorpiInspectOutputCoverage(const void *code, size_t size,

@@ -1122,11 +1122,11 @@ extern "C" int ScorpiCreateAlphaToCoverageShader(const void *code, size_t size,
   }
 }
 
-extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
-    uint32_t register_space, const ScorpiPackedBlendTarget *targets, size_t target_count, void **binary, size_t *binary_size,
-    char *error, size_t error_size) {
+template <typename Lower>
+static int CreateFramebufferFetchShader(const void *code, size_t size,
+    void **binary, size_t *binary_size, char *error, size_t error_size, Lower lower) {
   SetError(error, error_size, "");
-  if (!code || !size || !targets || !target_count || !binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  if (!code || !size || !binary || !binary_size) return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
   *binary = nullptr; *binary_size = 0;
   try {
     using namespace llvm;
@@ -1135,19 +1135,19 @@ extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
     auto normalized = ConvertToDxilBinary(code, size, nullptr, 0);
     auto *container = reinterpret_cast<const DxilContainerHeader *>(normalized.data());
     if (!IsValidDxilContainer(container, normalized.size()))
-      throw std::runtime_error("invalid packed-blend shader container");
+      throw std::runtime_error("invalid framebuffer-fetch shader container");
     auto *program = GetDxilProgramHeader(container, DFCC_DXIL);
-    if (!program) throw std::runtime_error("missing packed-blend DXIL program");
+    if (!program) throw std::runtime_error("missing framebuffer-fetch DXIL program");
     LLVMContext context;
     auto source = MemoryBuffer::getMemBuffer(StringRef(GetDxilBitcodeData(program),
-        GetDxilBitcodeSize(program)), "packed-blend", false);
+        GetDxilBitcodeSize(program)), "framebuffer-fetch", false);
     auto parsed = parseBitcodeFile(source->getMemBufferRef(), context);
-    if (!parsed) throw std::runtime_error("invalid packed-blend bitcode");
+    if (!parsed) throw std::runtime_error("invalid framebuffer-fetch bitcode");
     auto *dm = DxilModule::TryGetDxilModule(parsed.get().get());
     std::string why;
-    if (!dm || !scorpi::LowerPackedBlending(*dm, register_space, targets, target_count, why))
-      throw std::runtime_error(why.empty() ? "invalid packed-blend lowering" : why);
-    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid packed blend IR");
+    if (!dm || !lower(*dm, why))
+      throw std::runtime_error(why.empty() ? "invalid framebuffer-fetch lowering" : why);
+    if (verifyModule(*parsed.get())) throw std::runtime_error("invalid framebuffer-fetch IR");
     dm->GetSerializedViewIdState().clear();
     DxilModule::ClearDxilMetadata(*parsed.get()); dm->EmitDxilMetadata();
     CComPtr<AbstractMemoryStream> bitcode, output;
@@ -1156,7 +1156,7 @@ extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
     { raw_stream_ostream stream(bitcode.p); WriteBitcodeToFile(parsed.get().get(), stream); }
     SerializeDxilContainerForModule(dm, bitcode, nullptr, output, StringRef(), SerializeDxilFlags::None);
     auto *result = std::malloc(output->GetPtrSize());
-    if (!result) throw std::runtime_error("packed-blend output allocation failed");
+    if (!result) throw std::runtime_error("framebuffer-fetch output allocation failed");
     std::memcpy(result, output->GetPtr(), output->GetPtrSize());
     auto *header = static_cast<DxilContainerHeader *>(result);
     constexpr uint32_t offset = uint32_t(offsetof(DxilContainerHeader, Version));
@@ -1167,9 +1167,35 @@ extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
   } catch (const std::exception &exception) {
     SetError(error, error_size, exception.what()); return SCORPI_DXBC_TO_DXIL_CONVERSION_FAILED;
   } catch (...) {
-    SetError(error, error_size, "unexpected packed-blend conversion failure");
+    SetError(error, error_size, "unexpected framebuffer-fetch conversion failure");
     return SCORPI_DXBC_TO_DXIL_INTERNAL_ERROR;
   }
+}
+
+extern "C" int ScorpiCreatePackedBlendShader(const void *code, size_t size,
+    uint32_t register_space, const ScorpiPackedBlendTarget *targets, size_t target_count,
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (!targets || !target_count) {
+    SetError(error, error_size, "missing packed blend targets");
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  }
+  return CreateFramebufferFetchShader(code, size, binary, binary_size, error, error_size,
+      [&](hlsl::DxilModule &module, std::string &message) {
+        return scorpi::LowerPackedBlending(module, register_space, targets, target_count, message);
+      });
+}
+
+extern "C" int ScorpiCreateLogicOpShader(const void *code, size_t size,
+    uint32_t register_space, uint32_t operation, const uint8_t component_bits[8][4],
+    void **binary, size_t *binary_size, char *error, size_t error_size) {
+  if (!component_bits || register_space == UINT32_MAX) {
+    SetError(error, error_size, "missing logic-op targets or framebuffer space");
+    return SCORPI_DXBC_TO_DXIL_INVALID_ARGUMENT;
+  }
+  return CreateFramebufferFetchShader(code, size, binary, binary_size, error, error_size,
+      [&](hlsl::DxilModule &module, std::string &message) {
+        return scorpi::LowerLogicOp(module, register_space, operation, component_bits, message);
+      });
 }
 
 static int CreateRasterReplayShader(

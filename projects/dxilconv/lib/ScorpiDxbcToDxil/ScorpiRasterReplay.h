@@ -10,6 +10,8 @@ class DxilModule;
 namespace scorpi {
 bool LowerPackedBlending(hlsl::DxilModule &module, uint32_t registerSpace,
     const ScorpiPackedBlendTarget *targets, size_t count, std::string &error);
+bool LowerLogicOp(hlsl::DxilModule &module, uint32_t registerSpace,
+    uint32_t operation, const uint8_t componentBits[8][4], std::string &error);
 bool LowerAlphaToCoverage(hlsl::DxilModule &module, uint32_t sampleCount,
                          std::string &error, bool &changed);
 bool PrepareMsaa8TextureLoads(hlsl::DxilModule &module, std::string &error, bool &changed,
