@@ -2262,6 +2262,44 @@ static int InspectBindings(const void *code, size_t size,
           if (!access_only && (cls == 0 || cls == 1 || cls == 3) && end > first)
             appendRange(cls, space, uint32_t(first),
                 uint32_t(std::min<uint64_t>(end - first, UINT32_MAX)));
+        } else if (opcode->getZExtValue() == unsigned(hlsl::DXIL::OpCode::CreateHandleFromHeap)) {
+          const auto *sampler = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+          if (!sampler) return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+          const bool samplerHeap = !sampler->isZero();
+          const auto *slot = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          const uint32_t first = slot ? uint32_t(slot->getZExtValue()) : 0u;
+          const uint32_t count = slot ? 1u : samplerHeap ? SCORPI_METADATA_SAMPLER_DESCRIPTORS :
+              SCORPI_METADATA_RESOURCE_DESCRIPTORS;
+          uint32_t classes = samplerHeap ? (1u << 3) : 0;
+          if (!samplerHeap) {
+            llvm::SmallVector<llvm::Value *, 8> pending{call};
+            llvm::SmallPtrSet<llvm::Value *, 8> seen;
+            while (!pending.empty()) {
+              auto *handle = pending.pop_back_val();
+              if (!seen.insert(handle).second) continue;
+              for (auto *user : handle->users()) {
+                if (llvm::isa<llvm::PHINode>(user) || llvm::isa<llvm::SelectInst>(user)) {
+                  pending.push_back(user);
+                  continue;
+                }
+                auto *annotation = llvm::dyn_cast<llvm::CallInst>(user);
+                if (!annotation || !annotation->getCalledFunction() ||
+                    !annotation->getCalledFunction()->getName().startswith("dx.op.annotateHandle"))
+                  continue;
+                if (const auto *props = llvm::dyn_cast<llvm::Constant>(annotation->getArgOperand(2))) {
+                  const auto type = hlsl::resource_helper::loadPropsFromConstant(*props).getResourceClass();
+                  if (unsigned(type) < 3) classes |= 1u << unsigned(type);
+                }
+              }
+            }
+            if (!classes && !call->use_empty()) classes = 7;
+          }
+          for (uint32_t type = 0; type < 4; ++type) {
+            if (!(classes & (1u << type))) continue;
+            appendRange(type, SCORPI_DIRECT_HEAP_REGISTER_SPACE, first, count);
+            if (access_only) SetSampleOnly(ranges.back(), type == 0 && SampleOnlyHandle(call));
+          }
+          continue;
         } else if (call->getCalledFunction()->getName().startswith("dx.op.createHandle")) {
           // Do not narrow declarations for an unrecognized handle producer.
           unknown_handle = true;

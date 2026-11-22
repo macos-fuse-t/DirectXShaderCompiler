@@ -491,6 +491,8 @@ ScorpiLowerTextureLayouts(const void *code, size_t size, int split_msaa8,
 // absent register is ordinary; unknown handle provenance stays conservative.
 #define SCORPI_SHADER_BINDING_POLICY 4u
 #define SCORPI_SAMPLING_SPARSE 1u
+/* Reflection uses this reserved register space for physical heap indices. */
+#define SCORPI_DIRECT_HEAP_REGISTER_SPACE 0xffffffffu
 #define SCORPI_SAMPLING_RESOURCE_MIN_LOD 2u
 #define SCORPI_SAMPLING_REDUCTION 4u
 #define SCORPI_SAMPLING_TYPED_PREFIX 8u

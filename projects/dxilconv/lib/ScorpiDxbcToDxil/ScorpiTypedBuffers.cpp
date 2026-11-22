@@ -203,6 +203,19 @@ uint32_t SamplingRequirements(DxilModule &dm, Value *handle,
     auto r = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
     cls = r.resourceClass; space = r.spaceID; first = r.rangeLowerBound;
     end = uint64_t(r.rangeUpperBound) + 1; index = call->getArgOperand(2);
+  } else if (Opcode(call) == OpCode::CreateHandleFromHeap) {
+    const bool sampler = !cast<ConstantInt>(call->getArgOperand(2))->isZero();
+    const auto *slot = dyn_cast<ConstantInt>(call->getArgOperand(1));
+    uint32_t result = 0;
+    for (size_t i = 0; i < count; ++i) {
+      const auto &r = policy[i];
+      if (r.space == SCORPI_DIRECT_HEAP_REGISTER_SPACE &&
+          (r.resource_class == unsigned(ResourceClass::Sampler)) == sampler &&
+          (!slot || (slot->getZExtValue() >= r.base_register &&
+                    slot->getZExtValue() - r.base_register < r.count)))
+        result |= r.requirements;
+    }
+    return result;
   } else return UINT32_MAX;
   if (auto *constant = dyn_cast<ConstantInt>(index)) {
     auto reg = constant->getZExtValue();
@@ -362,7 +375,8 @@ public:
     auto *call = dyn_cast<CallInst>(handle);
     if (!call) throw std::runtime_error("unsupported typed-buffer handle");
     if (Opcode(call) == OpCode::AnnotateHandle) return words[key] = Word(call->getArgOperand(1), word, atomicOrigin, rawWord);
-    uint32_t cls, resourceSpace, lower;
+    const bool directHeap = Opcode(call) == OpCode::CreateHandleFromHeap;
+    uint32_t cls, resourceSpace = 0, lower = 0;
     Value *index;
     if (Opcode(call) == OpCode::CreateHandle) {
       cls = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
@@ -375,29 +389,40 @@ public:
       auto binding = resource_helper::loadBindingFromConstant(*cast<Constant>(call->getArgOperand(1)));
       cls = binding.resourceClass; resourceSpace = binding.spaceID; lower = binding.rangeLowerBound;
       index = call->getArgOperand(2);
-    } else throw std::runtime_error("unsupported typed-buffer binding (direct heaps require a separate ABI)");
+    } else if (directHeap) {
+      cls = cast<ConstantInt>(call->getArgOperand(2))->isZero() ?
+          unsigned(ResourceClass::SRV) : unsigned(ResourceClass::Sampler);
+      index = call->getArgOperand(1);
+    } else throw std::runtime_error("unsupported typed-buffer binding");
     // The selected native variant proves that all reachable SRV textures are
     // non-sparse and have zero resource MinLOD. Carry that proof into accesses
     // retained for instruction clamps or status consumers: otherwise their
     // dead software filter bodies survive into the Metal compiler. Do not
     // apply this to UAVs (not covered by the native SRV binding policy).
-    if (cls == unsigned(ResourceClass::SRV) && (word == 0 || word == 4)) {
+    if (!directHeap && cls == unsigned(ResourceClass::SRV) && (word == 0 || word == 4)) {
       std::set<Value *> seen;
       const uint32_t needed = word == 0 ? SCORPI_SAMPLING_SPARSE : SCORPI_SAMPLING_RESOURCE_MIN_LOD;
       if (bindingPolicy ? !(SamplingRequirements(dm, handle, policy, policyCount, seen) & needed) : nativeTextures)
         return words[key] = ConstantInt::get(Type::getInt32Ty(call->getContext()), 0);
     }
     const ScorpiTypedBufferBinding *range = nullptr;
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; !directHeap && i < count; ++i) {
       const auto &r = bindings[i];
       if (cls == r.resource_class && resourceSpace == r.space && lower >= r.base_register &&
           uint64_t(lower) - r.base_register < r.count) { range = &r; break; }
     }
-    if (!range) throw std::runtime_error("typed buffer not covered by a visible descriptor-table range");
-    auto *metadata = MetadataHandle(call->getParent()->getParent());
+    if (!directHeap && !range) throw std::runtime_error("typed buffer not covered by a visible descriptor-table range");
     IRBuilder<> b(call->getNextNode());
-    Value *offset = b.getInt32(range->feedback_offset);
-    if (range->table_offset != UINT32_MAX) {
+    Value *metadata;
+    Value *offset = b.getInt32(0);
+    const bool table = directHeap || range->table_offset != UINT32_MAX;
+    if (directHeap) {
+      metadata = DescriptorMetadataHandle(b, index, cls == unsigned(ResourceClass::Sampler));
+    } else {
+      metadata = MetadataHandle(call->getParent()->getParent());
+      offset = b.getInt32(range->feedback_offset);
+    }
+    if (table && !directHeap) {
       auto *base = Load(b, metadata, offset);
       auto *slot = b.CreateAdd(base, b.CreateAdd(b.CreateSub(index, b.getInt32(range->base_register)),
           b.getInt32(range->table_offset)));
@@ -405,7 +430,7 @@ public:
       offset = b.getInt32(0);
     }
     if (word == 7 && !atomicOrigin && !rawWord) return words[key] = metadata;
-    if (atomicOrigin && range->table_offset != UINT32_MAX) {
+    if (atomicOrigin && table) {
       auto *dimensions = Call(b,OpCode::GetDimensions,b.getInt32Ty(),{metadata,b.getInt32(0)});
       auto *present = b.CreateICmpUGE(b.CreateExtractValue(dimensions,0),b.getInt32(SCORPI_METADATA_RECORD_BYTES));
       auto *before = b.GetInsertBlock();
@@ -2171,7 +2196,7 @@ bool ScorpiLowerTypedBuffers(DxilModule &dm, const ScorpiTypedBufferBinding *bin
       return true;
     }), bufferLoads.end());
   if (!calls.empty() || !samples.empty() || !textureLoads.empty() || !bufferLoads.empty() || !gradientBiasSamples.empty() || !computeLODs.empty()) {
-    if (!bindings || !count || space == UINT32_MAX)
+    if (space == UINT32_MAX)
       throw std::runtime_error("typed-buffer metadata root binding missing");
     Lowering lowering(dm, bindings, count, space, selfOffset, options, policy, policyCount);
     for (auto *call : bufferLoads) lowering.RewriteBufferStatus(call);
