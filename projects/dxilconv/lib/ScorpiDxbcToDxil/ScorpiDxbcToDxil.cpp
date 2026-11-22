@@ -809,6 +809,12 @@ uint32_t InspectDxbcRasterizer(const void *code, size_t size) {
     if (!length || length > tokens[1] - offset)
       throw std::runtime_error("invalid DXBC instruction length");
     switch (opcode) {
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW:
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
+      if (tokens[offset] & D3D11_SB_RASTERIZER_ORDERED_ACCESS)
+        requirements |= SCORPI_RASTERIZER_ORDERED_VIEWS;
+      break;
     case D3D10_1_SB_OPCODE_SAMPLE_INFO:
     case D3D10_SB_OPCODE_DCL_INPUT:
     case D3D10_SB_OPCODE_DCL_INPUT_PS:
@@ -966,15 +972,34 @@ extern "C" int ScorpiInspectRasterizerRequirements(const void *code, size_t size
     const bool pixel = hlsl::GetVersionShaderType(program->ProgramVersion) ==
         hlsl::DXIL::ShaderKind::Pixel;
     if (!declared && !pixel) return SCORPI_DXBC_TO_DXIL_OK;
-    if (declared) {
-      if (parsed.get()->materializeAllPermanently())
-        return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
-      if (!RasterizerSampleCountCalls(*parsed.get()).empty())
-        *requirements |= SCORPI_RASTERIZER_SAMPLE_COUNT;
+    auto &module = *parsed.get();
+    auto *bindless_annotations = pixel && module.getFunction("dx.op.createHandleFromHeap")
+        ? module.getFunction("dx.op.annotateHandle") : nullptr;
+    if ((declared || bindless_annotations) && module.materializeAllPermanently())
+      return SCORPI_DXBC_TO_DXIL_INVALID_SHADER;
+    if (declared && !RasterizerSampleCountCalls(module).empty())
+      *requirements |= SCORPI_RASTERIZER_SAMPLE_COUNT;
+    // Heap-indexed ROVs carry their ordering flag on the handle annotation.
+    // They need not have an entry in the shader's UAV declaration table.
+    if (bindless_annotations) {
+      for (auto *user : bindless_annotations->users()) {
+        const auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+        if (!call || call->getNumArgOperands() != 3) continue;
+        const auto *properties = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2));
+        const auto *flags = properties
+            ? llvm::dyn_cast_or_null<llvm::ConstantInt>(properties->getAggregateElement(0u)) : nullptr;
+        if (!flags || flags->getBitWidth() != 32) continue;
+        hlsl::DxilResourceProperties resource;
+        resource.RawDword0 = static_cast<uint32_t>(flags->getZExtValue());
+        if (resource.Basic.IsUAV && resource.Basic.IsROV) {
+          *requirements |= SCORPI_RASTERIZER_ORDERED_VIEWS;
+          break;
+        }
+      }
     }
     if (pixel) {
-      // Decoding all resource metadata can fail on incomplete DDI metadata and
-      // is unrelated to interpolation. Load only the pixel entry signature.
+      // Read the ROV flag and pixel entry signature without decoding unrelated
+      // resource properties, which can be missing from DDI shader metadata.
       hlsl::DxilMDHelper helper(parsed.get().get(),
           std::unique_ptr<hlsl::DxilExtraPropertyHelper>(new hlsl::DxilExtraPropertyHelper(parsed.get().get())));
       const auto *entries = helper.GetDxilEntryPoints();
@@ -983,6 +1008,20 @@ extern "C" int ScorpiInspectRasterizerRequirements(const void *code, size_t size
       llvm::Function *entry = nullptr; std::string name;
       const llvm::MDOperand *signatures = nullptr, *resources = nullptr, *properties = nullptr;
       helper.GetDxilEntryPoint(entries->getOperand(0), entry, name, signatures, resources, properties);
+      if (resources && resources->get()) {
+        const llvm::MDTuple *srvs = nullptr, *uavs = nullptr, *cbuffers = nullptr, *samplers = nullptr;
+        helper.GetDxilResources(*resources, srvs, uavs, cbuffers, samplers);
+        if (uavs) {
+          for (const auto &operand : uavs->operands()) {
+            const auto *uav = llvm::dyn_cast_or_null<llvm::MDTuple>(operand.get());
+            if (uav && uav->getNumOperands() == hlsl::DxilMDHelper::kDxilUAVNumFields &&
+                helper.ConstMDToBool(uav->getOperand(hlsl::DxilMDHelper::kDxilUAVRasterizerOrderedView))) {
+              *requirements |= SCORPI_RASTERIZER_ORDERED_VIEWS;
+              break;
+            }
+          }
+        }
+      }
       hlsl::DxilEntrySignature signature(hlsl::DXIL::ShaderKind::Pixel, true);
       helper.LoadDxilSignatures(*signatures, signature);
       for (const auto &element : signature.InputSignature.GetElements())

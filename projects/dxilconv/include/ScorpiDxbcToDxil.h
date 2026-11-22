@@ -184,6 +184,7 @@ enum {
   SCORPI_RASTERIZER_SAMPLE_COUNT = 1,
   SCORPI_RASTERIZER_CENTROID = 2,
   SCORPI_RASTERIZER_INPUT_COVERAGE = 4,
+  SCORPI_RASTERIZER_ORDERED_VIEWS = 8,
 };
 // Inspect once per shader. Ordinary shaders do not require a rasterizer variant.
 SCORPI_DXBC_TO_DXIL_EXPORT int
